@@ -1,0 +1,3 @@
+# Homebrew's LLVM depends on zstd in this directory.
+[target.aarch64-apple-darwin]
+rustflags = ["-L", "/opt/homebrew/lib"]
