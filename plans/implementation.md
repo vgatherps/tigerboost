@@ -121,3 +121,9 @@ Scalar rolling4/sums2 compilation: 35.4/13.7/55.0/104.4 ms, after LLVM initializ
 SIMD is not a blanket win. Reuse-heavy tree order emits 32 scalar comparisons; SIMD cap2 emits 70 packed plus 20 scalar comparisons on both targets. Pair formation prevents some scalar-level common-expression sharing and adds extraction/spill costs. ARM64 text grows 3,484 → 5,532 bytes and total frame 448 → 640 bytes; x86 text grows 5,032 → 8,021 bytes and local stack 672 → 920 bytes (plus 48 saved-register bytes). Mixed SIMD cap2 text is 9,804/11,742 bytes on ARM64/x86-64. No per-model classifier or further backend tuning is justified here.
 
 Choose scalar rolling4/sums2 as the fixed portable default in the next chunk: useful mixed/wide gains, reuse-heavy parity, a small disjoint tradeoff. Keep tree order and SIMD explicit options. This is a measured compromise on one host, not a universal optimum.
+
+## Default and seeded differential check
+
+Default now uses scalar rolling4/sums2. Named tree-order benchmark/inspection controls remain explicit. Mixed rerun: old tree-order default 94.14 ns, selected default 79.98 ns; all row/trace checks pass.
+
+Added one 97-line seeded test: 96 forests, up to eight depth-0–6 trees, 20 rows, and three configurations per forest. Disjoint integer leaf-index fields occupy at most 48 bits, so scores stay exact and uniquely expose every selected leaf. Feature counts, live caps, and accumulator counts cycle independently; no debug API or fuzz dependency. Parent and secondary review accepted the oracle and small representation. Nineteen focused tests pass; parent reran the seeded test in debug/release after removing a generator correlation.

@@ -35,8 +35,8 @@ pub struct CompileOptions {
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
-            order: Order::TreeOrder,
-            accumulators: NonZeroUsize::new(1).unwrap(),
+            order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
+            accumulators: NonZeroUsize::new(2).unwrap(),
             comparisons: ComparisonMode::Scalar,
         }
     }
@@ -345,6 +345,14 @@ fn reassociate(value: FloatValue<'_>) -> CompileResult<FloatValue<'_>> {
 mod tests {
     use super::*;
     use crate::parsed_tree::{Discriminator, FeatureIndex, SingleTree};
+
+    #[test]
+    fn default_uses_rolling_scalar_with_two_accumulators() {
+        let options = CompileOptions::default();
+        assert!(matches!(options.order, Order::Rolling(cap) if cap.get() == 4));
+        assert_eq!(options.accumulators.get(), 2);
+        assert!(matches!(options.comparisons, ComparisonMode::Scalar));
+    }
 
     #[test]
     fn emits_predict_for_aarch64_and_x86_64() {
