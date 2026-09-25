@@ -1,7 +1,7 @@
 //! Synthetic dependent-call timings, including the row-selection driver.
 use inkwell::context::Context;
-use std::{error::Error, hint::black_box, time::Instant};
-use tigerboost::jit::{CompiledModel, compile};
+use std::{error::Error, hint::black_box, num::NonZeroUsize, time::Instant};
+use tigerboost::jit::{CompileOptions, CompiledModel, Order, compile_with_options};
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
 
 const FEATURES: usize = 16;
@@ -81,41 +81,72 @@ fn measure(predict: impl Fn(usize) -> f64, calls: usize) -> f64 {
 fn main() -> Result<(), Box<dyn Error>> {
     let (model, rows) = workload();
     let context = Context::create();
-    let start = Instant::now();
-    let compiled = compile(&context, &model)?;
-    let compile_ms = start.elapsed().as_secs_f64() * 1e3;
-    let (scores, distinct) = verify(&model, &compiled, &rows);
-    let reference = |index: usize| model.predict(black_box(rows[index].as_slice())).unwrap();
-    let jit = |index: usize| compiled.predict(black_box(rows[index].as_slice())).unwrap();
-    let floor = |index| scores[index];
-    measure(reference, 10_000);
-    measure(jit, 10_000);
-    measure(floor, 10_000);
-    let mut samples = [[0.0; 3]; ROUNDS];
-    for (round, sample) in samples.iter_mut().enumerate() {
-        let order = if round % 2 == 0 { [0, 1, 2] } else { [2, 1, 0] };
-        for variant in order {
-            sample[variant] = match variant {
-                0 => measure(reference, CALLS),
-                1 => measure(jit, CALLS),
-                2 => measure(floor, CALLS),
-                _ => unreachable!(),
+    let mut kernels = Vec::new();
+    let orders = std::iter::once(Order::TreeOrder)
+        .chain([1, 2, 4, 8].map(|cap| Order::Rolling(NonZeroUsize::new(cap).unwrap())));
+    for order in orders {
+        for count in [1, 2, 4] {
+            let options = CompileOptions {
+                order,
+                accumulators: NonZeroUsize::new(count).unwrap(),
             };
+            let start = Instant::now();
+            let compiled = compile_with_options(&context, &model, options)?;
+            let compile_ms = start.elapsed().as_secs_f64() * 1e3;
+            let label = match order {
+                Order::TreeOrder => format!("Tree order, sums {count}"),
+                Order::Rolling(cap) => format!("Rolling {cap}, sums {count}"),
+            };
+            kernels.push((label, compiled, compile_ms));
         }
     }
+    let (scores, distinct) = verify(&model, &kernels[0].1, &rows);
+    for (_, compiled, _) in &kernels[1..] {
+        verify(&model, compiled, &rows);
+    }
+    let reference = |index: usize| model.predict(black_box(rows[index].as_slice())).unwrap();
+    let floor = |index| scores[index];
+    let measure_variant = |variant, calls| match variant {
+        0 => measure(reference, calls),
+        last if last == kernels.len() + 1 => measure(floor, calls),
+        index => {
+            let compiled = &kernels[index - 1].1;
+            measure(
+                |row| compiled.predict(black_box(rows[row].as_slice())).unwrap(),
+                calls,
+            )
+        }
+    };
+    let mut order: Vec<_> = (0..kernels.len() + 2).collect();
+    for &variant in &order {
+        measure_variant(variant, 10_000);
+    }
+    let mut samples = vec![vec![0.0; order.len()]; ROUNDS];
+    for sample in &mut samples {
+        for &variant in &order {
+            sample[variant] = measure_variant(variant, CALLS);
+        }
+        order.reverse();
+    }
     println!("Synthetic: 64 trees, depth 6, {FEATURES} features, {ROWS} rows; generic target");
-    println!("Compile: {compile_ms:.3} ms; dependent chain visits {distinct} distinct rows");
+    println!("Dependent chain visits {distinct} distinct rows");
     println!(
         "{ROUNDS} rounds x {CALLS} calls; ns/prediction includes driver (floor not subtracted)"
     );
-    for (variant, label) in ["Reference", "Scalar JIT", "Driver floor"]
-        .into_iter()
-        .enumerate()
-    {
-        let mut values = samples.map(|sample| sample[variant]);
+    println!("Variant                    median      min      max   compile ms");
+    for variant in 0..order.len() {
+        let (label, compile_ms) = match variant {
+            0 => ("Reference", "-".to_owned()),
+            last if last == kernels.len() + 1 => ("Driver floor", "-".to_owned()),
+            index => (
+                kernels[index - 1].0.as_str(),
+                format!("{:.3}", kernels[index - 1].2),
+            ),
+        };
+        let mut values: Vec<_> = samples.iter().map(|sample| sample[variant]).collect();
         values.sort_by(f64::total_cmp);
         println!(
-            "{label}: median {:.2}, min {:.2}, max {:.2}",
+            "{label:<25} {:>7.2}  {:>7.2}  {:>7.2}  {compile_ms:>11}",
             values[ROUNDS / 2],
             values[0],
             values[ROUNDS - 1]
@@ -132,7 +163,7 @@ mod tests {
     fn workload_agrees_and_dependent_trace_visits_multiple_rows() {
         let (model, rows) = workload();
         let context = Context::create();
-        let compiled = compile(&context, &model).unwrap();
+        let compiled = compile_with_options(&context, &model, CompileOptions::default()).unwrap();
         let (scores, distinct) = verify(&model, &compiled, &rows);
         assert_eq!(scores.len(), ROWS);
         assert!(distinct > 1);

@@ -1,5 +1,6 @@
 use inkwell::context::Context;
-use tigerboost::jit::compile;
+use std::num::NonZeroUsize;
+use tigerboost::jit::{CompileOptions, Order, compile, compile_with_options};
 use tigerboost::parsed_tree::{
     Discriminator, FeatureIndex, NanMode, RowLengthError, SingleTree, Trees,
 };
@@ -18,6 +19,17 @@ fn indexed_tree(selections: Vec<Discriminator>) -> SingleTree {
     }
 }
 
+fn configurations() -> impl Iterator<Item = CompileOptions> {
+    std::iter::once(Order::TreeOrder)
+        .chain([1, 2, 4, 8].map(|cap| Order::Rolling(NonZeroUsize::new(cap).unwrap())))
+        .flat_map(|order| {
+            [1, 2, 4].map(move |count| CompileOptions {
+                order,
+                accumulators: NonZeroUsize::new(count).unwrap(),
+            })
+        })
+}
+
 #[test]
 fn indexed_leaves_expose_original_level_bits_and_strict_comparisons() {
     let context = Context::create();
@@ -32,26 +44,28 @@ fn indexed_leaves_expose_original_level_bits_and_strict_comparisons() {
         0.0,
     )
     .unwrap();
-    let compiled = compile(&context, &model).unwrap();
-    for index in 0..8 {
-        let row = [
-            if index & 2 != 0 { 2.0 } else { 1.0 },
-            if index & 4 != 0 { 0.0 } else { -1.0 },
-            if index & 1 != 0 { 1.0 } else { -0.0 },
-        ];
-        assert_eq!(compiled.predict(&row).unwrap(), index as f64);
-    }
-    for row in [
-        [f64::NAN; 3],
-        [f64::NEG_INFINITY; 3],
-        [f64::INFINITY; 3],
-        [
-            f64::from_bits(1.0f64.to_bits() + 1),
-            -1.0,
-            f64::from_bits(1),
-        ],
-    ] {
-        assert_eq!(compiled.predict(&row), model.predict(&row));
+    for options in configurations() {
+        let compiled = compile_with_options(&context, &model, options).unwrap();
+        for index in 0..8 {
+            let row = [
+                if index & 2 != 0 { 2.0 } else { 1.0 },
+                if index & 4 != 0 { 0.0 } else { -1.0 },
+                if index & 1 != 0 { 1.0 } else { -0.0 },
+            ];
+            assert_eq!(compiled.predict(&row).unwrap(), index as f64);
+        }
+        for row in [
+            [f64::NAN; 3],
+            [f64::NEG_INFINITY; 3],
+            [f64::INFINITY; 3],
+            [
+                f64::from_bits(1.0f64.to_bits() + 1),
+                -1.0,
+                f64::from_bits(1),
+            ],
+        ] {
+            assert_eq!(compiled.predict(&row), model.predict(&row));
+        }
     }
 }
 
@@ -76,15 +90,17 @@ fn repeated_features_nan_modes_and_scale_bias_match_reference() {
         -3.0,
     )
     .unwrap();
-    let compiled = compile(&context, &model).unwrap();
-    for row in [
-        [f64::NAN; 3],
-        [-f64::NAN, 1.0, 2.0],
-        [f64::NEG_INFINITY, f64::INFINITY, 0.0],
-        [f64::INFINITY, -0.0, 1.0],
-        [1.0, -1.0, 3.0],
-    ] {
-        assert_eq!(compiled.predict(&row), model.predict(&row));
+    for options in configurations() {
+        let compiled = compile_with_options(&context, &model, options).unwrap();
+        for row in [
+            [f64::NAN; 3],
+            [-f64::NAN, 1.0, 2.0],
+            [f64::NEG_INFINITY, f64::INFINITY, 0.0],
+            [f64::INFINITY, -0.0, 1.0],
+            [1.0, -1.0, 3.0],
+        ] {
+            assert_eq!(compiled.predict(&row), model.predict(&row));
+        }
     }
 }
 
@@ -92,36 +108,69 @@ fn repeated_features_nan_modes_and_scale_bias_match_reference() {
 fn empty_and_constant_forests_need_no_row_loads() {
     let context = Context::create();
     let empty = Trees::new(vec![], vec![], f64::NAN, -0.0).unwrap();
-    assert_eq!(
-        compile(&context, &empty)
-            .unwrap()
-            .predict(&[])
-            .unwrap()
-            .to_bits(),
-        (-0.0f64).to_bits()
-    );
-    for leaves in [
-        vec![1.5, -2.0],
-        vec![f64::INFINITY],
-        vec![f64::INFINITY, f64::NEG_INFINITY],
-        vec![f64::NAN],
-    ] {
-        let model = Trees::new(
-            leaves
-                .into_iter()
-                .map(|leaf| SingleTree {
-                    leafs: vec![leaf],
-                    selections: vec![],
-                })
-                .collect(),
-            vec![],
-            2.0,
-            3.0,
-        )
-        .unwrap();
-        let result = compile(&context, &model).unwrap().predict(&[]).unwrap();
-        let expected = model.predict(&[]).unwrap();
-        assert!(result == expected || result.is_nan() && expected.is_nan());
+    for options in configurations() {
+        assert_eq!(
+            compile_with_options(&context, &empty, options)
+                .unwrap()
+                .predict(&[])
+                .unwrap()
+                .to_bits(),
+            (-0.0f64).to_bits()
+        );
+        for leaves in [
+            vec![1.5, -2.0],
+            vec![f64::INFINITY],
+            vec![f64::INFINITY, f64::NEG_INFINITY],
+            vec![f64::NAN],
+        ] {
+            let model = Trees::new(
+                leaves
+                    .into_iter()
+                    .map(|leaf| SingleTree {
+                        leafs: vec![leaf],
+                        selections: vec![],
+                    })
+                    .collect(),
+                vec![],
+                2.0,
+                3.0,
+            )
+            .unwrap();
+            let result = compile_with_options(&context, &model, options)
+                .unwrap()
+                .predict(&[])
+                .unwrap();
+            let expected = model.predict(&[]).unwrap();
+            assert!(result == expected || result.is_nan() && expected.is_nan());
+        }
+    }
+}
+
+#[test]
+fn reordered_sums_allow_cancellation_error_scaled_by_absolute_leaves() {
+    let context = Context::create();
+    let values = [1e16, 1.0, -1e16, 3.0];
+    let model = Trees::new(
+        values
+            .map(|value| SingleTree {
+                leafs: vec![value, -value],
+                selections: vec![split(0, 0.0)],
+            })
+            .into(),
+        vec![NanMode::AsIs],
+        1.0,
+        0.0,
+    )
+    .unwrap();
+    let tolerance =
+        values.len() as f64 * f64::EPSILON * values.iter().map(|value| value.abs()).sum::<f64>();
+    for options in configurations() {
+        let compiled = compile_with_options(&context, &model, options).unwrap();
+        for row in [[-1.0], [1.0]] {
+            assert!(
+                (compiled.predict(&row).unwrap() - model.predict(&row).unwrap()).abs() <= tolerance
+            );
+        }
     }
 }
 

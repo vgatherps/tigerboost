@@ -1,4 +1,5 @@
 use crate::parsed_tree::{NanMode, RowLengthError, Trees};
+use crate::sort_policy::{self, Action};
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::context::Context;
 use inkwell::execution_engine::JitFunction;
@@ -7,10 +8,31 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
 use inkwell::values::{BasicValue, FastMathFlags, FloatValue};
 use inkwell::{AddressSpace, FloatPredicate, OptimizationLevel};
-use std::error::Error;
+use std::{error::Error, num::NonZeroUsize};
 
 type PredictFn = unsafe extern "C" fn(*const f64) -> f64;
 type CompileResult<T> = Result<T, Box<dyn Error>>;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Order {
+    TreeOrder,
+    Rolling(NonZeroUsize),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CompileOptions {
+    pub order: Order,
+    pub accumulators: NonZeroUsize,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            order: Order::TreeOrder,
+            accumulators: NonZeroUsize::new(1).unwrap(),
+        }
+    }
+}
 
 pub struct CompiledModel<'ctx> {
     // Retains the engine, including executable code and private constant globals.
@@ -33,6 +55,14 @@ impl CompiledModel<'_> {
 }
 
 pub fn compile<'ctx>(context: &'ctx Context, model: &Trees) -> CompileResult<CompiledModel<'ctx>> {
+    compile_with_options(context, model, CompileOptions::default())
+}
+
+pub fn compile_with_options<'ctx>(
+    context: &'ctx Context,
+    model: &Trees,
+    options: CompileOptions,
+) -> CompileResult<CompiledModel<'ctx>> {
     Target::initialize_native(&InitializationConfig::default())?;
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple)?;
@@ -46,7 +76,7 @@ pub fn compile<'ctx>(context: &'ctx Context, model: &Trees) -> CompileResult<Com
             CodeModel::Default,
         )
         .ok_or("could not create native target machine")?;
-    let module = emit_model(context, model)?;
+    let module = emit_model(context, model, options)?;
     module.set_triple(&triple);
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.verify()?;
@@ -65,7 +95,15 @@ pub fn compile<'ctx>(context: &'ctx Context, model: &Trees) -> CompileResult<Com
     })
 }
 
-fn emit_model<'ctx>(context: &'ctx Context, model: &Trees) -> CompileResult<Module<'ctx>> {
+fn emit_model<'ctx>(
+    context: &'ctx Context,
+    model: &Trees,
+    options: CompileOptions,
+) -> CompileResult<Module<'ctx>> {
+    let schedule = match options.order {
+        Order::TreeOrder => sort_policy::tree_order(model),
+        Order::Rolling(cap) => sort_policy::schedule(model, cap),
+    };
     let module = context.create_module("tigerboost");
     let builder = context.create_builder();
     let f64_type = context.f64_type();
@@ -98,80 +136,116 @@ fn emit_model<'ctx>(context: &'ctx Context, model: &Trees) -> CompileResult<Modu
     }
     builder.position_at_end(context.append_basic_block(function, "entry"));
     let row = function.get_first_param().unwrap().into_pointer_value();
-    let mut sum = f64_type.const_zero();
-    for (tree_number, tree) in model.trees().iter().enumerate() {
-        let leaf_count = u32::try_from(tree.leafs.len())
-            .map_err(|_| "leaf table exceeds LLVM array length limit")?;
-        let leaf_type = f64_type.array_type(leaf_count);
-        let leaves = module.add_global(leaf_type, None, &format!("leaves_{tree_number}"));
-        leaves.set_linkage(Linkage::Private);
-        leaves.set_constant(true);
-        leaves.set_alignment(8);
-        let values: Vec<_> = tree
-            .leafs
-            .iter()
-            .map(|&leaf| f64_type.const_float(leaf))
-            .collect();
-        leaves.set_initializer(&f64_type.const_array(&values));
-        let mut index = zero;
-        for (level, split) in tree.selections.iter().enumerate() {
-            // SAFETY: Trees validates the feature index and row byte span;
-            // CompiledModel::predict checks that the caller supplies that span.
-            let address = unsafe {
-                builder.build_in_bounds_gep(
-                    f64_type,
-                    row,
-                    &[index_type.const_int(split.feature_idx.0 as u64, false)],
-                    "feature_ptr",
-                )?
-            };
-            let loaded = builder.build_load(f64_type, address, "feature")?;
-            loaded.as_instruction_value().unwrap().set_alignment(8)?;
-            let mut value = loaded.into_float_value();
-            let mode = model.feature_modes()[split.feature_idx.0];
-            if mode != NanMode::AsIs {
-                let is_nan =
-                    builder.build_float_compare(FloatPredicate::UNO, value, value, "is_nan")?;
-                let replacement = if mode == NanMode::AsFalse {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::INFINITY
-                };
-                value = builder
-                    .build_select(
-                        is_nan,
-                        f64_type.const_float(replacement),
-                        value,
-                        "nan_value",
+    let mut indices = vec![None; model.trees().len()];
+    let mut loaded_feature = None;
+    let mut sums =
+        vec![f64_type.const_zero(); options.accumulators.get().min(model.trees().len().max(1))];
+    let mut retired = 0;
+    for action in schedule.actions {
+        match action {
+            Action::Admit(tree) => indices[tree.0] = Some(zero),
+            Action::Load(feature) => {
+                // SAFETY: Trees validates the feature index and row byte span;
+                // CompiledModel::predict checks that the caller supplies that span.
+                let address = unsafe {
+                    builder.build_in_bounds_gep(
+                        f64_type,
+                        row,
+                        &[index_type.const_int(feature.0 as u64, false)],
+                        "feature_ptr",
                     )?
-                    .into_float_value();
+                };
+                let loaded = builder.build_load(f64_type, address, "feature")?;
+                loaded.as_instruction_value().unwrap().set_alignment(8)?;
+                let mut value = loaded.into_float_value();
+                let mode = model.feature_modes()[feature.0];
+                if mode != NanMode::AsIs {
+                    let is_nan =
+                        builder.build_float_compare(FloatPredicate::UNO, value, value, "is_nan")?;
+                    let replacement = if mode == NanMode::AsFalse {
+                        f64::NEG_INFINITY
+                    } else {
+                        f64::INFINITY
+                    };
+                    value = builder
+                        .build_select(
+                            is_nan,
+                            f64_type.const_float(replacement),
+                            value,
+                            "nan_value",
+                        )?
+                        .into_float_value();
+                }
+                loaded_feature = Some(value);
             }
-            let bit = builder.build_float_compare(
-                FloatPredicate::OGT,
-                value,
-                f64_type.const_float(split.threshold),
-                "split",
-            )?;
-            let bit = builder.build_int_z_extend(bit, index_type, "bit")?;
-            let bit = builder.build_left_shift(
-                bit,
-                index_type.const_int(level as u64, false),
-                "level_bit",
-            )?;
-            index = builder.build_or(index, bit, "leaf_index")?;
+            Action::Compare {
+                predicate,
+                consumers,
+            } => {
+                let split = &schedule.predicates[predicate.0];
+                let bit = builder.build_float_compare(
+                    FloatPredicate::OGT,
+                    loaded_feature.expect("comparison requires a loaded feature"),
+                    f64_type.const_float(split.threshold),
+                    "split",
+                )?;
+                let bit = builder.build_int_z_extend(bit, index_type, "bit")?;
+                for consumer in consumers {
+                    let level_bit = builder.build_left_shift(
+                        bit,
+                        index_type.const_int(consumer.level as u64, false),
+                        "level_bit",
+                    )?;
+                    let index =
+                        indices[consumer.tree.0].expect("comparison requires an active tree");
+                    indices[consumer.tree.0] =
+                        Some(builder.build_or(index, level_bit, "leaf_index")?);
+                }
+            }
+            Action::Retire(tree_id) => {
+                let index = indices[tree_id.0]
+                    .take()
+                    .expect("retirement requires an active tree");
+                let tree = &model.trees()[tree_id.0];
+                let leaf_count = u32::try_from(tree.leafs.len())
+                    .map_err(|_| "leaf table exceeds LLVM array length limit")?;
+                let leaf_type = f64_type.array_type(leaf_count);
+                let leaves = module.add_global(leaf_type, None, &format!("leaves_{}", tree_id.0));
+                leaves.set_linkage(Linkage::Private);
+                leaves.set_constant(true);
+                leaves.set_alignment(8);
+                let values: Vec<_> = tree
+                    .leafs
+                    .iter()
+                    .map(|&leaf| f64_type.const_float(leaf))
+                    .collect();
+                leaves.set_initializer(&f64_type.const_array(&values));
+                // SAFETY: exactly depth bits form index, and Trees requires 2^depth leaves.
+                let address = unsafe {
+                    builder.build_in_bounds_gep(
+                        leaf_type,
+                        leaves.as_pointer_value(),
+                        &[zero, index],
+                        "leaf_ptr",
+                    )?
+                };
+                let leaf = builder.build_load(f64_type, address, "leaf")?;
+                leaf.as_instruction_value().unwrap().set_alignment(8)?;
+                let slot = retired % sums.len();
+                let accumulator = &mut sums[slot];
+                *accumulator = reassociate(builder.build_float_add(
+                    *accumulator,
+                    leaf.into_float_value(),
+                    "sum",
+                )?)?;
+                retired += 1;
+            }
         }
-        // SAFETY: exactly depth bits form index, and Trees requires 2^depth leaves.
-        let address = unsafe {
-            builder.build_in_bounds_gep(
-                leaf_type,
-                leaves.as_pointer_value(),
-                &[zero, index],
-                "leaf_ptr",
-            )?
-        };
-        let leaf = builder.build_load(f64_type, address, "leaf")?;
-        leaf.as_instruction_value().unwrap().set_alignment(8)?;
-        sum = reassociate(builder.build_float_add(sum, leaf.into_float_value(), "sum")?)?;
+    }
+    let mut sums = sums.into_iter();
+    let mut sum = sums.next().unwrap();
+    for partial in sums {
+        sum = reassociate(builder.build_float_add(sum, partial, "reduced")?)?;
     }
     let result = if model.trees().is_empty() {
         f64_type.const_float(model.bias())
@@ -204,6 +278,55 @@ mod tests {
     use crate::parsed_tree::{Discriminator, FeatureIndex, SingleTree};
 
     #[test]
+    fn rolling_shares_loads_and_comparisons_before_llvm_passes() {
+        let context = Context::create();
+        let split = Discriminator {
+            feature_idx: FeatureIndex(0),
+            threshold: 0.0,
+        };
+        let model = Trees::new(
+            vec![
+                SingleTree {
+                    leafs: vec![0.0, 1.0, 2.0, 3.0],
+                    selections: vec![split.clone(), split.clone()],
+                },
+                SingleTree {
+                    leafs: vec![0.0, 1.0, 2.0, 3.0],
+                    selections: vec![
+                        split,
+                        Discriminator {
+                            feature_idx: FeatureIndex(0),
+                            threshold: 1.0,
+                        },
+                    ],
+                },
+            ],
+            vec![NanMode::AsIs],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        for (order, loads, comparisons) in [
+            (Order::TreeOrder, 6, 4),
+            (Order::Rolling(NonZeroUsize::new(2).unwrap()), 3, 2),
+        ] {
+            let module = emit_model(
+                &context,
+                &model,
+                CompileOptions {
+                    order,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            module.verify().unwrap();
+            let ir = module.print_to_string().to_string();
+            assert_eq!(ir.matches("load double").count(), loads);
+            assert_eq!(ir.matches("fcmp ogt double").count(), comparisons);
+        }
+    }
+
+    #[test]
     fn ir_has_readonly_rows_constant_leaves_and_only_reassociation() {
         let context = Context::create();
         let model = Trees::new(
@@ -219,7 +342,7 @@ mod tests {
             3.0,
         )
         .unwrap();
-        let module = emit_model(&context, &model).unwrap();
+        let module = emit_model(&context, &model, CompileOptions::default()).unwrap();
         module.verify().unwrap();
         let ir = module.print_to_string().to_string();
         for expected in [

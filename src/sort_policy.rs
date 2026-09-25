@@ -30,6 +30,28 @@ pub(crate) struct Schedule {
     pub actions: Vec<Action>,
 }
 
+pub(crate) fn tree_order(trees: &Trees) -> Schedule {
+    let mut plan = Schedule {
+        predicates: Vec::new(),
+        actions: Vec::new(),
+    };
+    for (tree, description) in trees.trees().iter().enumerate() {
+        let tree = TreeId(tree);
+        plan.actions.push(Action::Admit(tree));
+        for (level, split) in description.selections.iter().enumerate() {
+            let predicate = PredicateId(plan.predicates.len());
+            plan.predicates.push(split.clone());
+            plan.actions.push(Action::Load(split.feature_idx));
+            plan.actions.push(Action::Compare {
+                predicate,
+                consumers: vec![Consumer { tree, level }],
+            });
+        }
+        plan.actions.push(Action::Retire(tree));
+    }
+    plan
+}
+
 struct ActiveTree {
     id: TreeId,
     remaining: usize,

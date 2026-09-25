@@ -64,3 +64,19 @@ User rejected the Python/CatBoost setup and native fixture pipeline as overengin
 ## Rolling planner review
 
 Replaced the unfinished sorting sketch with a 230-line crate-private planner. Parent reviewed the action representation, exact-bit predicate interning, bounded active set, deterministic choices, constant-tree handling, immediate retirement/refill, and retained-feature reuse. Six focused interpreter tests pass in debug/release; edition-2024 formatting and diff checks pass. Prediction code is unchanged, so this slice makes no latency claim. Planner dead-code warnings disappear when LLVM lowering consumes it in the next slice.
+
+## Rolling LLVM review
+
+Both orders now use one action lowerer; retirement clears its partial index and updates a round-robin accumulator. Parent and independent review found no correctness defect or need for another abstraction. Fourteen library/scalar tests pass in release (independent reviewer reran debug); benchmark trace validation also passes. No warnings. Default remains tree-order/one accumulator until broader measurements and emitted-code review.
+
+Same 64-tree workload, parent medians in ns/call (driver included):
+
+| Order | 1 accumulator | 2 accumulators | 4 accumulators |
+|---|---:|---:|---:|
+| Tree order | 92.07 | 94.69 | 95.05 |
+| Rolling, cap 1 | 87.17 | 90.33 | 89.11 |
+| Rolling, cap 2 | 83.53 | 82.66 | 82.08 |
+| Rolling, cap 4 | 86.39 | 79.68 | 79.12 |
+| Rolling, cap 8 | 85.53 | 82.92 | 83.91 |
+
+Extra accumulators alone regress. Rolling cap 4 with two accumulators improves about 13% over tree order on this workload; four accumulators have similar timing and need more logical state. Reference 169.28 ns, floor 5.22 ns. Compilation ranged 36–73 ms, with first-call LLVM setup included only in the first case. Logical action lifetimes are tested; physical register pressure is not yet established.
