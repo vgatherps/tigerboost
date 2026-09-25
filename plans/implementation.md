@@ -80,3 +80,9 @@ Same 64-tree workload, parent medians in ns/call (driver included):
 | Rolling, cap 8 | 85.53 | 82.92 | 83.91 |
 
 Extra accumulators alone regress. Rolling cap 4 with two accumulators improves about 13% over tree order on this workload; four accumulators have similar timing and need more logical state. Reference 169.28 ns, floor 5.22 ns. Compilation ranged 36–73 ms, with first-call LLVM setup included only in the first case. Logical action lifetimes are tested; physical register pressure is not yet established.
+
+## Emitted-code inspection
+
+Added a narrow `emit_assembly` API sharing target setup/passes with JIT compilation, and a small `inspect_code` example. Parent checked the diff, reran fifteen library/scalar tests, emitted both targets, and assembled their output with LLVM 21 `llvm-mc`. Workload extraction preserves the exact original model/rows. These are separate emissions, not MCJIT byte disassemblies.
+
+The inspection exposed substantial spilling despite bounded planned indices. ARM64 text shrinks from 12,232 to 11,192 bytes (tree-order1 → rolling4/sums2), but rolling still allocates 1,536 local stack bytes plus 160 bytes of callee saves. x86 text grows 8,650 → 9,044 bytes; local stack allocation grows 344 → 496 bytes. Body stores/reloads include generated indices and FP temporaries, not only ABI saves. Resolve emission/backend ordering before adding SIMD; do not claim physical boundedness from the planner cap.

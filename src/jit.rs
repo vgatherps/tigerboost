@@ -5,7 +5,9 @@ use inkwell::context::Context;
 use inkwell::execution_engine::JitFunction;
 use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
-use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
+use inkwell::targets::{
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
+};
 use inkwell::values::{BasicValue, FastMathFlags, FloatValue};
 use inkwell::{AddressSpace, FloatPredicate, OptimizationLevel};
 use std::{error::Error, num::NonZeroUsize};
@@ -65,19 +67,49 @@ pub fn compile_with_options<'ctx>(
 ) -> CompileResult<CompiledModel<'ctx>> {
     Target::initialize_native(&InitializationConfig::default())?;
     let triple = TargetMachine::get_default_triple();
-    let target = Target::from_triple(&triple)?;
+    let (module, _) = prepare_module(context, model, options, &triple)?;
+    let engine = module.create_jit_execution_engine(OptimizationLevel::Less)?;
+    // SAFETY: emit_model builds exactly C ABI double(const double*).
+    let function = unsafe { engine.get_function::<PredictFn>("predict")? };
+    Ok(CompiledModel {
+        function,
+        feature_count: model.feature_modes().len(),
+    })
+}
+
+/// Separate target emission for inspection, not disassembly of MCJIT's executable bytes.
+pub fn emit_assembly(
+    context: &Context,
+    model: &Trees,
+    options: CompileOptions,
+    target_triple: &str,
+) -> CompileResult<String> {
+    Target::initialize_all(&InitializationConfig::default());
+    let triple = TargetTriple::create(target_triple);
+    let (module, machine) = prepare_module(context, model, options, &triple)?;
+    let buffer = machine.write_to_memory_buffer(&module, FileType::Assembly)?;
+    Ok(String::from_utf8(buffer.as_slice().to_vec())?)
+}
+
+fn prepare_module<'ctx>(
+    context: &'ctx Context,
+    model: &Trees,
+    options: CompileOptions,
+    triple: &TargetTriple,
+) -> CompileResult<(Module<'ctx>, TargetMachine)> {
+    let target = Target::from_triple(triple)?;
     let machine = target
         .create_target_machine(
-            &triple,
+            triple,
             "generic",
             "",
             OptimizationLevel::Less,
             RelocMode::Default,
             CodeModel::Default,
         )
-        .ok_or("could not create native target machine")?;
+        .ok_or("could not create target machine")?;
     let module = emit_model(context, model, options)?;
-    module.set_triple(&triple);
+    module.set_triple(triple);
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.verify()?;
     module.run_passes(
@@ -86,13 +118,7 @@ pub fn compile_with_options<'ctx>(
         PassBuilderOptions::create(),
     )?;
     module.verify()?;
-    let engine = module.create_jit_execution_engine(OptimizationLevel::Less)?;
-    // SAFETY: emit_model builds exactly C ABI double(const double*).
-    let function = unsafe { engine.get_function::<PredictFn>("predict")? };
-    Ok(CompiledModel {
-        function,
-        feature_count: model.feature_modes().len(),
-    })
+    Ok((module, machine))
 }
 
 fn emit_model<'ctx>(
@@ -276,6 +302,29 @@ fn reassociate(value: FloatValue<'_>) -> CompileResult<FloatValue<'_>> {
 mod tests {
     use super::*;
     use crate::parsed_tree::{Discriminator, FeatureIndex, SingleTree};
+
+    #[test]
+    fn emits_predict_for_aarch64_and_x86_64() {
+        let context = Context::create();
+        let model = Trees::new(
+            vec![SingleTree {
+                leafs: vec![1.0, 2.0],
+                selections: vec![Discriminator {
+                    feature_idx: FeatureIndex(0),
+                    threshold: 0.0,
+                }],
+            }],
+            vec![NanMode::AsIs],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+            let assembly =
+                emit_assembly(&context, &model, CompileOptions::default(), triple).unwrap();
+            assert!(assembly.contains("predict"), "{triple}: {assembly}");
+        }
+    }
 
     #[test]
     fn rolling_shares_loads_and_comparisons_before_llvm_passes() {
