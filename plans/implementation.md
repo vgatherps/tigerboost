@@ -92,3 +92,11 @@ Independent review found an inspection mismatch: MCJIT's EngineBuilder defaults 
 Tried backend `Default` with the previous code model: emitted ARM64 assembly was byte-identical and timings unchanged. Dropped that experiment; backend stays `Less`. A shared private constant now keeps both creation sites consistent. After code-model correction, same-workload tree-order1/rolling4-sums2 medians were 93.12/79.98 ns; sixteen focused release tests pass.
 
 Also tried `None` with JITDefault. ARM64 rolling emission has no stack accesses and begins accumulating leaves around line 157 rather than near the end; x86 stack-access instructions decrease 205 → 170. Warm compilation falls to about 3 ms. However, rolling4/sums2 latency regresses 79.98 → 87.15 ns on the same workload. Dropped the change rather than trade away the primary latency goal. Retain `Less`; record the physical-liveness limitation explicitly. SIMD exploration follows on the faster accepted baseline, not on the regressing experiment.
+
+## Two-lane SIMD review
+
+Parent and independent review accepted same-feature pairs of distinct predicates, with all consumers updated before retirement/refill. Odd tails stay scalar. Both vector lanes are defined; ordered comparisons retain NaN behavior. One shared consumer loop handles both modes. Focused lane-order, fanout/refill, odd-tail and IR tests pass; parent reran 18 library/JIT/benchmark tests. Agent also passed release, Clippy and formatting gates.
+
+Same-workload parent medians: tree order 91.59 ns, scalar rolling2/sums2 81.89 ns, SIMD rolling2/sums2 73.92 ns. SIMD rolling4/sums2 regresses 79.31 → 80.35 ns; two earlier runs also regressed at cap4. Defaults remain unchanged pending broader shapes. Driver floor 5.19 ns included; SIMD cap2 compilation 31.843 ms.
+
+Both targets emit packed comparisons (ARM64 `fcmgt.2d`, x86-64 `cmpltpd`/`movmskpd`). Six outputs assembled successfully. For cap4/sums2, ARM64 text decreases 11,176 → 9,880 bytes and local stack 1,472 → 736 bytes (plus 160 callee saves). x86-64 text grows 11,883 → 12,286 bytes and local stack 552 → 888 bytes. SIMD reduces comparison count, but extraction and scheduling costs remain target/model dependent. No x86 execution result.

@@ -14,14 +14,23 @@ pub(crate) struct Consumer {
     pub level: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ComparisonMode {
+    Scalar,
+    Simd2,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Comparison {
+    pub predicate: PredicateId,
+    pub consumers: Vec<Consumer>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     Admit(TreeId),
     Load(FeatureIndex),
-    Compare {
-        predicate: PredicateId,
-        consumers: Vec<Consumer>,
-    },
+    Compare(Vec<Comparison>),
     Retire(TreeId),
 }
 
@@ -42,10 +51,10 @@ pub(crate) fn tree_order(trees: &Trees) -> Schedule {
             let predicate = PredicateId(plan.predicates.len());
             plan.predicates.push(split.clone());
             plan.actions.push(Action::Load(split.feature_idx));
-            plan.actions.push(Action::Compare {
+            plan.actions.push(Action::Compare(vec![Comparison {
                 predicate,
                 consumers: vec![Consumer { tree, level }],
-            });
+            }]));
         }
         plan.actions.push(Action::Retire(tree));
     }
@@ -66,9 +75,14 @@ struct Planner {
     retained: Option<FeatureIndex>,
     actions: Vec<Action>,
     limit: usize,
+    comparisons: ComparisonMode,
 }
 
-pub(crate) fn schedule(trees: &Trees, max_live_trees: NonZeroUsize) -> Schedule {
+pub(crate) fn schedule(
+    trees: &Trees,
+    max_live_trees: NonZeroUsize,
+    comparisons: ComparisonMode,
+) -> Schedule {
     let mut predicates: Vec<Discriminator> = Vec::new();
     let mut frequencies = vec![0; trees.feature_modes().len()];
     let splits = trees
@@ -110,6 +124,7 @@ pub(crate) fn schedule(trees: &Trees, max_live_trees: NonZeroUsize) -> Schedule 
         retained: None,
         actions: Vec::new(),
         limit: max_live_trees.get(),
+        comparisons,
     }
     .run()
 }
@@ -206,31 +221,41 @@ impl Planner {
                 self.actions.push(Action::Load(feature));
                 self.retained = Some(feature);
             }
-            let predicate = self
-                .active
-                .iter()
-                .flat_map(|tree| self.pending(tree))
-                .map(|(_, id)| id)
-                .filter(|id| self.predicates[id.0].feature_idx == feature)
-                .min()
-                .unwrap();
-            let mut consumers = Vec::new();
-            for tree in &mut self.active {
-                for (level, &id) in self.splits[tree.id.0].iter().enumerate() {
-                    let bit = 1 << level;
-                    if id == predicate && tree.remaining & bit != 0 {
-                        consumers.push(Consumer {
-                            tree: tree.id,
-                            level,
-                        });
-                        tree.remaining &= !bit;
+            let width = match self.comparisons {
+                ComparisonMode::Scalar => 1,
+                ComparisonMode::Simd2 => 2,
+            };
+            let mut comparisons = Vec::new();
+            for _ in 0..width {
+                let Some(predicate) = self
+                    .active
+                    .iter()
+                    .flat_map(|tree| self.pending(tree))
+                    .map(|(_, id)| id)
+                    .filter(|id| self.predicates[id.0].feature_idx == feature)
+                    .min()
+                else {
+                    break;
+                };
+                let mut consumers = Vec::new();
+                for tree in &mut self.active {
+                    for (level, &id) in self.splits[tree.id.0].iter().enumerate() {
+                        let bit = 1 << level;
+                        if id == predicate && tree.remaining & bit != 0 {
+                            consumers.push(Consumer {
+                                tree: tree.id,
+                                level,
+                            });
+                            tree.remaining &= !bit;
+                        }
                     }
                 }
+                comparisons.push(Comparison {
+                    predicate,
+                    consumers,
+                });
             }
-            self.actions.push(Action::Compare {
-                predicate,
-                consumers,
-            });
+            self.actions.push(Action::Compare(comparisons));
             self.active.retain(|tree| {
                 if tree.remaining == 0 {
                     self.actions.push(Action::Retire(tree.id));

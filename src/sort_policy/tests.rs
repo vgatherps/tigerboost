@@ -30,7 +30,11 @@ fn forest(trees: Vec<SingleTree>) -> Trees {
 }
 
 fn check(trees: &Trees, cap: usize, row: &[f64]) -> Schedule {
-    let plan = schedule(trees, NonZeroUsize::new(cap).unwrap());
+    check_mode(trees, cap, row, ComparisonMode::Scalar)
+}
+
+fn check_mode(trees: &Trees, cap: usize, row: &[f64], mode: ComparisonMode) -> Schedule {
+    let plan = schedule(trees, NonZeroUsize::new(cap).unwrap(), mode);
     let mut state = vec![0; trees.trees().len()];
     let mut seen = vec![0usize; state.len()];
     let mut indices = vec![0usize; state.len()];
@@ -54,31 +58,38 @@ fn check(trees: &Trees, cap: usize, row: &[f64]) -> Schedule {
                 };
                 loaded = Some((*feature, value));
             }
-            Action::Compare {
-                predicate,
-                consumers,
-            } => {
-                assert!(
-                    !consumers.is_empty(),
-                    "comparison must resolve pending work"
-                );
-                let predicate = &plan.predicates[predicate.0];
-                let (feature, value) = loaded.expect("comparison without a loaded feature");
-                assert_eq!(feature, predicate.feature_idx);
-                let result = usize::from(value > predicate.threshold);
-                for &Consumer {
-                    tree: TreeId(tree),
-                    level,
-                } in consumers
+            Action::Compare(comparisons) => {
+                assert!((1..=2).contains(&comparisons.len()));
+                if comparisons.len() == 2 {
+                    assert_ne!(comparisons[0].predicate, comparisons[1].predicate);
+                }
+                for Comparison {
+                    predicate,
+                    consumers,
+                } in comparisons
                 {
-                    assert_eq!(state[tree], 1);
-                    let original = &trees.trees()[tree].selections[level];
-                    assert_eq!(original.feature_idx, predicate.feature_idx);
-                    assert_eq!(original.threshold.to_bits(), predicate.threshold.to_bits());
-                    let bit = 1 << level;
-                    assert_eq!(seen[tree] & bit, 0, "split consumed twice");
-                    seen[tree] |= bit;
-                    indices[tree] |= result << level;
+                    assert!(
+                        !consumers.is_empty(),
+                        "comparison must resolve pending work"
+                    );
+                    let predicate = &plan.predicates[predicate.0];
+                    let (feature, value) = loaded.expect("comparison without a loaded feature");
+                    assert_eq!(feature, predicate.feature_idx);
+                    let result = usize::from(value > predicate.threshold);
+                    for &Consumer {
+                        tree: TreeId(tree),
+                        level,
+                    } in consumers
+                    {
+                        assert_eq!(state[tree], 1);
+                        let original = &trees.trees()[tree].selections[level];
+                        assert_eq!(original.feature_idx, predicate.feature_idx);
+                        assert_eq!(original.threshold.to_bits(), predicate.threshold.to_bits());
+                        let bit = 1 << level;
+                        assert_eq!(seen[tree] & bit, 0, "split consumed twice");
+                        seen[tree] |= bit;
+                        indices[tree] |= result << level;
+                    }
                 }
             }
             Action::Retire(TreeId(tree)) => {
@@ -124,10 +135,10 @@ fn shares_exact_predicates_and_loads_different_thresholds() {
         .actions
         .iter()
         .filter_map(|action| match action {
-            Action::Compare {
-                predicate,
-                consumers,
-            } => Some((*predicate, consumers.len())),
+            Action::Compare(comparisons) => {
+                assert_eq!(comparisons.len(), 1);
+                Some((comparisons[0].predicate, comparisons[0].consumers.len()))
+            }
             _ => None,
         })
         .collect();
@@ -150,13 +161,13 @@ fn replaces_finished_tree_and_recomputes_discarded_predicate_without_reload() {
     assert_eq!(plan.actions[retire_short + 1], Action::Admit(TreeId(2)));
     assert_eq!(
         plan.actions[retire_short + 2],
-        Action::Compare {
+        Action::Compare(vec![Comparison {
             predicate: PredicateId(0),
             consumers: vec![Consumer {
                 tree: TreeId(2),
                 level: 0
             }],
-        }
+        }])
     );
     let retire_long = plan
         .actions
@@ -244,11 +255,73 @@ fn deterministic_varied_forests_obey_caps_and_preserve_leaf_bits() {
                 .collect(),
         );
         for cap in [1, 2, 4, 16] {
-            let first = check(&trees, cap, &rows[0]);
-            for row in rows {
-                let next = check(&trees, cap, &row);
-                assert_eq!(first.actions, next.actions);
+            for mode in [ComparisonMode::Scalar, ComparisonMode::Simd2] {
+                let first = check_mode(&trees, cap, &rows[0], mode);
+                for row in rows {
+                    let next = check_mode(&trees, cap, &row, mode);
+                    assert_eq!(first.actions, next.actions);
+                }
             }
         }
     }
+}
+
+#[test]
+fn pair_fanout_retires_both_trees_before_refill_and_leaves_odd_tail_scalar() {
+    let trees = forest(vec![
+        tree(&[(0, 0.0), (0, 1.0)]),
+        tree(&[(0, 1.0), (0, 0.0)]),
+        tree(&[(0, 2.0)]),
+    ]);
+    let plan = check_mode(&trees, 2, &[0.5; 4], ComparisonMode::Simd2);
+    let Action::Compare(pair) = &plan.actions[3] else {
+        panic!("expected pair")
+    };
+    assert_eq!(pair.len(), 2);
+    assert_eq!(
+        pair[0].consumers,
+        [
+            Consumer {
+                tree: TreeId(0),
+                level: 0
+            },
+            Consumer {
+                tree: TreeId(1),
+                level: 1
+            }
+        ]
+    );
+    assert_eq!(
+        pair[1].consumers,
+        [
+            Consumer {
+                tree: TreeId(0),
+                level: 1
+            },
+            Consumer {
+                tree: TreeId(1),
+                level: 0
+            }
+        ]
+    );
+    assert_eq!(
+        plan.actions[4..7],
+        [
+            Action::Retire(TreeId(0)),
+            Action::Retire(TreeId(1)),
+            Action::Admit(TreeId(2))
+        ]
+    );
+    let Action::Compare(tail) = &plan.actions[7] else {
+        panic!("expected scalar tail")
+    };
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].predicate, PredicateId(2));
+    assert_eq!(
+        plan.actions
+            .iter()
+            .filter(|action| matches!(action, Action::Load(_)))
+            .count(),
+        1
+    );
 }

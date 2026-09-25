@@ -1,4 +1,5 @@
 use crate::parsed_tree::{NanMode, RowLengthError, Trees};
+pub use crate::sort_policy::ComparisonMode;
 use crate::sort_policy::{self, Action};
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::context::Context;
@@ -8,6 +9,7 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
 };
+use inkwell::types::VectorType;
 use inkwell::values::{BasicValue, FastMathFlags, FloatValue};
 use inkwell::{AddressSpace, FloatPredicate, OptimizationLevel};
 use std::{error::Error, num::NonZeroUsize};
@@ -26,6 +28,8 @@ pub enum Order {
 pub struct CompileOptions {
     pub order: Order,
     pub accumulators: NonZeroUsize,
+    /// Packs comparisons only for rolling order; tree order remains scalar.
+    pub comparisons: ComparisonMode,
 }
 
 impl Default for CompileOptions {
@@ -33,6 +37,7 @@ impl Default for CompileOptions {
         Self {
             order: Order::TreeOrder,
             accumulators: NonZeroUsize::new(1).unwrap(),
+            comparisons: ComparisonMode::Scalar,
         }
     }
 }
@@ -129,7 +134,7 @@ fn emit_model<'ctx>(
 ) -> CompileResult<Module<'ctx>> {
     let schedule = match options.order {
         Order::TreeOrder => sort_policy::tree_order(model),
-        Order::Rolling(cap) => sort_policy::schedule(model, cap),
+        Order::Rolling(cap) => sort_policy::schedule(model, cap, options.comparisons),
     };
     let module = context.create_module("tigerboost");
     let builder = context.create_builder();
@@ -205,28 +210,65 @@ fn emit_model<'ctx>(
                 }
                 loaded_feature = Some(value);
             }
-            Action::Compare {
-                predicate,
-                consumers,
-            } => {
-                let split = &schedule.predicates[predicate.0];
-                let bit = builder.build_float_compare(
-                    FloatPredicate::OGT,
-                    loaded_feature.expect("comparison requires a loaded feature"),
-                    f64_type.const_float(split.threshold),
-                    "split",
-                )?;
-                let bit = builder.build_int_z_extend(bit, index_type, "bit")?;
-                for consumer in consumers {
-                    let level_bit = builder.build_left_shift(
-                        bit,
-                        index_type.const_int(consumer.level as u64, false),
-                        "level_bit",
-                    )?;
-                    let index =
-                        indices[consumer.tree.0].expect("comparison requires an active tree");
-                    indices[consumer.tree.0] =
-                        Some(builder.build_or(index, level_bit, "leaf_index")?);
+            Action::Compare(comparisons) => {
+                let feature = loaded_feature.expect("comparison requires a loaded feature");
+                let threshold = |comparison: &sort_policy::Comparison| {
+                    f64_type.const_float(schedule.predicates[comparison.predicate.0].threshold)
+                };
+                let bits = match comparisons.as_slice() {
+                    [single] => vec![builder.build_float_compare(
+                        FloatPredicate::OGT,
+                        feature,
+                        threshold(single),
+                        "split",
+                    )?],
+                    [first, second] => {
+                        let mut features = f64_type.vec_type(2).get_undef();
+                        for lane in 0..2 {
+                            features = builder.build_insert_element(
+                                features,
+                                feature,
+                                context.i32_type().const_int(lane, false),
+                                "splat",
+                            )?;
+                        }
+                        let thresholds =
+                            VectorType::const_vector(&[threshold(first), threshold(second)]);
+                        let result = builder.build_float_compare(
+                            FloatPredicate::OGT,
+                            features,
+                            thresholds,
+                            "splits",
+                        )?;
+                        let mut bits = Vec::new();
+                        for lane in 0..2 {
+                            bits.push(
+                                builder
+                                    .build_extract_element(
+                                        result,
+                                        context.i32_type().const_int(lane, false),
+                                        "lane",
+                                    )?
+                                    .into_int_value(),
+                            );
+                        }
+                        bits
+                    }
+                    _ => unreachable!("comparison pack must contain one or two predicates"),
+                };
+                for (comparison, bit) in comparisons.into_iter().zip(bits) {
+                    let bit = builder.build_int_z_extend(bit, index_type, "bit")?;
+                    for consumer in comparison.consumers {
+                        let level_bit = builder.build_left_shift(
+                            bit,
+                            index_type.const_int(consumer.level as u64, false),
+                            "level_bit",
+                        )?;
+                        let index =
+                            indices[consumer.tree.0].expect("comparison requires an active tree");
+                        indices[consumer.tree.0] =
+                            Some(builder.build_or(index, level_bit, "leaf_index")?);
+                    }
                 }
             }
             Action::Retire(tree_id) => {
@@ -356,15 +398,30 @@ mod tests {
             0.0,
         )
         .unwrap();
-        for (order, loads, comparisons) in [
-            (Order::TreeOrder, 6, 4),
-            (Order::Rolling(NonZeroUsize::new(2).unwrap()), 3, 2),
+        for (order, comparisons, loads, scalars, pairs) in [
+            (Order::TreeOrder, ComparisonMode::Scalar, 6, 4, 0),
+            (Order::TreeOrder, ComparisonMode::Simd2, 6, 4, 0),
+            (
+                Order::Rolling(NonZeroUsize::new(2).unwrap()),
+                ComparisonMode::Scalar,
+                3,
+                2,
+                0,
+            ),
+            (
+                Order::Rolling(NonZeroUsize::new(2).unwrap()),
+                ComparisonMode::Simd2,
+                3,
+                0,
+                1,
+            ),
         ] {
             let module = emit_model(
                 &context,
                 &model,
                 CompileOptions {
                     order,
+                    comparisons,
                     ..CompileOptions::default()
                 },
             )
@@ -372,7 +429,9 @@ mod tests {
             module.verify().unwrap();
             let ir = module.print_to_string().to_string();
             assert_eq!(ir.matches("load double").count(), loads);
-            assert_eq!(ir.matches("fcmp ogt double").count(), comparisons);
+            assert_eq!(ir.matches("fcmp ogt double").count(), scalars);
+            assert_eq!(ir.matches("fcmp ogt <2 x double>").count(), pairs);
+            assert_eq!(ir.matches("extractelement <2 x i1>").count(), pairs * 2);
         }
     }
 

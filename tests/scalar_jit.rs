@@ -1,6 +1,6 @@
 use inkwell::context::Context;
 use std::num::NonZeroUsize;
-use tigerboost::jit::{CompileOptions, Order, compile, compile_with_options};
+use tigerboost::jit::{ComparisonMode, CompileOptions, Order, compile, compile_with_options};
 use tigerboost::parsed_tree::{
     Discriminator, FeatureIndex, NanMode, RowLengthError, SingleTree, Trees,
 };
@@ -23,11 +23,58 @@ fn configurations() -> impl Iterator<Item = CompileOptions> {
     std::iter::once(Order::TreeOrder)
         .chain([1, 2, 4, 8].map(|cap| Order::Rolling(NonZeroUsize::new(cap).unwrap())))
         .flat_map(|order| {
-            [1, 2, 4].map(move |count| CompileOptions {
-                order,
-                accumulators: NonZeroUsize::new(count).unwrap(),
+            [1, 2, 4].into_iter().flat_map(move |count| {
+                [ComparisonMode::Scalar, ComparisonMode::Simd2].map(move |comparisons| {
+                    CompileOptions {
+                        order,
+                        accumulators: NonZeroUsize::new(count).unwrap(),
+                        comparisons,
+                    }
+                })
             })
         })
+}
+
+#[test]
+fn paired_thresholds_preserve_both_lane_orders_and_odd_tail() {
+    let context = Context::create();
+    let options = CompileOptions {
+        order: Order::Rolling(NonZeroUsize::new(1).unwrap()),
+        comparisons: ComparisonMode::Simd2,
+        ..CompileOptions::default()
+    };
+    let mut outcomes = [false; 4];
+    for thresholds in [[0.0, 1.0], [1.0, 0.0]] {
+        for mode in [NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue] {
+            let model = Trees::new(
+                vec![indexed_tree(vec![
+                    split(0, thresholds[0]),
+                    split(0, thresholds[1]),
+                    split(0, 2.0),
+                ])],
+                vec![mode],
+                1.0,
+                0.0,
+            )
+            .unwrap();
+            let compiled = compile_with_options(&context, &model, options).unwrap();
+            for value in [
+                f64::NEG_INFINITY,
+                -0.0,
+                0.0,
+                0.5,
+                1.0,
+                2.0,
+                f64::INFINITY,
+                f64::NAN,
+            ] {
+                let index = compiled.predict(&[value]).unwrap() as usize;
+                assert_eq!(index, model.leaf_indices(&[value]).unwrap()[0]);
+                outcomes[index & 3] = true;
+            }
+        }
+    }
+    assert!(outcomes.into_iter().all(|seen| seen));
 }
 
 #[test]

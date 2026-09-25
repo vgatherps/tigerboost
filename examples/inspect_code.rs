@@ -9,7 +9,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
 };
-use tigerboost::jit::{CompileOptions, Order, emit_assembly};
+use tigerboost::jit::{ComparisonMode, CompileOptions, Order, emit_assembly};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
@@ -32,6 +32,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 CompileOptions {
                     order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
                     accumulators: NonZeroUsize::new(2).unwrap(),
+                    comparisons: ComparisonMode::Scalar,
+                },
+            ),
+            (
+                "simd2-rolling-4-2",
+                CompileOptions {
+                    order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
+                    accumulators: NonZeroUsize::new(2).unwrap(),
+                    comparisons: ComparisonMode::Simd2,
                 },
             ),
         ] {

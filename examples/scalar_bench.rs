@@ -4,7 +4,7 @@ mod support;
 use inkwell::context::Context;
 use std::{error::Error, hint::black_box, num::NonZeroUsize, time::Instant};
 use support::{FEATURES, ROWS, workload};
-use tigerboost::jit::{CompileOptions, CompiledModel, Order, compile_with_options};
+use tigerboost::jit::{ComparisonMode, CompileOptions, CompiledModel, Order, compile_with_options};
 use tigerboost::parsed_tree::Trees;
 
 const CALLS: usize = 50_000;
@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let options = CompileOptions {
                 order,
                 accumulators: NonZeroUsize::new(count).unwrap(),
+                comparisons: ComparisonMode::Scalar,
             };
             let start = Instant::now();
             let compiled = compile_with_options(&context, &model, options)?;
@@ -74,6 +75,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             kernels.push((label, compiled, compile_ms));
         }
+    }
+    for cap in [1, 2, 4, 8] {
+        let options = CompileOptions {
+            order: Order::Rolling(NonZeroUsize::new(cap).unwrap()),
+            accumulators: NonZeroUsize::new(2).unwrap(),
+            comparisons: ComparisonMode::Simd2,
+        };
+        let start = Instant::now();
+        let compiled = compile_with_options(&context, &model, options)?;
+        let compile_ms = start.elapsed().as_secs_f64() * 1e3;
+        kernels.push((format!("SIMD2 rolling {cap}, sums 2"), compiled, compile_ms));
     }
     let (scores, distinct) = verify(&model, &kernels[0].1, &rows);
     for (_, compiled, _) in &kernels[1..] {
