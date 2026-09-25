@@ -8,6 +8,8 @@ These are steady-state batch costs, not isolated single-row latency. Calls have 
 
 ## Reproduce
 
+Reproduction requires historical revision `ae90c35`, which retains the probe and its dependencies. These commands do not apply to the current tree; saved experiment artifacts remain unchanged.
+
 ```sh
 cargo test --offline --all-targets
 cargo run --offline --release --example cranelift_probe -- sweep

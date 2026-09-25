@@ -10,11 +10,11 @@ Reuse that integration and initial pass setup. Do not import breadboard's graph 
 
 Use a generic target configuration; do not add per-CPU tuning. Breadboard stays read-only. Its performance claims and graph-specific policies are not evidence about CatBoost kernels.
 
-## First chunk
+## Initial probe (historical)
 
 A small development kernel establishes compilation, invocation, annotations, and ownership before production codegen. Dedicated tests cover varying every feature, changing rows between calls, short-input rejection, and independent compiled kernels. Verify LLVM IR before and after passes; capture both forms and target assembly. A separate target-machine assembly emission is not a byte-for-byte dump of MCJIT memory.
 
-Implemented in `examples/llvm_smoke.rs`; parent-reviewed, with five dedicated tests passing in debug and release. Run `cargo test --offline --example llvm_smoke` and `cargo run --offline --release --example llvm_smoke`. Requires LLVM 21; select its installation through `LLVM_SYS_211_PREFIX` when it is not discoverable by llvm-sys.
+The former `examples/llvm_smoke.rs` was parent-reviewed, with five dedicated tests passing in debug and release. It is preserved at historical revision `ae90c35`; current model/JIT tests supersede it. Requires LLVM 21; select its installation through `LLVM_SYS_211_PREFIX` when it is not discoverable by llvm-sys.
 
 The execution engine owns code and must die before its LLVM context. A scoped context is sufficient for the development example. The production compiled model must also own stable leaf storage; no borrowed function pointer may escape that owner's lifetime. No leaked contexts or speculative Send/Sync implementations.
 
@@ -26,6 +26,14 @@ Do not put `!invariant.load` on caller features: LLVM requires the value to stay
 
 Explicitly choose accumulation order in our generated dataflow. Allow arithmetic reassociation where the user permits it, without `nnan` or `ninf` promises. Do not relax comparisons: equality and model-defined missing-value decisions must stay exact. Avoid unrelated fast-math flags for operations the kernel does not perform.
 
-## Gate
+## Current validation
 
-Working LLVM integration and dedicated tests, reviewed unsafe boundaries, verified annotations, and inspected generated code. Then build the typed model/reference and scalar predictor. Measure actual model compilation and dependent-call latency as those become available; do not replace this with another broad synthetic compiler study.
+The model, rolling planner, scalar/SIMD lowering, ownership, IR annotations, and seeded differential checks run through the current test targets:
+
+```sh
+LLVM_SYS_211_PREFIX=/opt/homebrew/opt/llvm@21 cargo test --offline --all-targets
+LLVM_SYS_211_PREFIX=/opt/homebrew/opt/llvm@21 cargo test --offline --release --all-targets
+LLVM_SYS_211_PREFIX=/opt/homebrew/opt/llvm@21 cargo clippy --offline --all-targets -- -D warnings
+```
+
+`scalar_bench` measures model compilation and dependent-call latency; `inspect_code` emits separate target assembly. Do not substitute the historical smoke/probe measurements for either.

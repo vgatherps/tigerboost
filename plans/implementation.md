@@ -127,3 +127,9 @@ Choose scalar rolling4/sums2 as the fixed portable default in the next chunk: us
 Default now uses scalar rolling4/sums2. Named tree-order benchmark/inspection controls remain explicit. Mixed rerun: old tree-order default 94.14 ns, selected default 79.98 ns; all row/trace checks pass.
 
 Added one 97-line seeded test: 96 forests, up to eight depth-0–6 trees, 20 rows, and three configurations per forest. Disjoint integer leaf-index fields occupy at most 48 bits, so scores stay exact and uniquely expose every selected leaf. Feature counts, live caps, and accumulator counts cycle independently; no debug API or fuzz dependency. Parent and secondary review accepted the oracle and small representation. Nineteen focused tests pass; parent reran the seeded test in debug/release after removing a generator correlation.
+
+## Obsolete probe cleanup
+
+Removed the Cranelift probe/sweep and LLVM smoke example with their unused dev-dependencies; all three files remain available at revision `ae90c35`. Production code and saved measurement artifacts are unchanged. Current validation uses the model, planner, JIT, differential, and benchmark tests; historical reproduction notes now name the required revision.
+
+All 33 current tests pass in debug/release with `--all-targets`; Clippy passes with `-D warnings`. Cargo refreshed the lockfile offline without upgrading retained packages. The dependency tree has no Cranelift; llvm-sys remains only through Inkwell.

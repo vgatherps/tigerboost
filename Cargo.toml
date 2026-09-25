@@ -5,11 +5,3 @@ edition = "2024"
 
 [dependencies]
 inkwell = { version = "=0.9.0", features = ["llvm21-1"] }
-
-[dev-dependencies]
-cranelift-codegen = "=0.128.2"
-cranelift-frontend = "=0.128.2"
-cranelift-jit = "=0.128.2"
-cranelift-module = "=0.128.2"
-cranelift-native = "=0.128.2"
-llvm-sys = "=211.0.1"
