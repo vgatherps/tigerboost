@@ -100,3 +100,24 @@ Parent and independent review accepted same-feature pairs of distinct predicates
 Same-workload parent medians: tree order 91.59 ns, scalar rolling2/sums2 81.89 ns, SIMD rolling2/sums2 73.92 ns. SIMD rolling4/sums2 regresses 79.31 → 80.35 ns; two earlier runs also regressed at cap4. Defaults remain unchanged pending broader shapes. Driver floor 5.19 ns included; SIMD cap2 compilation 31.843 ms.
 
 Both targets emit packed comparisons (ARM64 `fcmgt.2d`, x86-64 `cmpltpd`/`movmskpd`). Six outputs assembled successfully. For cap4/sums2, ARM64 text decreases 11,176 → 9,880 bytes and local stack 1,472 → 736 bytes (plus 160 callee saves). x86-64 text grows 11,883 → 12,286 bytes and local stack 552 → 888 bytes. SIMD reduces comparison count, but extraction and scheduling costs remain target/model dependent. No x86 execution result.
+
+## Broader synthetic workloads
+
+Added fixed mixed, reuse-heavy, disjoint, and wide workloads shared by timing and assembly examples. Mixed retains its original RNG sequence/data. Reuse-heavy has 32 possible predicates; disjoint uses a different feature for every split; wide has 128 trees and 128 features. All have depth six and 256 input rows. Parent and independent review accepted the small example-only change; three dedicated benchmark tests pass.
+
+The old dependent driver stalled on reuse-heavy row 70. Changed every workload to an odd, prediction-dependent row step, preventing a fixed point modulo 256. Row storage is now variable-width. Remeasured all variants; do not compare these timings directly with the older harness. The traces visit 9/2/13/30 rows respectively, so these are hot synthetic measurements, not broad input-distribution or deployment claims.
+
+Apple M4 Pro, same generic LLVM setup; medians in ns/call, including the roughly 5 ns driver:
+
+| Workload | Reference | Tree order / 1 sum | Scalar rolling4 / 2 sums | SIMD rolling2 / 2 sums |
+|---|---:|---:|---:|---:|
+| Mixed | 179.07 | 92.25 | 80.43 | 74.38 |
+| Reuse-heavy | 176.51 | 52.04 | 51.99 | 75.85 |
+| Disjoint | 179.36 | 105.96 | 107.00 | 107.12 |
+| Wide | 346.32 | 226.25 | 184.95 | 202.34 |
+
+Scalar rolling4/sums2 compilation: 35.4/13.7/55.0/104.4 ms, after LLVM initialization. Disjoint repeat: tree order 104.76 ns versus scalar rolling4/sums2 107.06 ns; ranges overlap (102.70–107.08 versus 99.61–107.27). Keep the small slower median visible; there is no reuse to exploit in that model.
+
+SIMD is not a blanket win. Reuse-heavy tree order emits 32 scalar comparisons; SIMD cap2 emits 70 packed plus 20 scalar comparisons on both targets. Pair formation prevents some scalar-level common-expression sharing and adds extraction/spill costs. ARM64 text grows 3,484 → 5,532 bytes and total frame 448 → 640 bytes; x86 text grows 5,032 → 8,021 bytes and local stack 672 → 920 bytes (plus 48 saved-register bytes). Mixed SIMD cap2 text is 9,804/11,742 bytes on ARM64/x86-64. No per-model classifier or further backend tuning is justified here.
+
+Choose scalar rolling4/sums2 as the fixed portable default in the next chunk: useful mixed/wide gains, reuse-heavy parity, a small disjoint tradeoff. Keep tree order and SIMD explicit options. This is a measured compromise on one host, not a universal optimum.

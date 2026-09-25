@@ -9,6 +9,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
 };
+use support::Workload;
 use tigerboost::jit::{ComparisonMode, CompileOptions, Order, emit_assembly};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -16,23 +17,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output = PathBuf::from(
         arguments
             .next()
-            .ok_or("usage: inspect_code <fresh-output-directory>")?,
+            .ok_or("usage: inspect_code <fresh-output-directory> [workload]")?,
     );
+    let choice = match arguments.next() {
+        Some(name) => Workload::parse(name.to_str().ok_or("workload name must be UTF-8")?)?,
+        None => Workload::Mixed,
+    };
     if arguments.next().is_some() {
-        return Err("usage: inspect_code <fresh-output-directory>".into());
+        return Err("usage: inspect_code <fresh-output-directory> [workload]".into());
     }
     fs::create_dir(&output)?;
-    let (model, _) = support::workload();
+    let (model, _) = support::workload(choice);
     let context = Context::create();
     for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
         for (name, options) in [
-            ("tree-order-1", CompileOptions::default()),
+            (
+                "tree-order-1",
+                CompileOptions {
+                    order: Order::TreeOrder,
+                    accumulators: NonZeroUsize::new(1).unwrap(),
+                    comparisons: ComparisonMode::Scalar,
+                },
+            ),
             (
                 "rolling-4-2",
                 CompileOptions {
                     order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Scalar,
+                },
+            ),
+            (
+                "simd2-rolling-2-2",
+                CompileOptions {
+                    order: Order::Rolling(NonZeroUsize::new(2).unwrap()),
+                    accumulators: NonZeroUsize::new(2).unwrap(),
+                    comparisons: ComparisonMode::Simd2,
                 },
             ),
             (

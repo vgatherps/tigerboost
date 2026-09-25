@@ -1,30 +1,70 @@
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
 
-pub const FEATURES: usize = 16;
 pub const ROWS: usize = 256;
 
-pub fn workload() -> (Trees, Vec<[f64; FEATURES]>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Workload {
+    Mixed,
+    ReuseHeavy,
+    Disjoint,
+    Wide,
+}
+
+impl Workload {
+    pub fn parse(name: &str) -> Result<Self, &'static str> {
+        match name {
+            "mixed" => Ok(Self::Mixed),
+            "reuse-heavy" => Ok(Self::ReuseHeavy),
+            "disjoint" => Ok(Self::Disjoint),
+            "wide" => Ok(Self::Wide),
+            _ => Err("workload must be mixed, reuse-heavy, disjoint, or wide"),
+        }
+    }
+}
+
+pub fn workload(kind: Workload) -> (Trees, Vec<Vec<f64>>) {
+    let (tree_count, features) = match kind {
+        Workload::Mixed => (64, 16),
+        Workload::ReuseHeavy => (64, 4),
+        Workload::Disjoint => (64, 384),
+        Workload::Wide => (128, 128),
+    };
     let mut state = 42u64;
     let mut random = || {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
         (state >> 32) as usize
     };
-    let trees = (0..64)
-        .map(|_| SingleTree {
+    let trees = (0..tree_count)
+        .map(|tree| SingleTree {
             selections: (0..6)
-                .map(|_| Discriminator {
-                    feature_idx: FeatureIndex(random() % FEATURES),
-                    threshold: (random() % 2048) as f64 / 256.0 - 4.0,
+                .map(|level| {
+                    let feature = random() % features;
+                    Discriminator {
+                        feature_idx: FeatureIndex(if kind == Workload::Disjoint {
+                            tree * 6 + level
+                        } else {
+                            feature
+                        }),
+                        threshold: if kind == Workload::ReuseHeavy {
+                            (random() % 8) as f64 - 4.0
+                        } else {
+                            (random() % 2048) as f64 / 256.0 - 4.0
+                        },
+                    }
                 })
                 .collect(),
             leafs: (0..64).map(|_| (1 + random() % 16) as f64).collect(),
         })
         .collect();
     let rows = (0..ROWS)
-        .map(|_| std::array::from_fn(|_| (random() % 2048) as f64 / 256.0 - 4.0))
+        .map(|_| {
+            (0..features)
+                .map(|_| (random() % 2048) as f64 / 256.0 - 4.0)
+                .collect()
+        })
         .collect();
     (
-        Trees::new(trees, vec![NanMode::AsIs; FEATURES], 1.0, 0.0).unwrap(),
+        Trees::new(trees, vec![NanMode::AsIs; features], 1.0, 0.0).unwrap(),
         rows,
     )
 }
