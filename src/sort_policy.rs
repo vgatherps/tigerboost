@@ -1,121 +1,230 @@
-use std::{
-    collections::{HashMap, HashSet},
-    hash::Hash,
-    num::NonZeroUsize,
-};
+use std::{cmp::Reverse, num::NonZeroUsize};
 
-use crate::parsed_tree::{FeatureIndex, Trees};
+use crate::parsed_tree::{Discriminator, FeatureIndex, Trees};
 
-// sorting and batching policy for trees
-pub struct SortOptions {
-    pub max_live_trees: NonZeroUsize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TreeId(pub usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PredicateId(pub usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Consumer {
+    pub tree: TreeId,
+    pub level: usize,
 }
 
-#[derive(Default)]
-pub struct FeatureScore {
-    n_uses: usize,
-}
-
-pub fn score_feature_indices(trees: &Trees) -> HashMap<FeatureIndex, FeatureScore> {
-    let mut feature_scores = HashMap::<_, FeatureScore>::default();
-    for tree in trees.trees() {
-        for feature in &tree.selections {
-            feature_scores
-                .entry(feature.feature_idx)
-                .or_default()
-                .n_uses += 1;
-        }
-    }
-    feature_scores
-}
-
-pub fn score_trees(
-    trees: &Trees,
-    feature_scores: &HashMap<FeatureIndex, FeatureScore>,
-) -> HashMap<usize, usize> {
-    let mut tree_scores = HashMap::new();
-    for (tree_idx, tree) in trees.trees().iter().enumerate() {
-        let mut score = 0;
-        for eval in &tree.selections {
-            score += feature_scores[&eval.feature_idx].n_uses;
-        }
-        tree_scores.insert(tree_idx, score);
-    }
-    tree_scores
-}
-
-pub enum Action {
-    EvalFeatureFor {
-        feature_idx: FeatureIndex,
-        evaluator_index: usize,
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Action {
+    Admit(TreeId),
+    Load(FeatureIndex),
+    Compare {
+        predicate: PredicateId,
+        consumers: Vec<Consumer>,
     },
-    EvalFeatureVecFor {
-        feature_idx: FeatureIndex,
-        evaluator_indices: Vec<usize>,
-    },
-    // implicit in here whether this is single or vector eval
-    ExtractEvalBit {
-        evaluator_index: usize,
-    },
+    Retire(TreeId),
 }
 
-pub struct Evaluator {
-    pub tree_index: usize,
-    pub level_index: usize,
+pub(crate) struct Schedule {
+    pub predicates: Vec<Discriminator>,
+    pub actions: Vec<Action>,
 }
 
-pub fn build_evaluators(trees: &Trees) -> HashMap<usize, Evaluator> {
-    let mut evaluators = HashMap::default();
-
-    for (tree_index, tree) in trees.trees().iter().enumerate() {
-        for level_index in 0..tree.leafs.len() {
-            let eval_idx = evaluators.len();
-            evaluators.insert(
-                eval_idx,
-                Evaluator {
-                    tree_index,
-                    level_index,
-                },
-            );
-        }
-    }
-
-    evaluators
+struct ActiveTree {
+    id: TreeId,
+    remaining: usize,
 }
 
-pub fn sort_trees(trees: &Trees) -> Vec<Action> {
-    let mut actions = Vec::new();
-    let mut live_trees: HashSet<usize> = Default::default();
+struct Planner {
+    predicates: Vec<Discriminator>,
+    splits: Vec<Vec<PredicateId>>,
+    scores: Vec<usize>,
+    waiting: Vec<TreeId>,
+    active: Vec<ActiveTree>,
+    retained: Option<FeatureIndex>,
+    actions: Vec<Action>,
+    limit: usize,
+}
 
-    let evaluators = build_evaluators(trees);
-
-    let feature_scores = score_feature_indices(trees);
-    let tree_scores = score_trees(trees, &feature_scores);
-
-    // tree with highest score i.e. most used indices is live
-    let first_tree_idx = *tree_scores
+pub(crate) fn schedule(trees: &Trees, max_live_trees: NonZeroUsize) -> Schedule {
+    let mut predicates: Vec<Discriminator> = Vec::new();
+    let mut frequencies = vec![0; trees.feature_modes().len()];
+    let splits = trees
+        .trees()
         .iter()
-        .max_by_key(|(_, score)| *score)
-        .unwrap()
-        .1;
-
-    // set the live features
-    let first_tree = &trees.trees()[first_tree_idx];
-
-    // 1. take the first tree.
-    // 2. start appending trees *first* ranked by overlap with active set, THEN, by highest score
-    // 2.a we want to maximize parallelism here
-    // 3. append trees until we have a batch or no more trees.
-    // 4. find the feature with the most uses in the batch
-    // 5. decide whether to vectorize or individual eval it.
-    // 6. do so, *and*, count 'live vector registers' and 'live tree mask trackers'
-    // 7. increase parallel ops while can. either by individual eval or vector.
-    // 8. once enough, start retiring indices.
-    // 9. if a tree is complete, then it's retired' (this should be an action no?)
-    // flop between 7 and 8. balance of reuse of loaded features, clearing them out, and keeping state resources under control.
-    // note that as we reach a limit, we can start aggressively finishing eval for trees to retire.
-    // and as we retire trees, add the as-of-now most overlapped trees
-    // details are not fleshed out yet
-
-    actions
+        .map(|tree| {
+            tree.selections
+                .iter()
+                .map(|split| {
+                    frequencies[split.feature_idx.0] += 1;
+                    let id = predicates.iter().position(|p| {
+                        p.feature_idx == split.feature_idx
+                            && p.threshold.to_bits() == split.threshold.to_bits()
+                    });
+                    PredicateId(id.unwrap_or_else(|| {
+                        predicates.push(split.clone());
+                        predicates.len() - 1
+                    }))
+                })
+                .collect()
+        })
+        .collect();
+    let scores = trees
+        .trees()
+        .iter()
+        .map(|tree| {
+            tree.selections
+                .iter()
+                .map(|split| frequencies[split.feature_idx.0])
+                .sum()
+        })
+        .collect();
+    Planner {
+        predicates,
+        splits,
+        scores,
+        waiting: (0..trees.trees().len()).map(TreeId).collect(),
+        active: Vec::new(),
+        retained: None,
+        actions: Vec::new(),
+        limit: max_live_trees.get(),
+    }
+    .run()
 }
+
+impl Planner {
+    fn pending<'a>(
+        &'a self,
+        tree: &'a ActiveTree,
+    ) -> impl Iterator<Item = (usize, PredicateId)> + 'a {
+        self.splits[tree.id.0]
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(level, _)| tree.remaining & (1 << level) != 0)
+    }
+
+    fn uses(&self, tree: &ActiveTree, feature: FeatureIndex) -> usize {
+        self.pending(tree)
+            .filter(|(_, id)| self.predicates[id.0].feature_idx == feature)
+            .count()
+    }
+
+    fn fill(&mut self) {
+        while self.active.len() < self.limit && !self.waiting.is_empty() {
+            let (position, &tree) = self
+                .waiting
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, tree)| {
+                    let overlap = self.splits[tree.0]
+                        .iter()
+                        .filter(|id| {
+                            let feature = self.predicates[id.0].feature_idx;
+                            self.retained == Some(feature)
+                                || self.active.iter().any(|tree| self.uses(tree, feature) > 0)
+                        })
+                        .count();
+                    (overlap, self.scores[tree.0], Reverse(tree.0))
+                })
+                .unwrap();
+            self.waiting.remove(position);
+            self.actions.push(Action::Admit(tree));
+            let remaining = (1 << self.splits[tree.0].len()) - 1;
+            if remaining == 0 {
+                self.actions.push(Action::Retire(tree));
+            } else {
+                self.active.push(ActiveTree {
+                    id: tree,
+                    remaining,
+                });
+            }
+        }
+    }
+
+    fn select_feature(&self) -> FeatureIndex {
+        if let Some(feature) = self.retained
+            && self.active.iter().any(|tree| self.uses(tree, feature) > 0)
+        {
+            return feature;
+        }
+        let (feature, uses, _) = self
+            .predicates
+            .iter()
+            .map(|predicate| {
+                let feature = predicate.feature_idx;
+                let mut uses = 0;
+                let mut finishes = 0;
+                for tree in &self.active {
+                    let count = self.uses(tree, feature);
+                    uses += count;
+                    finishes += usize::from(count == tree.remaining.count_ones() as usize);
+                }
+                (feature, uses, finishes)
+            })
+            .max_by_key(|(feature, uses, finishes)| (*uses, *finishes, Reverse(feature.0)))
+            .unwrap();
+        if uses > 1 {
+            return feature;
+        }
+        let tree = self
+            .active
+            .iter()
+            .min_by_key(|tree| (tree.remaining.count_ones(), tree.id.0))
+            .unwrap();
+        let (_, predicate) = self.pending(tree).next().unwrap();
+        self.predicates[predicate.0].feature_idx
+    }
+
+    fn run(mut self) -> Schedule {
+        self.fill();
+        while !self.active.is_empty() {
+            let feature = self.select_feature();
+            if self.retained != Some(feature) {
+                self.actions.push(Action::Load(feature));
+                self.retained = Some(feature);
+            }
+            let predicate = self
+                .active
+                .iter()
+                .flat_map(|tree| self.pending(tree))
+                .map(|(_, id)| id)
+                .filter(|id| self.predicates[id.0].feature_idx == feature)
+                .min()
+                .unwrap();
+            let mut consumers = Vec::new();
+            for tree in &mut self.active {
+                for (level, &id) in self.splits[tree.id.0].iter().enumerate() {
+                    let bit = 1 << level;
+                    if id == predicate && tree.remaining & bit != 0 {
+                        consumers.push(Consumer {
+                            tree: tree.id,
+                            level,
+                        });
+                        tree.remaining &= !bit;
+                    }
+                }
+            }
+            self.actions.push(Action::Compare {
+                predicate,
+                consumers,
+            });
+            self.active.retain(|tree| {
+                if tree.remaining == 0 {
+                    self.actions.push(Action::Retire(tree.id));
+                    false
+                } else {
+                    true
+                }
+            });
+            self.fill();
+        }
+        Schedule {
+            predicates: self.predicates,
+            actions: self.actions,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -60,3 +60,7 @@ Compile: 76.484 ms. Driver cost is included, not subtracted. These are one synth
 ## Scope correction
 
 User rejected the Python/CatBoost setup and native fixture pipeline as overengineering. Dropped that requirement and deferred JSON import. The naive Rust evaluator plus focused constructed-tree tests is the reference for JIT work. No further native dependency setup; no importer work before the evaluator/JIT.
+
+## Rolling planner review
+
+Replaced the unfinished sorting sketch with a 230-line crate-private planner. Parent reviewed the action representation, exact-bit predicate interning, bounded active set, deterministic choices, constant-tree handling, immediate retirement/refill, and retained-feature reuse. Six focused interpreter tests pass in debug/release; edition-2024 formatting and diff checks pass. Prediction code is unchanged, so this slice makes no latency claim. Planner dead-code warnings disappear when LLVM lowering consumes it in the next slice.
