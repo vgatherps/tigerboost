@@ -14,6 +14,7 @@ use std::{error::Error, num::NonZeroUsize};
 
 type PredictFn = unsafe extern "C" fn(*const f64) -> f64;
 type CompileResult<T> = Result<T, Box<dyn Error>>;
+const BACKEND_OPTIMIZATION: OptimizationLevel = OptimizationLevel::Less;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Order {
@@ -68,7 +69,7 @@ pub fn compile_with_options<'ctx>(
     Target::initialize_native(&InitializationConfig::default())?;
     let triple = TargetMachine::get_default_triple();
     let (module, _) = prepare_module(context, model, options, &triple)?;
-    let engine = module.create_jit_execution_engine(OptimizationLevel::Less)?;
+    let engine = module.create_jit_execution_engine(BACKEND_OPTIMIZATION)?;
     // SAFETY: emit_model builds exactly C ABI double(const double*).
     let function = unsafe { engine.get_function::<PredictFn>("predict")? };
     Ok(CompiledModel {
@@ -103,9 +104,9 @@ fn prepare_module<'ctx>(
             triple,
             "generic",
             "",
-            OptimizationLevel::Less,
+            BACKEND_OPTIMIZATION,
             RelocMode::Default,
-            CodeModel::Default,
+            CodeModel::JITDefault,
         )
         .ok_or("could not create target machine")?;
     let module = emit_model(context, model, options)?;
