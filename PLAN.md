@@ -1,6 +1,6 @@
 # CatBoost JIT plan
 
-Status: implementation approved. Subagents implement one reviewable chunk at a time; the parent reviews code, dedicated tests, and measurements before allowing the next chunk. Progress and review decisions are recorded in [implementation notes](plans/implementation.md).
+Status: the agreed in-memory evaluator/JIT scope is complete. The [README](README.md) documents the API, selected scalar default, synthetic measurements, and limitations. ARM64 execution is tested; x86-64 has separate assembly evidence only. Progress and review decisions are recorded in [implementation notes](plans/implementation.md).
 
 ## Goal and agreed constraints
 
@@ -13,7 +13,7 @@ Single-row prediction latency. Capture most useful model-specific optimization w
 - Immutable feature/model reads during prediction; no writes to caller/model memory.
 - Rolling bounded active-tree set. Admit replacements when slots become free; no whole-group completion barrier.
 
-## Result to build
+## Implemented design
 
 Validated model → compile-time schedule → model-specialized LLVM function.
 
@@ -23,7 +23,7 @@ Separate model predicates from their uses at tree levels. The same predicate may
 
 Use a few independent sums to shorten the addition dependency chain. Treat their count, active-tree cap, and scalar/SIMD choice as a small measured policy space. Do not add a general optimizer, register allocator, runtime work queues, or a global table of all comparison results.
 
-## Ordered subplans
+## Subplan history
 
 | Subplan | Concrete result | Evidence needed before proceeding |
 |---|---|---|
@@ -34,11 +34,11 @@ Use a few independent sums to shorten the addition dependency chain. Treat their
 | [Portable SIMD](plans/portable-simd.md) | Explicit two-lane `f64` comparison packs | Scalar/SIMD agreement, both-target lowering, end-to-end measurements |
 | [Performance and completion](plans/performance-and-completion.md) | Reproducible evidence and usable API | Representative models, all preceding gates, honest portability report |
 
-LLVM integration and the model contract are independent pieces. Production codegen depends on both. Each subplan specifies smaller implementation slices; land and validate each before extending it. Tests and benchmark recording start with the first runnable slice, not at the end. The completed Cranelift experiments remain historical evidence, not an active implementation gate.
+The subplans record the reviewed implementation sequence. Tests and measurements accompanied each slice. Cranelift experiments remain historical evidence, not an active implementation gate.
 
-## Compiler uncertainty to resolve first
+## Observed compiler limitation
 
-Read-only load elimination can merge distant reads into one long-lived value. The Cranelift probe demonstrated spilling and consumer-driven reordering; those results do not establish LLVM's behavior. Inspect LLVM output on the real model kernels before changing the schedule or pass setup. Logical schedule lifetime counts are not physical-register guarantees.
+Read-only load elimination can merge distant reads into one long-lived value. LLVM output still delays some consumers and spills despite the bounded logical schedule. Logical lifetime counts are not physical-register guarantees; assembly findings and the rejected backend experiments are in the implementation notes.
 
 Keep valid read-only annotations. Do not manufacture side effects, volatile accesses, fake dependencies, or helper-call barriers to enforce source order. If measured code defeats the intended schedule, document the reproducer and choose the smallest justified change before continuing.
 
@@ -48,11 +48,10 @@ Build the symmetric-tree evaluator and JIT from the in-memory model first. Outpu
 
 A representative user model and input rows are needed for deployment-level performance claims. Small constructed forests suffice for evaluator/JIT correctness and initial measurements. Do not install Python/CatBoost or build a native compatibility test pipeline.
 
-## Completion
+## Completion evidence and remaining boundaries
 
-- In-memory symmetric-tree models compile and predict through the documented API.
-- Reference, scalar JIT, scheduled JIT, and SIMD agree on split decisions; finite sums agree within a documented error bound accommodating reassociation.
-- Feature reuse and rolling retirement are observed in generated code and measured on realistic models.
-- Compare generic evaluation, direct tree-order JIT, scheduled scalar JIT, and scheduled SIMD JIT with equivalent timing boundaries.
-- Report latency, compilation cost, code size, spill behavior, and regressions. Distinguish successful cross-compilation from execution/performance on another CPU.
-- No outstanding correctness failures or unexplained performance regressions on the agreed workload. A slower SIMD experiment is evidence, not a speedup claim.
+- In-memory models compile and predict through the documented, checked API; ownership tests cover dropped source models and retained kernels.
+- Hand-derived cases and seeded forests compare reference, tree-order, rolling scalar, and SIMD leaf decisions. Cancellation tests accommodate reordered sums; overflow/bitwise equivalence is not promised.
+- Four synthetic workloads compare all variants with the same dependent-call timing boundary. Scalar rolling4/two sums is the selected default; SIMD remains opt-in after a substantial reuse-heavy regression.
+- Latency, compilation cost, code size, and spills are recorded. The disjoint scalar slowdown and short benchmark traces remain explicit limitations.
+- No representative user model or x86-64 execution evidence was supplied. Deployment-level performance and broader platform validation remain outside this completed scope.

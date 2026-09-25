@@ -133,3 +133,9 @@ Added one 97-line seeded test: 96 forests, up to eight depth-0–6 trees, 20 row
 Removed the Cranelift probe/sweep and LLVM smoke example with their unused dev-dependencies; all three files remain available at revision `ae90c35`. Production code and saved measurement artifacts are unchanged. Current validation uses the model, planner, JIT, differential, and benchmark tests; historical reproduction notes now name the required revision.
 
 All 33 current tests pass in debug/release with `--all-targets`; Clippy passes with `-D warnings`. Cargo refreshed the lockfile offline without upgrading retained packages. The dependency tree has no Cranelift; llvm-sys remains only through Inkwell.
+
+## Final handoff
+
+The README documents the in-memory API, model/row ownership, numeric semantics, selected scalar default, explicit SIMD option, and synthetic measurements with their regressions and short-trace limitations. Its single Rust example is included as crate documentation and executes as a doctest. PLAN.md now marks the agreed in-memory scope complete without claiming deployment performance or x86-64 execution coverage. Prediction code is unchanged.
+
+All 33 tests pass in debug/release with `--all-targets`; the README doctest, Clippy with `-D warnings`, and formatting checks pass offline. On this Homebrew ARM64 setup, the doctest requires `RUSTDOCFLAGS="-C link-arg=/opt/homebrew/lib/libzstd.dylib"`: rustdoc does not inherit the normal Cargo linker path and otherwise selects the existing Intel zstd in `/usr/local/lib`. The documented command links the correct native library explicitly; no source workaround or dependency change was needed.
