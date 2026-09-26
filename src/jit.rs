@@ -318,7 +318,7 @@ fn reassociate(value: FloatValue<'_>) -> CompileResult<FloatValue<'_>> {
 mod tests {
     use super::*;
     use crate::parsed_tree::{Discriminator, FeatureIndex, SingleTree, Trees};
-    use crate::sort_policy::{ComparisonMode, Order, SortOptions, plan};
+    use crate::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
     use std::num::NonZeroUsize;
 
     #[test]
@@ -338,14 +338,18 @@ mod tests {
         )
         .unwrap();
         for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
-            let assembly =
-                emit_assembly(&context, &plan(&model, SortOptions::default()), triple).unwrap();
+            let assembly = emit_assembly(
+                &context,
+                &plan(&model, SortOptions::default()).unwrap(),
+                triple,
+            )
+            .unwrap();
             assert!(assembly.contains("predict"), "{triple}: {assembly}");
         }
     }
 
     #[test]
-    fn rolling_shares_loads_and_comparisons_before_llvm_passes() {
+    fn scheduled_order_shares_loads_and_comparisons_before_llvm_passes() {
         let context = Context::create();
         let split = Discriminator {
             feature_idx: FeatureIndex(0),
@@ -377,14 +381,20 @@ mod tests {
             (Order::TreeOrder, ComparisonMode::Scalar, 6, 4, 0),
             (Order::TreeOrder, ComparisonMode::Simd2, 6, 4, 0),
             (
-                Order::Rolling(NonZeroUsize::new(2).unwrap()),
+                Order::Scheduled(RegisterBudget {
+                    general: NonZeroUsize::new(6).unwrap(),
+                    floating: NonZeroUsize::new(12).unwrap(),
+                }),
                 ComparisonMode::Scalar,
                 3,
                 2,
                 0,
             ),
             (
-                Order::Rolling(NonZeroUsize::new(2).unwrap()),
+                Order::Scheduled(RegisterBudget {
+                    general: NonZeroUsize::new(6).unwrap(),
+                    floating: NonZeroUsize::new(12).unwrap(),
+                }),
                 ComparisonMode::Simd2,
                 3,
                 0,
@@ -400,7 +410,8 @@ mod tests {
                         comparisons,
                         ..SortOptions::default()
                     },
-                ),
+                )
+                .unwrap(),
             )
             .unwrap();
             module.verify().unwrap();
@@ -428,7 +439,7 @@ mod tests {
             3.0,
         )
         .unwrap();
-        let module = emit_plan(&context, &plan(&model, SortOptions::default())).unwrap();
+        let module = emit_plan(&context, &plan(&model, SortOptions::default()).unwrap()).unwrap();
         module.verify().unwrap();
         let ir = module.print_to_string().to_string();
         for expected in [

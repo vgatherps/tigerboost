@@ -29,21 +29,48 @@ pub enum ComparisonMode {
 #[derive(Clone, Copy, Debug)]
 pub enum Order {
     TreeOrder,
-    Rolling(NonZeroUsize),
+    Scheduled(RegisterBudget),
 }
+
+/// Logical working registers, not a guarantee about LLVM's physical allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegisterBudget {
+    pub general: NonZeroUsize,
+    pub floating: NonZeroUsize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct InsufficientBudget {
+    pub required: RegisterBudget,
+}
+
+impl std::fmt::Display for InsufficientBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "schedule needs at least {} general and {} floating registers",
+            self.required.general, self.required.floating
+        )
+    }
+}
+
+impl std::error::Error for InsufficientBudget {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SortOptions {
     pub order: Order,
     pub accumulators: NonZeroUsize,
-    /// Packs comparisons only for rolling order; tree order remains scalar.
+    /// Maximum pack width for scheduled order; tree order remains scalar.
     pub comparisons: ComparisonMode,
 }
 
 impl Default for SortOptions {
     fn default() -> Self {
         Self {
-            order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
+            order: Order::Scheduled(RegisterBudget {
+                general: NonZeroUsize::new(12).unwrap(),
+                floating: NonZeroUsize::new(12).unwrap(),
+            }),
             accumulators: NonZeroUsize::new(2).unwrap(),
             comparisons: ComparisonMode::Scalar,
         }
@@ -105,11 +132,23 @@ impl Plan<'_> {
     }
 }
 
-pub fn plan(model: &Trees, options: SortOptions) -> Plan<'_> {
+pub fn plan(model: &Trees, options: SortOptions) -> Result<Plan<'_>, InsufficientBudget> {
     let sum_count = options.accumulators.get().min(model.trees().len().max(1));
     let mut plan = match options.order {
         Order::TreeOrder => tree_order(model, sum_count),
-        Order::Rolling(cap) => schedule(model, cap, options.comparisons, sum_count),
+        Order::Scheduled(budget) => {
+            if !model.trees().is_empty() {
+                let has_splits = model.trees().iter().any(|tree| !tree.selections.is_empty());
+                let required = RegisterBudget {
+                    general: NonZeroUsize::new(3 + usize::from(has_splits)).unwrap(),
+                    floating: NonZeroUsize::new(sum_count + 1 + usize::from(has_splits)).unwrap(),
+                };
+                if budget.general < required.general || budget.floating < required.floating {
+                    return Err(InsufficientBudget { required });
+                }
+            }
+            schedule(model, budget, options.comparisons, sum_count)
+        }
     };
     for source in 1..sum_count {
         plan.actions.push(Action::AddSums {
@@ -122,7 +161,7 @@ pub fn plan(model: &Trees, options: SortOptions) -> Plan<'_> {
     } else {
         Action::ReturnScaled(SumId(0))
     });
-    plan
+    Ok(plan)
 }
 
 fn tree_order(trees: &Trees, sum_count: usize) -> Plan<'_> {
@@ -167,6 +206,12 @@ struct ActiveTree {
     remaining: usize,
 }
 
+struct Operation {
+    feature: FeatureIndex,
+    new_trees: Vec<TreeId>,
+    comparisons: Vec<Comparison>,
+}
+
 struct Planner<'model> {
     model: &'model Trees,
     predicates: Vec<Discriminator>,
@@ -174,9 +219,9 @@ struct Planner<'model> {
     scores: Vec<usize>,
     waiting: Vec<TreeId>,
     active: Vec<ActiveTree>,
-    retained: Option<(FeatureIndex, FeatureValueId)>,
+    resident: Vec<(FeatureIndex, FeatureValueId)>,
     actions: Vec<Action>,
-    limit: usize,
+    budget: RegisterBudget,
     comparisons: ComparisonMode,
     sum_count: usize,
     retired: usize,
@@ -184,7 +229,7 @@ struct Planner<'model> {
 
 fn schedule(
     trees: &Trees,
-    max_live_trees: NonZeroUsize,
+    budget: RegisterBudget,
     comparisons: ComparisonMode,
     sum_count: usize,
 ) -> Plan<'_> {
@@ -227,9 +272,9 @@ fn schedule(
         scores,
         waiting: (0..trees.trees().len()).map(TreeId).collect(),
         active: Vec::new(),
-        retained: None,
+        resident: Vec::new(),
         actions: Vec::new(),
-        limit: max_live_trees.get(),
+        budget,
         comparisons,
         sum_count,
         retired: 0,
@@ -255,145 +300,252 @@ impl<'model> Planner<'model> {
             .count()
     }
 
-    fn fill(&mut self) {
-        while self.active.len() < self.limit && !self.waiting.is_empty() {
-            let (position, &tree) = self
-                .waiting
+    fn waiting_order(&self) -> Vec<TreeId> {
+        let mut waiting = self.waiting.clone();
+        waiting.sort_by_cached_key(|tree| {
+            let overlap = self.splits[tree.0]
                 .iter()
-                .enumerate()
-                .max_by_key(|(_, tree)| {
-                    let overlap = self.splits[tree.0]
-                        .iter()
-                        .filter(|id| {
-                            let feature = self.predicates[id.0].feature_idx;
-                            self.retained.map(|(feature, _)| feature) == Some(feature)
-                                || self.active.iter().any(|tree| self.uses(tree, feature) > 0)
-                        })
-                        .count();
-                    (overlap, self.scores[tree.0], Reverse(tree.0))
+                .filter(|id| {
+                    let feature = self.predicates[id.0].feature_idx;
+                    self.resident.iter().any(|&(f, _)| f == feature)
+                        || self.active.iter().any(|tree| self.uses(tree, feature) > 0)
                 })
-                .unwrap();
-            self.waiting.remove(position);
-            self.actions.push(Action::Admit(tree));
-            let remaining = (1 << self.splits[tree.0].len()) - 1;
-            if remaining == 0 {
-                self.actions.push(Action::Retire {
-                    tree,
-                    sum: SumId(self.retired % self.sum_count),
-                });
-                self.retired += 1;
-            } else {
-                self.active.push(ActiveTree {
-                    id: tree,
-                    remaining,
-                });
-            }
-        }
+                .count();
+            (Reverse(overlap), Reverse(self.scores[tree.0]), tree.0)
+        });
+        waiting
     }
 
-    fn select_feature(&self) -> FeatureIndex {
-        if let Some((feature, _)) = self.retained
-            && self.active.iter().any(|tree| self.uses(tree, feature) > 0)
+    fn operation(
+        &self,
+        feature: FeatureIndex,
+        width: usize,
+        waiting: &[TreeId],
+    ) -> Option<Operation> {
+        // Pair threshold storage becomes its result mask; it is not another FP slot.
+        let scratch = width + 1;
+        if 1 + self.active.len() + scratch > self.budget.general.get()
+            || self.sum_count + 1 + width > self.budget.floating.get()
         {
-            return feature;
+            return None;
         }
-        let (feature, uses, _) = self
-            .predicates
-            .iter()
-            .map(|predicate| {
-                let feature = predicate.feature_idx;
-                let mut uses = 0;
-                let mut finishes = 0;
-                for tree in &self.active {
-                    let count = self.uses(tree, feature);
-                    uses += count;
-                    finishes += usize::from(count == tree.remaining.count_ones() as usize);
+        let mut op = Operation {
+            feature,
+            new_trees: Vec::new(),
+            comparisons: Vec::new(),
+        };
+        let mut active: Vec<_> = self.active.iter().collect();
+        if 1 + active.len() + 1 + 2 > self.budget.general.get() {
+            active.sort_by_key(|tree| (tree.remaining.count_ones(), tree.id.0));
+        }
+        for tree in active
+            .into_iter()
+            .map(|t| t.id)
+            .chain(waiting.iter().copied())
+        {
+            let active = self.active.iter().find(|t| t.id == tree);
+            if active.is_none()
+                && 1 + self.active.len() + op.new_trees.len() + 1 + scratch
+                    > self.budget.general.get()
+            {
+                continue;
+            }
+            let mut used = false;
+            for (level, &predicate) in self.splits[tree.0].iter().enumerate() {
+                if active.is_some_and(|t| t.remaining & (1 << level) == 0)
+                    || self.predicates[predicate.0].feature_idx != feature
+                {
+                    continue;
                 }
-                (feature, uses, finishes)
-            })
-            .max_by_key(|(feature, uses, finishes)| (*uses, *finishes, Reverse(feature.0)))
-            .unwrap();
-        if uses > 1 {
-            return feature;
+                let position = op.comparisons.iter().position(|c| c.predicate == predicate);
+                let position = match position {
+                    Some(position) => position,
+                    None if op.comparisons.len() < width => {
+                        op.comparisons.push(Comparison {
+                            predicate,
+                            consumers: Vec::new(),
+                        });
+                        op.comparisons.len() - 1
+                    }
+                    None => continue,
+                };
+                op.comparisons[position]
+                    .consumers
+                    .push(Consumer { tree, level });
+                used = true;
+            }
+            if used && active.is_none() {
+                op.new_trees.push(tree);
+            }
         }
-        let tree = self
+        (op.comparisons.len() == width).then_some(op)
+    }
+
+    fn select(&self, waiting: &[TreeId]) -> Operation {
+        let pressured = 1 + self.active.len() + 1 + 2 > self.budget.general.get();
+        let shortest = self
             .active
             .iter()
-            .min_by_key(|tree| (tree.remaining.count_ones(), tree.id.0))
-            .unwrap();
-        let (_, predicate) = self.pending(tree).next().unwrap();
-        self.predicates[predicate.0].feature_idx
+            .min_by_key(|t| (t.remaining.count_ones(), t.id.0));
+        (0..self.model.feature_modes().len())
+            .filter_map(|index| {
+                let feature = FeatureIndex(index);
+                if !self.active.iter().any(|t| self.uses(t, feature) > 0)
+                    && !waiting.first().is_some_and(|t| {
+                        self.splits[t.0]
+                            .iter()
+                            .any(|id| self.predicates[id.0].feature_idx == feature)
+                    })
+                {
+                    return None;
+                }
+                let pair = matches!(self.comparisons, ComparisonMode::Simd2)
+                    .then(|| self.operation(feature, 2, waiting))
+                    .flatten();
+                pair.or_else(|| self.operation(feature, 1, waiting))
+            })
+            .max_by_key(|op| {
+                let uses = self
+                    .active
+                    .iter()
+                    .map(|t| self.uses(t, op.feature))
+                    .sum::<usize>()
+                    + op.new_trees
+                        .iter()
+                        .map(|t| {
+                            self.splits[t.0]
+                                .iter()
+                                .filter(|id| self.predicates[id.0].feature_idx == op.feature)
+                                .count()
+                        })
+                        .sum::<usize>();
+                let consumed = |tree: TreeId| {
+                    op.comparisons
+                        .iter()
+                        .flat_map(|c| &c.consumers)
+                        .filter(|c| c.tree == tree)
+                        .count()
+                };
+                let finishes = self
+                    .active
+                    .iter()
+                    .filter(|t| consumed(t.id) == t.remaining.count_ones() as usize)
+                    .count();
+                let drains = pressured && shortest.is_some_and(|t| consumed(t.id) > 0);
+                (
+                    drains,
+                    uses,
+                    finishes,
+                    self.resident.iter().any(|&(f, _)| f == op.feature),
+                    Reverse(op.feature.0),
+                )
+            })
+            .expect("validated scalar workspace must permit progress")
+    }
+
+    fn remaining_uses(&self, feature: FeatureIndex) -> usize {
+        self.active
+            .iter()
+            .map(|t| self.uses(t, feature))
+            .sum::<usize>()
+            + self
+                .waiting
+                .iter()
+                .map(|t| {
+                    self.splits[t.0]
+                        .iter()
+                        .filter(|id| self.predicates[id.0].feature_idx == feature)
+                        .count()
+                })
+                .sum::<usize>()
+    }
+
+    fn release(&mut self, position: usize) {
+        let (_, value) = self.resident.remove(position);
+        self.actions.push(Action::Release(value));
+    }
+
+    fn retire(&mut self, tree: TreeId) {
+        self.actions.push(Action::Retire {
+            tree,
+            sum: SumId(self.retired % self.sum_count),
+        });
+        self.retired += 1;
     }
 
     fn run(mut self) -> Plan<'model> {
         let mut next_value = 0;
-        self.fill();
-        while !self.active.is_empty() {
-            let feature = self.select_feature();
-            let value = match self.retained {
-                Some((_, value)) => value,
+        while !self.active.is_empty() || !self.waiting.is_empty() {
+            let waiting = self.waiting_order();
+            if let Some(&tree) = waiting.first()
+                && self.splits[tree.0].is_empty()
+            {
+                self.waiting.retain(|&t| t != tree);
+                self.actions.push(Action::Admit(tree));
+                self.retire(tree);
+                continue;
+            }
+            let op = self.select(&waiting);
+            let loaded = self.resident.iter().any(|&(f, _)| f == op.feature);
+            // Loading needs one address register (two with NaN normalization),
+            // and normalization one FP replacement: covered by scalar workspace.
+            while self.sum_count + self.resident.len() + usize::from(!loaded) + op.comparisons.len()
+                > self.budget.floating.get()
+            {
+                let position = self
+                    .resident
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (f, _))| *f != op.feature)
+                    .min_by_key(|(_, (f, _))| (self.remaining_uses(*f), Reverse(f.0)))
+                    .map(|(position, _)| position)
+                    .expect("operand and scalar workspace fit");
+                self.release(position);
+            }
+            let value = match self.resident.iter().find(|&&(f, _)| f == op.feature) {
+                Some(&(_, value)) => value,
                 None => {
                     let value = FeatureValueId(next_value);
                     next_value += 1;
-                    self.actions.push(Action::Load { value, feature });
-                    self.retained = Some((feature, value));
+                    self.actions.push(Action::Load {
+                        value,
+                        feature: op.feature,
+                    });
+                    self.resident.push((op.feature, value));
                     value
                 }
             };
-            let width = match self.comparisons {
-                ComparisonMode::Scalar => 1,
-                ComparisonMode::Simd2 => 2,
-            };
-            let mut comparisons = Vec::new();
-            for _ in 0..width {
-                let Some(predicate) = self
-                    .active
-                    .iter()
-                    .flat_map(|tree| self.pending(tree))
-                    .map(|(_, id)| id)
-                    .filter(|id| self.predicates[id.0].feature_idx == feature)
-                    .min()
-                else {
-                    break;
-                };
-                let mut consumers = Vec::new();
-                for tree in &mut self.active {
-                    for (level, &id) in self.splits[tree.id.0].iter().enumerate() {
-                        let bit = 1 << level;
-                        if id == predicate && tree.remaining & bit != 0 {
-                            consumers.push(Consumer {
-                                tree: tree.id,
-                                level,
-                            });
-                            tree.remaining &= !bit;
-                        }
-                    }
-                }
-                comparisons.push(Comparison {
-                    predicate,
-                    consumers,
+            for tree in op.new_trees {
+                self.waiting.retain(|&t| t != tree);
+                self.actions.push(Action::Admit(tree));
+                self.active.push(ActiveTree {
+                    id: tree,
+                    remaining: (1 << self.splits[tree.0].len()) - 1,
                 });
+            }
+            for comparison in &op.comparisons {
+                for consumer in &comparison.consumers {
+                    self.active
+                        .iter_mut()
+                        .find(|t| t.id == consumer.tree)
+                        .unwrap()
+                        .remaining &= !(1 << consumer.level);
+                }
             }
             self.actions.push(Action::Compare {
                 feature: value,
-                comparisons,
+                comparisons: op.comparisons,
             });
-            self.active.retain(|tree| {
-                if tree.remaining == 0 {
-                    self.actions.push(Action::Retire {
-                        tree: tree.id,
-                        sum: SumId(self.retired % self.sum_count),
-                    });
-                    self.retired += 1;
-                    false
-                } else {
-                    true
-                }
-            });
-            self.fill();
-            if self.active.iter().all(|tree| self.uses(tree, feature) == 0) {
-                self.actions.push(Action::Release(value));
-                self.retained = None;
+            while let Some(position) = self
+                .resident
+                .iter()
+                .position(|&(f, _)| self.remaining_uses(f) == 0)
+            {
+                self.release(position);
+            }
+            while let Some(position) = self.active.iter().position(|t| t.remaining == 0) {
+                let tree = self.active.remove(position);
+                self.retire(tree.id);
             }
         }
         Plan {

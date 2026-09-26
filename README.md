@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         -1.0, // bias
     )?;
     let context = Context::create();
-    let plan = plan(&model, SortOptions::default());
+    let plan = plan(&model, SortOptions::default())?;
     let predictor = compile(&context, &plan)?;
     drop(plan);
     drop(model);
@@ -58,24 +58,34 @@ with the reference are not promised. Comparisons retain NaN/infinity semantics.
 
 ## Scheduling
 
-`SortOptions::default()` selects scalar comparisons, up to four active trees,
-and two independent sums. The compile-time schedule shares feature loads and predicates,
-updates original leaf-index bits, and retires/refills trees as they finish.
+`SortOptions::default()` selects scalar comparisons, logical budgets of twelve
+general and twelve floating registers, and two independent sums. The schedule
+shares feature loads and predicates, checks operation peaks before starting
+selectors, and releases values as their uses finish or space is needed.
 Prediction does not walk split metadata or run the scheduler.
 
+GP counts the row pointer, live selectors and primitive scratch; FP counts sums,
+resident features and primitive scratch. Plan-assigned IDs are dense and deterministic;
+reloads get fresh IDs. Feature frequencies count split occurrences; tree scores sum
+those frequencies. Within each operation, eligible admissions rank resident/pending
+feature overlap before tree score, with stable ID tie breaks.
+
 `sort_policy::plan(&model, SortOptions { order, accumulators, comparisons })`
-produces a complete plan without LLVM. Its read-only commands specify feature
-lifetimes, comparisons, leaf accumulation, sum reduction, and return behavior.
+returns a complete plan or an insufficient-budget error, without LLVM. Its
+read-only commands specify feature lifetimes, comparisons, leaf accumulation,
+sum reduction, and return behavior.
 `jit::compile(&context, &plan)` emits that plan. Counts use `NonZeroUsize`.
 Choose `Order::TreeOrder`, one
 accumulator, and `ComparisonMode::Scalar` for the direct baseline. Choose
-`Order::Rolling(cap)` and `ComparisonMode::Simd2` for opt-in two-lane comparisons
-sharing a feature; tree order remains scalar regardless of that option.
+`Order::Scheduled(RegisterBudget { general, floating })` and
+`ComparisonMode::Simd2` for opt-in two-lane comparisons sharing a feature.
+Pairs fall back to scalar when their transient workspace cannot fit;
+tree order remains scalar regardless of that option.
 
 The backend uses a generic CPU, LLVM `early-cse`, and backend optimization
 level `Less`. Immutable leaf tables and read-only input/function annotations
 permit load reuse. LLVM can still reorder instructions and spill: the planner's
-active-tree cap is not a bound on physical register usage.
+logical register budgets are not bounds on physical register usage.
 
 ## Build and checks
 
@@ -97,17 +107,21 @@ existing Intel zstd in `/usr/local/lib` first on this machine.
 Native execution was tested on ARM64. Generic x86-64 assembly was emitted and
 assembled, not executed; x86-64 correctness/performance is not established.
 
-## Synthetic measurements
+## Historical synthetic measurements
+
+These cap-based fixtures included an artificial repeated-threshold reuse case.
+They do not validate the new scheduler; see the separate
+[resource-aware planning results](plans/implementation.md#resource-aware-planning).
 
 SIMD regressed on reuse-heavy trees: 75.85 ns versus 52.04 ns for tree order.
 The scalar default was slightly slower on disjoint trees (about 1–2 ns across
-two runs, with overlapping ranges). It improves mixed/wide workloads and stays
-near parity on reuse-heavy ones; it is not a universal optimum.
+two runs, with overlapping ranges). It improved mixed/wide workloads and stayed
+near parity on reuse-heavy ones; those settings were not universally best.
 
 Apple M4 Pro, LLVM 21.1.8, median ns/call including the roughly 5 ns row-selection
 driver; five interleaved rounds of 50,000 dependent single-row calls:
 
-| Workload | Reference | Tree order, 1 sum | Default scalar, cap 4 / 2 sums | SIMD, cap 2 / 2 sums |
+| Workload | Reference | Tree order, 1 sum | Historical scalar, cap 4 / 2 sums | SIMD, cap 2 / 2 sums |
 |---|---:|---:|---:|---:|
 | Mixed | 179.07 | 92.25 | 80.43 | 74.38 |
 | Reuse-heavy | 176.51 | 52.04 | 51.99 | 75.85 |
@@ -120,6 +134,8 @@ against the reference before timing. The result-dependent traces visit only
 9/2/13/30 distinct rows respectively: these are warm synthetic measurements,
 especially the two-row reuse-heavy trace, not deployment-level evidence.
 
+These commands exercise the current resource-aware implementation:
+
 ```sh
 cargo run --offline --release --example scalar_bench -- mixed
 cargo run --offline --release --example inspect_code -- /private/tmp/tigerboost-code-new mixed
@@ -127,5 +143,5 @@ cargo run --offline --release --example inspect_code -- /private/tmp/tigerboost-
 
 Both accept `mixed` (default), `reuse-heavy`, `disjoint`, or `wide`.
 Inspection requires a fresh output directory and emits separate ARM64/x86-64
-assembly, not MCJIT's executable bytes. See [implementation notes](plans/implementation.md)
+assembly, not MCJIT's executable bytes. See [implementation history](plans/implementation.md)
 for compilation times, code sizes, spills, regressions, and review history.

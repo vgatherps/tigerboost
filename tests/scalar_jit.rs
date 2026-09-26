@@ -4,7 +4,7 @@ use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{
     Discriminator, FeatureIndex, NanMode, RowLengthError, SingleTree, Trees,
 };
-use tigerboost::sort_policy::{ComparisonMode, Order, SortOptions, plan};
+use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
 
 fn split(feature: usize, threshold: f64) -> Discriminator {
     Discriminator {
@@ -22,7 +22,12 @@ fn indexed_tree(selections: Vec<Discriminator>) -> SingleTree {
 
 fn configurations() -> impl Iterator<Item = SortOptions> {
     std::iter::once(Order::TreeOrder)
-        .chain([1, 2, 4, 8].map(|cap| Order::Rolling(NonZeroUsize::new(cap).unwrap())))
+        .chain([4, 6, 12, 20].map(|general| {
+            Order::Scheduled(RegisterBudget {
+                general: NonZeroUsize::new(general).unwrap(),
+                floating: NonZeroUsize::new(12).unwrap(),
+            })
+        }))
         .flat_map(|order| {
             [1, 2, 4].into_iter().flat_map(move |count| {
                 [ComparisonMode::Scalar, ComparisonMode::Simd2].map(move |comparisons| {
@@ -40,7 +45,10 @@ fn configurations() -> impl Iterator<Item = SortOptions> {
 fn paired_thresholds_preserve_both_lane_orders_and_odd_tail() {
     let context = Context::create();
     let options = SortOptions {
-        order: Order::Rolling(NonZeroUsize::new(1).unwrap()),
+        order: Order::Scheduled(RegisterBudget {
+            general: NonZeroUsize::new(5).unwrap(),
+            floating: NonZeroUsize::new(12).unwrap(),
+        }),
         comparisons: ComparisonMode::Simd2,
         ..SortOptions::default()
     };
@@ -58,7 +66,7 @@ fn paired_thresholds_preserve_both_lane_orders_and_odd_tail() {
                 0.0,
             )
             .unwrap();
-            let compiled = compile(&context, &plan(&model, options)).unwrap();
+            let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
             for value in [
                 f64::NEG_INFINITY,
                 -0.0,
@@ -93,7 +101,7 @@ fn indexed_leaves_expose_original_level_bits_and_strict_comparisons() {
     )
     .unwrap();
     for options in configurations() {
-        let compiled = compile(&context, &plan(&model, options)).unwrap();
+        let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
         for index in 0..8 {
             let row = [
                 if index & 2 != 0 { 2.0 } else { 1.0 },
@@ -139,7 +147,7 @@ fn repeated_features_nan_modes_and_scale_bias_match_reference() {
     )
     .unwrap();
     for options in configurations() {
-        let compiled = compile(&context, &plan(&model, options)).unwrap();
+        let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
         for row in [
             [f64::NAN; 3],
             [-f64::NAN, 1.0, 2.0],
@@ -158,7 +166,7 @@ fn empty_and_constant_forests_need_no_row_loads() {
     let empty = Trees::new(vec![], vec![], f64::NAN, -0.0).unwrap();
     for options in configurations() {
         assert_eq!(
-            compile(&context, &plan(&empty, options))
+            compile(&context, &plan(&empty, options).unwrap())
                 .unwrap()
                 .predict(&[])
                 .unwrap()
@@ -184,7 +192,7 @@ fn empty_and_constant_forests_need_no_row_loads() {
                 3.0,
             )
             .unwrap();
-            let result = compile(&context, &plan(&model, options))
+            let result = compile(&context, &plan(&model, options).unwrap())
                 .unwrap()
                 .predict(&[])
                 .unwrap();
@@ -213,7 +221,7 @@ fn reordered_sums_allow_cancellation_error_scaled_by_absolute_leaves() {
     let tolerance =
         values.len() as f64 * f64::EPSILON * values.iter().map(|value| value.abs()).sum::<f64>();
     for options in configurations() {
-        let compiled = compile(&context, &plan(&model, options)).unwrap();
+        let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
         for row in [[-1.0], [1.0]] {
             assert!(
                 (compiled.predict(&row).unwrap() - model.predict(&row).unwrap()).abs() <= tolerance
@@ -232,7 +240,7 @@ fn row_check_and_reused_row_allocation_are_respected() {
         0.0,
     )
     .unwrap();
-    let compiled = compile(&context, &plan(&model, SortOptions::default())).unwrap();
+    let compiled = compile(&context, &plan(&model, SortOptions::default()).unwrap()).unwrap();
     assert_eq!(
         compiled.predict(&[1.0]),
         Err(RowLengthError {
@@ -261,7 +269,7 @@ fn moved_model_owns_leaf_tables_after_source_and_other_kernel_drop() {
             0.0,
         )
         .unwrap();
-        compile(&context, &plan(&model, SortOptions::default())).unwrap()
+        compile(&context, &plan(&model, SortOptions::default()).unwrap()).unwrap()
     };
     let mut moved = vec![compiled];
     {
@@ -273,7 +281,11 @@ fn moved_model_owns_leaf_tables_after_source_and_other_kernel_drop() {
             0.0,
         )
         .unwrap();
-        let other = compile(&other_context, &plan(&other_model, SortOptions::default())).unwrap();
+        let other = compile(
+            &other_context,
+            &plan(&other_model, SortOptions::default()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(other.predict(&[1.0]), Ok(1.0));
     }
     let compiled = moved.pop().unwrap();

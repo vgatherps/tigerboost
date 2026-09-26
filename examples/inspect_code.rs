@@ -11,7 +11,7 @@ use std::{
 };
 use support::Workload;
 use tigerboost::jit::emit_assembly;
-use tigerboost::sort_policy::{ComparisonMode, Order, SortOptions, plan};
+use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
@@ -41,31 +41,40 @@ fn main() -> Result<(), Box<dyn Error>> {
                 },
             ),
             (
-                "rolling-4-2",
+                "scheduled-12gp-12fp-2sums",
                 SortOptions {
-                    order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
+                    order: Order::Scheduled(RegisterBudget {
+                        general: NonZeroUsize::new(12).unwrap(),
+                        floating: NonZeroUsize::new(12).unwrap(),
+                    }),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Scalar,
                 },
             ),
             (
-                "simd2-rolling-2-2",
+                "simd2-scheduled-6gp-12fp-2sums",
                 SortOptions {
-                    order: Order::Rolling(NonZeroUsize::new(2).unwrap()),
+                    order: Order::Scheduled(RegisterBudget {
+                        general: NonZeroUsize::new(6).unwrap(),
+                        floating: NonZeroUsize::new(12).unwrap(),
+                    }),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Simd2,
                 },
             ),
             (
-                "simd2-rolling-4-2",
+                "simd2-scheduled-12gp-12fp-2sums",
                 SortOptions {
-                    order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
+                    order: Order::Scheduled(RegisterBudget {
+                        general: NonZeroUsize::new(12).unwrap(),
+                        floating: NonZeroUsize::new(12).unwrap(),
+                    }),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Simd2,
                 },
             ),
         ] {
-            let assembly = emit_assembly(&context, &plan(&model, options), triple)?;
+            let assembly = emit_assembly(&context, &plan(&model, options)?, triple)?;
             let path = output.join(format!("{triple}-{name}.s"));
             File::create_new(&path)?.write_all(assembly.as_bytes())?;
             println!("{}", path.display());

@@ -1,6 +1,6 @@
 # CatBoost JIT plan
 
-Status: the agreed in-memory evaluator/JIT scope is complete. The [README](README.md) documents the API, selected scalar default, synthetic measurements, and limitations. ARM64 execution is tested; x86-64 has separate assembly evidence only. Progress and review decisions are recorded in [implementation notes](plans/implementation.md).
+Status: the resource-aware sort is reviewed and validated; [current measurements](plans/implementation.md#resource-aware-planning) retain its compilation regressions and narrow-trace limits. The [README](README.md) documents the API. LLVM's physical register allocation remains a separate concern; logical budgets do not constrain it.
 
 ## Goal and agreed constraints
 
@@ -8,10 +8,10 @@ Single-row prediction latency. Capture most useful model-specific optimization w
 
 - Numeric, symmetric trees; `f64` features, thresholds, leaves, and arithmetic.
 - Arithmetic may reorder. Split decisions and leaf-index bits must remain correct.
-- LLVM 21 backend through Inkwell/MCJIT, following breadboard's integration. This replaces the earlier Cranelift choice. Our JIT selects reuse, SIMD packs, admission, retirement, and accumulation order.
+- LLVM 21 backend through Inkwell/MCJIT, following breadboard's integration. This replaces the earlier Cranelift choice. Our planner selects reuse, SIMD packs, admission, retirement, and accumulation order.
 - One scheduling strategy for x86-64 and ARM64; no per-CPU instruction-cost model.
 - Immutable feature/model reads during prediction; no writes to caller/model memory.
-- Rolling bounded active-tree set. Admit replacements when slots become free; no whole-group completion barrier.
+- Independent GP/FP budgets constrain live values and primitive peaks. Admit selectors only with feasible work; retire completed trees and release features under pressure, without a whole-group barrier.
 
 ## Implemented design
 
@@ -21,7 +21,7 @@ Feature offsets, borders, destination bits, and leaf-table bases are known while
 
 Separate model predicates from their uses at tree levels. The same predicate may feed several bits. Distinct thresholds on one feature share its load. SIMD packs share one feature and contain explicit thresholds and consumers. Finish a tree as soon as its bits are complete; immediately accumulate its leaf and release its partial index.
 
-Use a few independent sums to shorten the addition dependency chain. Treat their count, active-tree cap, and scalar/SIMD choice as a small measured policy space. Do not add a general optimizer, register allocator, runtime work queues, or a global table of all comparison results.
+Use a few independent sums to shorten the addition dependency chain. Account for sums, resident feature values, live selectors and primitive scratch before admitting work; vary GP/FP budgets and scalar/SIMD choice through measurements. Do not add a general optimizer, register allocator, runtime work queues, or a global table of all comparison results.
 
 ## Subplan history
 
@@ -34,11 +34,11 @@ Use a few independent sums to shorten the addition dependency chain. Treat their
 | [Portable SIMD](plans/portable-simd.md) | Explicit two-lane `f64` comparison packs | Scalar/SIMD agreement, both-target lowering, end-to-end measurements |
 | [Performance and completion](plans/performance-and-completion.md) | Reproducible evidence and usable API | Representative models, all preceding gates, honest portability report |
 
-The subplans record the reviewed implementation sequence. Tests and measurements accompanied each slice. Cranelift experiments remain historical evidence, not an active implementation gate.
+These subplans record the earlier implementation sequence, including the superseded active-tree cap. Cranelift experiments and cap-based measurements are historical evidence, not current scheduler validation.
 
 ## Observed compiler limitation
 
-Read-only load elimination can merge distant reads into one long-lived value. LLVM output still delays some consumers and spills despite the bounded logical schedule. Logical lifetime counts are not physical-register guarantees; assembly findings and the rejected backend experiments are in the implementation notes.
+Read-only load elimination can merge distant reads into one long-lived value. Earlier cap-based LLVM output delayed some consumers and spilled. Logical lifetime counts are not physical-register guarantees; historical assembly findings and rejected backend experiments are in the implementation notes.
 
 Keep valid read-only annotations. Do not manufacture side effects, volatile accesses, fake dependencies, or helper-call barriers to enforce source order. If measured code defeats the intended schedule, document the reproducer and choose the smallest justified change before continuing.
 
@@ -51,7 +51,7 @@ A representative user model and input rows are needed for deployment-level perfo
 ## Completion evidence and remaining boundaries
 
 - In-memory models compile and predict through the documented, checked API; ownership tests cover dropped source models and retained kernels.
-- Hand-derived cases and seeded forests compare reference, tree-order, rolling scalar, and SIMD leaf decisions. Cancellation tests accommodate reordered sums; overflow/bitwise equivalence is not promised.
-- Four synthetic workloads compare all variants with the same dependent-call timing boundary. Scalar rolling4/two sums is the selected default; SIMD remains opt-in after a substantial reuse-heavy regression.
-- Latency, compilation cost, code size, and spills are recorded. The disjoint scalar slowdown and short benchmark traces remain explicit limitations.
-- No representative user model or x86-64 execution evidence was supplied. Deployment-level performance and broader platform validation remain outside this completed scope.
+- Hand-derived cases and seeded forests compare reference, tree-order, scheduled scalar, and SIMD leaf decisions. Cancellation tests accommodate reordered sums; overflow/bitwise equivalence is not promised.
+- Four historical synthetic workloads compared cap-based variants and included an artificial repeated-threshold reuse case. Separate resource-aware measurements are now recorded; SIMD remains opt-in.
+- Historical latency, compilation cost, code size, spills, disjoint slowdown and short traces remain recorded. The new sort is accepted with higher cold compilation costs; physical LLVM allocation remains separate.
+- No representative user model or x86-64 execution evidence was supplied. Deployment-level performance and broader platform validation remain unestablished.

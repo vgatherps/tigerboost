@@ -6,7 +6,7 @@ use std::{error::Error, hint::black_box, num::NonZeroUsize, time::Instant};
 use support::{ROWS, Workload, workload};
 use tigerboost::jit::{CompiledModel, compile};
 use tigerboost::parsed_tree::Trees;
-use tigerboost::sort_policy::{ComparisonMode, Order, SortOptions, plan};
+use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
 
 const CALLS: usize = 50_000;
 const ROUNDS: usize = 5;
@@ -59,8 +59,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (model, rows) = workload(choice);
     let context = Context::create();
     let mut kernels = Vec::new();
-    let orders = std::iter::once(Order::TreeOrder)
-        .chain([1, 2, 4, 8].map(|cap| Order::Rolling(NonZeroUsize::new(cap).unwrap())));
+    let orders = std::iter::once(Order::TreeOrder).chain([4, 6, 12, 20].map(|general| {
+        Order::Scheduled(RegisterBudget {
+            general: NonZeroUsize::new(general).unwrap(),
+            floating: NonZeroUsize::new(12).unwrap(),
+        })
+    }));
     for order in orders {
         for count in [1, 2, 4] {
             let options = SortOptions {
@@ -69,25 +73,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                 comparisons: ComparisonMode::Scalar,
             };
             let start = Instant::now();
-            let compiled = compile(&context, &plan(&model, options))?;
+            let compiled = compile(&context, &plan(&model, options)?)?;
             let compile_ms = start.elapsed().as_secs_f64() * 1e3;
             let label = match order {
                 Order::TreeOrder => format!("Tree order, sums {count}"),
-                Order::Rolling(cap) => format!("Rolling {cap}, sums {count}"),
+                Order::Scheduled(budget) => format!("Scheduled {:?}, sums {count}", budget),
             };
             kernels.push((label, compiled, compile_ms));
         }
     }
-    for cap in [1, 2, 4, 8] {
+    for general in [4, 6, 12, 20] {
         let options = SortOptions {
-            order: Order::Rolling(NonZeroUsize::new(cap).unwrap()),
+            order: Order::Scheduled(RegisterBudget {
+                general: NonZeroUsize::new(general).unwrap(),
+                floating: NonZeroUsize::new(12).unwrap(),
+            }),
             accumulators: NonZeroUsize::new(2).unwrap(),
             comparisons: ComparisonMode::Simd2,
         };
         let start = Instant::now();
-        let compiled = compile(&context, &plan(&model, options))?;
+        let compiled = compile(&context, &plan(&model, options)?)?;
         let compile_ms = start.elapsed().as_secs_f64() * 1e3;
-        kernels.push((format!("SIMD2 rolling {cap}, sums 2"), compiled, compile_ms));
+        kernels.push((
+            format!("SIMD2 scheduled GP {general}/FP 12, sums 2"),
+            compiled,
+            compile_ms,
+        ));
     }
     let (scores, distinct) = verify(&model, &kernels[0].1, &rows);
     for (_, compiled, _) in &kernels[1..] {
@@ -167,7 +178,7 @@ mod tests {
     fn workload_agrees_and_dependent_trace_visits_multiple_rows() {
         let (model, rows) = workload(Workload::Mixed);
         let context = Context::create();
-        let compiled = compile(&context, &plan(&model, SortOptions::default())).unwrap();
+        let compiled = compile(&context, &plan(&model, SortOptions::default()).unwrap()).unwrap();
         let (scores, distinct) = verify(&model, &compiled, &rows);
         assert_eq!(scores.len(), ROWS);
         assert!(distinct > 1);
@@ -214,11 +225,15 @@ mod tests {
                 &plan(
                     &model,
                     SortOptions {
-                        order: Order::Rolling(NonZeroUsize::new(2).unwrap()),
+                        order: Order::Scheduled(RegisterBudget {
+                            general: NonZeroUsize::new(6).unwrap(),
+                            floating: NonZeroUsize::new(12).unwrap(),
+                        }),
                         accumulators: NonZeroUsize::new(2).unwrap(),
                         comparisons: ComparisonMode::Simd2,
                     },
-                ),
+                )
+                .unwrap(),
             )
             .unwrap();
             let (_, distinct) = verify(&model, &compiled, &rows);

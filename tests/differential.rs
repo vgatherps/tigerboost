@@ -2,7 +2,7 @@ use inkwell::context::Context;
 use std::num::NonZeroUsize;
 use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
-use tigerboost::sort_policy::{ComparisonMode, Order, SortOptions, plan};
+use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
 
 fn next(state: &mut u64, limit: usize) -> usize {
     *state ^= *state >> 12;
@@ -65,7 +65,10 @@ fn seeded_forests_preserve_every_trees_leaf_index() {
                     .collect()
             })
             .collect();
-        let cap = NonZeroUsize::new([1, 2, 4, 8][case / 8 % 4]).unwrap();
+        let budget = RegisterBudget {
+            general: NonZeroUsize::new([4, 6, 12, 20][case / 8 % 4]).unwrap(),
+            floating: NonZeroUsize::new(8).unwrap(),
+        };
         let accumulators = NonZeroUsize::new([1, 2, 4][case / 32]).unwrap();
         let context = Context::create();
         for options in [
@@ -75,17 +78,17 @@ fn seeded_forests_preserve_every_trees_leaf_index() {
                 comparisons: ComparisonMode::Scalar,
             },
             SortOptions {
-                order: Order::Rolling(cap),
+                order: Order::Scheduled(budget),
                 accumulators,
                 comparisons: ComparisonMode::Scalar,
             },
             SortOptions {
-                order: Order::Rolling(cap),
+                order: Order::Scheduled(budget),
                 accumulators,
                 comparisons: ComparisonMode::Simd2,
             },
         ] {
-            let compiled = compile(&context, &plan(&model, options)).unwrap();
+            let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
             for (row_index, row) in rows.iter().enumerate() {
                 assert_eq!(
                     compiled.predict(row),

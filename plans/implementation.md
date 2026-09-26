@@ -139,3 +139,21 @@ All 33 current tests pass in debug/release with `--all-targets`; Clippy passes w
 The README documents the in-memory API, model/row ownership, numeric semantics, selected scalar default, explicit SIMD option, and synthetic measurements with their regressions and short-trace limitations. Its single Rust example is included as crate documentation and executes as a doctest. PLAN.md now marks the agreed in-memory scope complete without claiming deployment performance or x86-64 execution coverage. Prediction code is unchanged.
 
 All 33 tests pass in debug/release with `--all-targets`; the README doctest, Clippy with `-D warnings`, and formatting checks pass offline. On this Homebrew ARM64 setup, the doctest requires `RUSTDOCFLAGS="-C link-arg=/opt/homebrew/lib/libzstd.dylib"`: rustdoc does not inherit the normal Cargo linker path and otherwise selects the existing Intel zstd in `/usr/local/lib`. The documented command links the correct native library explicitly; no source workaround or dependency change was needed.
+
+## Resource-aware planning
+
+Cold model compilation (planning + LLVM) remains higher: scalar 500 trees / 100 features rose from 485.28 to 639.88 ms; 500 / 1000 rose from 606.54 to 819.00 ms. Caching each waiting-sort key avoids repeated score calculation without changing plans; it does not eliminate the compilation regression.
+
+Final same-harness comparison: old cap 4 versus independent GP/FP budgets of 12/12, both with two sums. Five alternating rounds of 50,000 dependent calls; median ns/call includes the driver, without subtracting its floor. All models have depth six, reused features, and globally distinct thresholds.
+
+| Trees / features | Scalar before → after | SIMD before → after |
+|---|---:|---:|
+| 100 / 100 | 142.40 → 144.34 | 142.79 → 138.36 |
+| 500 / 100 | 691.60 → 690.79 | 652.81 → 640.11 |
+| 500 / 1000 | 805.41 → 764.56 | 863.48 → 799.70 |
+
+Earlier 500 / 100 scalar medians were 708.53 and 726.37 ns; that regression did not recur in the final 690.79 ns run. No cause or noise explanation is established, and these results are not a universal win. The timed traces visit only 35/13/3 rows respectively; all 256 rows were separately correctness-checked for every kernel.
+
+Raw artifacts: `/private/tmp/tigerboost-sort-after.wfA3TV/`. The final pair is `old-final.txt` / `new-cached-final.txt`; `new1.txt` / `new2.txt` retain the earlier regressions. Default remains scalar, GP/FP 12/12, two sums; the LLVM backend is unchanged. Logical resource limits do not bound LLVM's physical allocation.
+
+Validation passed: 23 standalone planner tests, all 48 tests in both debug and release, and the README doctest. Review covered primitive peaks, mixed-pair destination unions, actual short-tail progress, reload IDs, deterministic metrics, and complete plan/JIT separation.
