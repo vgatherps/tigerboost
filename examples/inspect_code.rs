@@ -41,33 +41,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                 },
             ),
             (
-                "scheduled-12gp-12fp-2sums",
+                "scheduled-12gp-9fp-2sums",
                 SortOptions {
                     order: Order::Scheduled(RegisterBudget {
                         general: NonZeroUsize::new(12).unwrap(),
-                        floating: NonZeroUsize::new(12).unwrap(),
+                        floating: NonZeroUsize::new(9).unwrap(),
                     }),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Scalar,
                 },
             ),
             (
-                "simd2-scheduled-6gp-12fp-2sums",
+                "simd2-scheduled-6gp-9fp-2sums",
                 SortOptions {
                     order: Order::Scheduled(RegisterBudget {
                         general: NonZeroUsize::new(6).unwrap(),
-                        floating: NonZeroUsize::new(12).unwrap(),
+                        floating: NonZeroUsize::new(9).unwrap(),
                     }),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Simd2,
                 },
             ),
             (
-                "simd2-scheduled-12gp-12fp-2sums",
+                "simd2-scheduled-12gp-9fp-2sums",
                 SortOptions {
                     order: Order::Scheduled(RegisterBudget {
                         general: NonZeroUsize::new(12).unwrap(),
-                        floating: NonZeroUsize::new(12).unwrap(),
+                        floating: NonZeroUsize::new(9).unwrap(),
                     }),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Simd2,

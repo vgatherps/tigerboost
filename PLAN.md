@@ -1,6 +1,6 @@
 # CatBoost JIT plan
 
-Status: the resource-aware sort is reviewed and validated; [current measurements](plans/implementation.md#resource-aware-planning) retain its compilation regressions and narrow-trace limits. The [README](README.md) documents the API. LLVM's physical register allocation remains a separate concern; logical budgets do not constrain it.
+Status: resource-aware sorting, bounded continuation emission, and full-width SIMD masks are reviewed and validated. [Current measurements](plans/implementation.md#bounded-continuation-kernels) show faster scalar prediction and stack-free ARM64 continuation bodies on the tested cases; SIMD remains opt-in and slower than scalar. Narrow traces, custom-budget spills, and untested x86 execution remain limitations. The [README](README.md) documents the API.
 
 ## Goal and agreed constraints
 
@@ -16,6 +16,8 @@ Single-row prediction latency. Capture most useful model-specific optimization w
 ## Implemented design
 
 Validated model → compile-time schedule → model-specialized LLVM function.
+
+The pure plan supplies chunks of at most 16 comparison tests and stable incoming value slots. Multi-chunk kernels transfer real live selectors/features/sums through matching `preserve_nonecc` signatures with `musttail`; one-chunk kernels keep a direct C entry. Default budgets are GP12/FP9 with two sums.
 
 Feature offsets, borders, destination bits, and leaf-table bases are known while compiling. Runtime executes selected loads, comparisons, bit operations, leaf lookups, and additions. It does not walk split metadata or run the scheduling policy.
 
@@ -40,7 +42,7 @@ These subplans record the earlier implementation sequence, including the superse
 
 Read-only load elimination can merge distant reads into one long-lived value. Earlier cap-based LLVM output delayed some consumers and spilled. Logical lifetime counts are not physical-register guarantees; historical assembly findings and rejected backend experiments are in the implementation notes.
 
-Keep valid read-only annotations. Do not manufacture side effects, volatile accesses, fake dependencies, or helper-call barriers to enforce source order. If measured code defeats the intended schedule, document the reproducer and choose the smallest justified change before continuing.
+Keep valid read-only annotations. Do not manufacture side effects, volatile accesses, fake dependencies, or empty calls used only as barriers. The implemented continuations carry real state and bound cross-chunk reordering; LLVM still schedules within each chunk, and logical budgets do not guarantee spill-free custom configurations.
 
 ## Input and output scope
 
@@ -52,6 +54,6 @@ A representative user model and input rows are needed for deployment-level perfo
 
 - In-memory models compile and predict through the documented, checked API; ownership tests cover dropped source models and retained kernels.
 - Hand-derived cases and seeded forests compare reference, tree-order, scheduled scalar, and SIMD leaf decisions. Cancellation tests accommodate reordered sums; overflow/bitwise equivalence is not promised.
-- Four historical synthetic workloads compared cap-based variants and included an artificial repeated-threshold reuse case. Separate resource-aware measurements are now recorded; SIMD remains opt-in.
-- Historical latency, compilation cost, code size, spills, disjoint slowdown and short traces remain recorded. The new sort is accepted with higher cold compilation costs; physical LLVM allocation remains separate.
+- Four historical synthetic workloads retain cap-based results, including an artificial repeated-threshold reuse case. Three reproducible distinct-threshold workloads now validate continuations and SIMD masks; all 256 rows agree before timing.
+- Historical latency, compilation cost, code size, spills, disjoint slowdown and short traces remain recorded. Actual ARM64 captures show zero continuation-body stack traffic for the measured GP12/FP9 cases, not a universal physical-register bound.
 - No representative user model or x86-64 execution evidence was supplied. Deployment-level performance and broader platform validation remain unestablished.

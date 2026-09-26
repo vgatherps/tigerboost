@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let orders = std::iter::once(Order::TreeOrder).chain([4, 6, 12, 20].map(|general| {
         Order::Scheduled(RegisterBudget {
             general: NonZeroUsize::new(general).unwrap(),
-            floating: NonZeroUsize::new(12).unwrap(),
+            floating: NonZeroUsize::new(9).unwrap(),
         })
     }));
     for order in orders {
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let options = SortOptions {
             order: Order::Scheduled(RegisterBudget {
                 general: NonZeroUsize::new(general).unwrap(),
-                floating: NonZeroUsize::new(12).unwrap(),
+                floating: NonZeroUsize::new(9).unwrap(),
             }),
             accumulators: NonZeroUsize::new(2).unwrap(),
             comparisons: ComparisonMode::Simd2,
@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let compiled = compile(&context, &plan(&model, options)?)?;
         let compile_ms = start.elapsed().as_secs_f64() * 1e3;
         kernels.push((
-            format!("SIMD2 scheduled GP {general}/FP 12, sums 2"),
+            format!("SIMD2 scheduled GP {general}/FP 9, sums 2"),
             compiled,
             compile_ms,
         ));
@@ -227,7 +227,7 @@ mod tests {
                     SortOptions {
                         order: Order::Scheduled(RegisterBudget {
                             general: NonZeroUsize::new(6).unwrap(),
-                            floating: NonZeroUsize::new(12).unwrap(),
+                            floating: NonZeroUsize::new(9).unwrap(),
                         }),
                         accumulators: NonZeroUsize::new(2).unwrap(),
                         comparisons: ComparisonMode::Simd2,
@@ -239,5 +239,54 @@ mod tests {
             let (_, distinct) = verify(&model, &compiled, &rows);
             assert!(distinct > 1, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn distinct_workloads_are_deterministic_and_match_scalar_and_simd() {
+        let context = Context::create();
+        for (name, trees, features) in [
+            ("100x100", 100, 100),
+            ("500x100", 500, 100),
+            ("500x1000", 500, 1000),
+        ] {
+            let kind = Workload::parse(name).unwrap();
+            let (model, rows) = workload(kind);
+            let (again, repeated_rows) = workload(kind);
+            assert_eq!(model.trees().len(), trees);
+            assert_eq!(model.feature_modes().len(), features);
+            assert_eq!(rows.len(), ROWS);
+            assert!(rows.iter().all(|row| row.len() == features));
+            assert_eq!(rows, repeated_rows);
+            let mut borders = std::collections::BTreeSet::new();
+            for (tree, repeated) in model.trees().iter().zip(again.trees()) {
+                assert_eq!(tree.selections.len(), 6);
+                assert_eq!(tree.leafs.len(), 64);
+                assert_eq!(tree.leafs, repeated.leafs);
+                for (split, repeated) in tree.selections.iter().zip(&repeated.selections) {
+                    assert_eq!(split.feature_idx, repeated.feature_idx);
+                    assert_eq!(split.threshold.to_bits(), repeated.threshold.to_bits());
+                    assert!(borders.insert(split.threshold.to_bits()));
+                }
+            }
+            assert_eq!(borders.len(), trees * 6);
+            for comparisons in [ComparisonMode::Scalar, ComparisonMode::Simd2] {
+                let compiled = compile(
+                    &context,
+                    &plan(
+                        &model,
+                        SortOptions {
+                            comparisons,
+                            ..SortOptions::default()
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                for row in &rows {
+                    assert_eq!(compiled.predict(row), model.predict(row));
+                }
+            }
+        }
+        assert!(Workload::parse("not-a-workload").is_err());
     }
 }

@@ -59,7 +59,7 @@ with the reference are not promised. Comparisons retain NaN/infinity semantics.
 ## Scheduling
 
 `SortOptions::default()` selects scalar comparisons, logical budgets of twelve
-general and twelve floating registers, and two independent sums. The schedule
+general and nine floating registers, and two independent sums. The schedule
 shares feature loads and predicates, checks operation peaks before starting
 selectors, and releases values as their uses finish or space is needed.
 Prediction does not walk split metadata or run the scheduler.
@@ -73,7 +73,9 @@ feature overlap before tree score, with stable ID tie breaks.
 `sort_policy::plan(&model, SortOptions { order, accumulators, comparisons })`
 returns a complete plan or an insufficient-budget error, without LLVM. Its
 read-only commands specify feature lifetimes, comparisons, leaf accumulation,
-sum reduction, and return behavior.
+sum reduction, and return behavior. The plan also supplies consecutive chunks
+of at most 16 comparison tests (a SIMD pair counts as two) and stable incoming
+value slots; unfinished trees may cross a boundary.
 `jit::compile(&context, &plan)` emits that plan. Counts use `NonZeroUsize`.
 Choose `Order::TreeOrder`, one
 accumulator, and `ComparisonMode::Scalar` for the direct baseline. Choose
@@ -83,9 +85,18 @@ Pairs fall back to scalar when their transient workspace cannot fit;
 tree order remains scalar regardless of that option.
 
 The backend uses a generic CPU, LLVM `early-cse`, and backend optimization
-level `Less`. Immutable leaf tables and read-only input/function annotations
-permit load reuse. LLVM can still reorder instructions and spill: the planner's
-logical register budgets are not bounds on physical register usage.
+level `Less`. Immutable leaf tables and read-only row/function annotations remain
+in place. Multi-chunk kernels use identical `noinline preserve_nonecc`
+signatures and direct `musttail` transfers of the row pointer, live selectors,
+features, and sums. These transfer real computation state, bounding LLVM's
+reordering across chunks. One-chunk models emit a direct C `predict`, without
+an extra call or wrapper.
+
+Actual ARM64 MCJIT captures for the three distinct-threshold workloads below
+have stack-free continuation bodies and one 160-byte C-entry save frame.
+This is measured evidence, not a guarantee for arbitrary models or custom
+budgets. LLVM may still reorder within a chunk or spill. Scalar remains faster
+than SIMD in the current measurements; see [current results](plans/implementation.md#bounded-continuation-kernels).
 
 ## Build and checks
 
@@ -137,11 +148,16 @@ especially the two-row reuse-heavy trace, not deployment-level evidence.
 These commands exercise the current resource-aware implementation:
 
 ```sh
-cargo run --offline --release --example scalar_bench -- mixed
-cargo run --offline --release --example inspect_code -- /private/tmp/tigerboost-code-new mixed
+cargo run --offline --release --example scalar_bench -- 500x100
+cargo run --offline --release --example inspect_code -- /private/tmp/tigerboost-code-new 100x100
 ```
 
-Both accept `mixed` (default), `reuse-heavy`, `disjoint`, or `wide`.
+Both accept `100x100`, `500x100`, and `500x1000` (trees × declared features),
+plus the unchanged historical `mixed` (default), `reuse-heavy`, `disjoint`, and
+`wide` fixtures. The new cases randomly reuse features but have globally distinct
+thresholds: shuffled dyadic values in `[-4, 4)`, integer leaves 1–16, and 256
+dyadic rows. Depth six is a diagnostic assumption, not a supplied user model;
+some declared features may be unused.
 Inspection requires a fresh output directory and emits separate ARM64/x86-64
-assembly, not MCJIT's executable bytes. See [implementation history](plans/implementation.md)
+assembly and corresponding plan dumps, not MCJIT's executable bytes. See [implementation history](plans/implementation.md)
 for compilation times, code sizes, spills, regressions, and review history.

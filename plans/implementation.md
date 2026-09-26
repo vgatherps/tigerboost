@@ -157,3 +157,39 @@ Earlier 500 / 100 scalar medians were 708.53 and 726.37 ns; that regression did 
 Raw artifacts: `/private/tmp/tigerboost-sort-after.wfA3TV/`. The final pair is `old-final.txt` / `new-cached-final.txt`; `new1.txt` / `new2.txt` retain the earlier regressions. Default remains scalar, GP/FP 12/12, two sums; the LLVM backend is unchanged. Logical resource limits do not bound LLVM's physical allocation.
 
 Validation passed: 23 standalone planner tests, all 48 tests in both debug and release, and the README doctest. Review covered primitive peaks, mixed-pair destination unions, actual short-tail progress, reload IDs, deterministic metrics, and complete plan/JIT separation.
+
+## Bounded continuation kernels
+
+LLVM's global load merging and machine scheduling defeated the planned lifetimes. The pure plan now partitions unchanged commands into chunks of at most 16 comparison tests, including trailing releases/retirements. Stable slots carry unfinished indices and feature instances; sums retain fixed slots. LLVM emits matching `noinline preserve_nonecc` functions connected by direct `musttail` returns. These are real-state transfers, not fake dependencies. One-chunk models keep a direct C entry. Default is scalar, GP12/FP9, two sums; custom budgets remain explicit and can spill.
+
+Final production comparison against `57006a2`, Apple M4 Pro / LLVM 21.1.8, generic target. Five alternating rounds × 50,000 dependent calls after 10,000 warmup calls; median ns/call includes row checks, common dispatch, and driver. Depth-six models randomly reuse features; every threshold is globally distinct. All 256 rows and identical timed traces were checked. These traces visit only 35/13/3 rows, so this is warm synthetic evidence, not deployment performance.
+
+| Trees / declared features | Old scalar GP12/FP12 | Old scalar GP12/FP9 | Current scalar GP12/FP9 | Old SIMD GP12/FP9 | Current SIMD GP12/FP9 |
+|---|---:|---:|---:|---:|---:|
+| 100 / 100 | 150.732 | 151.279 | 121.151 | 137.759 | 124.085 |
+| 500 / 100 | 733.398 | 723.660 | 571.641 | 641.837 | 612.200 |
+| 500 / 1000 | 789.854 | 784.735 | 586.101 | 823.176 | 589.988 |
+
+Driver floors were 5.568/5.569/5.262 ns, not subtracted. The same-budget old scalar column isolates the continuation change; the current SIMD column also includes full-width masks. Raw rounds, ranges, and controls: `/private/tmp/tigerboost-production-continuation.QCiuYC/mask-timing.txt`.
+
+Tree-order scalar with the same continuation backend and two sums measured 124.656/587.466/613.198 ns in that run. Scheduling improves those medians by about 2.8–4.4%; the larger 20–26% gain against the old default mostly comes from correcting backend scheduling, not from feature reuse alone.
+
+Actual MCJIT object/byte captures (`masks-*` in that directory), checked against function bounds and exact tail destinations, contain zero continuation-body stack accesses, calls, or conditional branches in all six wide cases. Each has one 23-instruction C wrapper with a 160-byte save frame. The tested empty/constant probes have two instructions, no calls, and no stack traffic. Scalar/SIMD total instructions including the wrapper are 4,453/4,051, 22,233/19,744, and 22,857/22,120 for the three cases. Separate x86 emission is validated, not native execution or x86 speed evidence. Arbitrary models/budgets are not guaranteed spill-free.
+
+On 100/100 with the same GP12/FP9 budget, the unsplit scalar kernel delayed its first leaf load until 571 of 600 tests; continuations load the first leaf after 30. The unsplit capture also has 3,168 bytes of local stack storage beyond its 160-byte save frame, versus no continuation-body stack traffic. Source evidence: `/private/tmp/tigerboost-unsplit-fp9.FYJBoE/report.md` and the current `masks-100-100-scalar` native capture.
+
+## Full-width SIMD masks
+
+Paired comparisons now extend lane results to full-width 0/−1 masks and AND each consumer's destination bit before OR-ing its selector. Scalar lowering, plans, chunk boundaries, and backend settings are unchanged. ARM64 no longer narrows each pair with `xtn`; it still extracts both lanes and updates separate indices. In the 500/100 plan, 1,333 of 1,340 pairs (99.5%) target different trees, so packing comparisons does not combine selector construction.
+
+Isolated production `13e24ee` → full-mask comparison, same five-round protocol and GP12/FP9 plans:
+
+| Trees / features | Scalar control | SIMD before | SIMD full masks |
+|---|---:|---:|---:|
+| 100 / 100 | 123.792 | 127.972 | 126.097 |
+| 500 / 100 | 579.005 | 606.158 | 600.067 |
+| 500 / 1000 | 586.804 | 600.182 | 595.908 |
+
+Mask gains are modest and noisy: all before/after ranges overlap, and scalar remains faster. Do not compare these medians across runs with the preceding table. Raw production samples: `/private/tmp/tigerboost-production-continuation.QCiuYC/mask-compare.txt`; earlier diagnostic assembly and explanation: `/private/tmp/tigerboost-full-mask.PBMl5H/report.md`. The latter's scratch timings are not the final production comparison. x86 separate emission has fewer total instructions despite replacing `movmskpd` with full-width extracts; no x86 runtime claim follows.
+
+The exact workload generator is now shared by the existing benchmark/inspection examples under `100x100`, `500x100`, and `500x1000`. Historical fixtures are unchanged. Dedicated tests check parser dimensions, global threshold uniqueness, deterministic model/row regeneration, and scalar/SIMD agreement for all 256 rows without adding timed-call loops.

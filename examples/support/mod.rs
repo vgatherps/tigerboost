@@ -1,5 +1,7 @@
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
 
+mod distinct;
+
 pub const ROWS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8,6 +10,7 @@ pub enum Workload {
     ReuseHeavy,
     Disjoint,
     Wide,
+    Distinct(usize, usize),
 }
 
 impl Workload {
@@ -17,7 +20,12 @@ impl Workload {
             "reuse-heavy" => Ok(Self::ReuseHeavy),
             "disjoint" => Ok(Self::Disjoint),
             "wide" => Ok(Self::Wide),
-            _ => Err("workload must be mixed, reuse-heavy, disjoint, or wide"),
+            "100x100" => Ok(Self::Distinct(100, 100)),
+            "500x100" => Ok(Self::Distinct(500, 100)),
+            "500x1000" => Ok(Self::Distinct(500, 1000)),
+            _ => Err(
+                "workload must be mixed, reuse-heavy, disjoint, wide, 100x100, 500x100, or 500x1000",
+            ),
         }
     }
 }
@@ -28,6 +36,7 @@ pub fn workload(kind: Workload) -> (Trees, Vec<Vec<f64>>) {
         Workload::ReuseHeavy => (64, 4),
         Workload::Disjoint => (64, 384),
         Workload::Wide => (128, 128),
+        Workload::Distinct(trees, features) => return distinct::workload(trees, features),
     };
     let mut state = 42u64;
     let mut random = || {
