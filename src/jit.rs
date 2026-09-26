@@ -299,6 +299,11 @@ fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Mod
                                 thresholds,
                                 "splits",
                             )?;
+                            let result = builder.build_int_s_extend(
+                                result,
+                                index_type.vec_type(2),
+                                "full_masks",
+                            )?;
                             let mut bits = Vec::new();
                             for lane in 0..2 {
                                 bits.push(
@@ -316,13 +321,26 @@ fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Mod
                         _ => unreachable!("comparison pack must contain one or two predicates"),
                     };
                     for (comparison, bit) in comparisons.iter().zip(bits) {
-                        let bit = builder.build_int_z_extend(bit, index_type, "bit")?;
+                        let scalar = comparisons.len() == 1;
+                        let bit = if scalar {
+                            builder.build_int_z_extend(bit, index_type, "bit")?
+                        } else {
+                            bit
+                        };
                         for consumer in &comparison.consumers {
-                            let level_bit = builder.build_left_shift(
-                                bit,
-                                index_type.const_int(consumer.level as u64, false),
-                                "level_bit",
-                            )?;
+                            let level_bit = if scalar {
+                                builder.build_left_shift(
+                                    bit,
+                                    index_type.const_int(consumer.level as u64, false),
+                                    "level_bit",
+                                )?
+                            } else {
+                                builder.build_and(
+                                    bit,
+                                    index_type.const_int(1u64 << consumer.level, false),
+                                    "level_bit",
+                                )?
+                            };
                             let index = indices[consumer.tree.0]
                                 .expect("comparison requires an active tree");
                             indices[consumer.tree.0] =
@@ -539,7 +557,10 @@ mod tests {
             assert_eq!(ir.matches("load double").count(), loads);
             assert_eq!(ir.matches("fcmp ogt double").count(), scalars);
             assert_eq!(ir.matches("fcmp ogt <2 x double>").count(), pairs);
-            assert_eq!(ir.matches("extractelement <2 x i1>").count(), pairs * 2);
+            assert_eq!(ir.matches("sext <2 x i1>").count(), pairs);
+            assert_eq!(ir.matches("to <2 x i64>").count(), pairs);
+            assert_eq!(ir.matches("extractelement <2 x i64>").count(), pairs * 2);
+            assert!(!ir.contains("extractelement <2 x i1>"));
         }
     }
 

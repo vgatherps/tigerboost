@@ -4,7 +4,7 @@ use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{
     Discriminator, FeatureIndex, NanMode, RowLengthError, SingleTree, Trees,
 };
-use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
+use tigerboost::sort_policy::{Action, ComparisonMode, Order, RegisterBudget, SortOptions, plan};
 
 fn split(feature: usize, threshold: f64) -> Discriminator {
     Discriminator {
@@ -46,7 +46,7 @@ fn paired_thresholds_preserve_both_lane_orders_and_odd_tail() {
     let context = Context::create();
     let options = SortOptions {
         order: Order::Scheduled(RegisterBudget {
-            general: NonZeroUsize::new(5).unwrap(),
+            general: NonZeroUsize::new(6).unwrap(),
             floating: NonZeroUsize::new(12).unwrap(),
         }),
         comparisons: ComparisonMode::Simd2,
@@ -55,18 +55,47 @@ fn paired_thresholds_preserve_both_lane_orders_and_odd_tail() {
     let mut outcomes = [false; 4];
     for thresholds in [[0.0, 1.0], [1.0, 0.0]] {
         for mode in [NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue] {
-            let model = Trees::new(
-                vec![indexed_tree(vec![
-                    split(0, thresholds[0]),
-                    split(0, thresholds[1]),
-                    split(0, 2.0),
-                ])],
-                vec![mode],
-                1.0,
-                0.0,
-            )
-            .unwrap();
-            let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
+            let first = indexed_tree(vec![
+                split(0, thresholds[0]),
+                split(0, thresholds[1]),
+                split(0, 2.0),
+                split(0, f64::INFINITY),
+                split(0, f64::NEG_INFINITY),
+            ]);
+            let mut second = first.clone();
+            second.selections.rotate_left(1);
+            for leaf in &mut second.leafs {
+                *leaf *= 64.0;
+            }
+            let model = Trees::new(vec![first, second], vec![mode], 1.0, 0.0).unwrap();
+            let plan = plan(&model, options).unwrap();
+            let packs: Vec<_> = plan
+                .actions()
+                .iter()
+                .filter_map(|action| {
+                    if let Action::Compare { comparisons, .. } = action {
+                        Some(comparisons)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                packs.iter().map(|pack| pack.len()).collect::<Vec<_>>(),
+                [2, 2, 1]
+            );
+            assert_eq!(
+                packs[0]
+                    .iter()
+                    .map(|comparison| plan.predicates()[comparison.predicate.0].threshold)
+                    .collect::<Vec<_>>(),
+                thresholds
+            );
+            for comparison in packs.iter().flat_map(|pack| pack.iter()) {
+                assert_eq!(comparison.consumers.len(), 2);
+                assert_ne!(comparison.consumers[0].level, comparison.consumers[1].level);
+            }
+            let compiled = compile(&context, &plan).unwrap();
             for value in [
                 f64::NEG_INFINITY,
                 -0.0,
@@ -77,9 +106,9 @@ fn paired_thresholds_preserve_both_lane_orders_and_odd_tail() {
                 f64::INFINITY,
                 f64::NAN,
             ] {
-                let index = compiled.predict(&[value]).unwrap() as usize;
-                assert_eq!(index, model.leaf_indices(&[value]).unwrap()[0]);
-                outcomes[index & 3] = true;
+                let prediction = compiled.predict(&[value]).unwrap();
+                assert_eq!(prediction, model.predict(&[value]).unwrap());
+                outcomes[prediction as usize & 3] = true;
             }
         }
     }
