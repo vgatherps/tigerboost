@@ -10,7 +10,8 @@ use std::{
     path::PathBuf,
 };
 use support::Workload;
-use tigerboost::jit::{ComparisonMode, CompileOptions, Order, emit_assembly};
+use tigerboost::jit::emit_assembly;
+use tigerboost::sort_policy::{ComparisonMode, Order, SortOptions, plan};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
@@ -33,7 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for (name, options) in [
             (
                 "tree-order-1",
-                CompileOptions {
+                SortOptions {
                     order: Order::TreeOrder,
                     accumulators: NonZeroUsize::new(1).unwrap(),
                     comparisons: ComparisonMode::Scalar,
@@ -41,7 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ),
             (
                 "rolling-4-2",
-                CompileOptions {
+                SortOptions {
                     order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Scalar,
@@ -49,7 +50,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ),
             (
                 "simd2-rolling-2-2",
-                CompileOptions {
+                SortOptions {
                     order: Order::Rolling(NonZeroUsize::new(2).unwrap()),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Simd2,
@@ -57,14 +58,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             ),
             (
                 "simd2-rolling-4-2",
-                CompileOptions {
+                SortOptions {
                     order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
                     accumulators: NonZeroUsize::new(2).unwrap(),
                     comparisons: ComparisonMode::Simd2,
                 },
             ),
         ] {
-            let assembly = emit_assembly(&context, &model, options, triple)?;
+            let assembly = emit_assembly(&context, &plan(&model, options), triple)?;
             let path = output.join(format!("{triple}-{name}.s"));
             File::create_new(&path)?.write_all(assembly.as_bytes())?;
             println!("{}", path.display());

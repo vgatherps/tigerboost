@@ -4,8 +4,9 @@ mod support;
 use inkwell::context::Context;
 use std::{error::Error, hint::black_box, num::NonZeroUsize, time::Instant};
 use support::{ROWS, Workload, workload};
-use tigerboost::jit::{ComparisonMode, CompileOptions, CompiledModel, Order, compile_with_options};
+use tigerboost::jit::{CompiledModel, compile};
 use tigerboost::parsed_tree::Trees;
+use tigerboost::sort_policy::{ComparisonMode, Order, SortOptions, plan};
 
 const CALLS: usize = 50_000;
 const ROUNDS: usize = 5;
@@ -62,13 +63,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .chain([1, 2, 4, 8].map(|cap| Order::Rolling(NonZeroUsize::new(cap).unwrap())));
     for order in orders {
         for count in [1, 2, 4] {
-            let options = CompileOptions {
+            let options = SortOptions {
                 order,
                 accumulators: NonZeroUsize::new(count).unwrap(),
                 comparisons: ComparisonMode::Scalar,
             };
             let start = Instant::now();
-            let compiled = compile_with_options(&context, &model, options)?;
+            let compiled = compile(&context, &plan(&model, options))?;
             let compile_ms = start.elapsed().as_secs_f64() * 1e3;
             let label = match order {
                 Order::TreeOrder => format!("Tree order, sums {count}"),
@@ -78,13 +79,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     for cap in [1, 2, 4, 8] {
-        let options = CompileOptions {
+        let options = SortOptions {
             order: Order::Rolling(NonZeroUsize::new(cap).unwrap()),
             accumulators: NonZeroUsize::new(2).unwrap(),
             comparisons: ComparisonMode::Simd2,
         };
         let start = Instant::now();
-        let compiled = compile_with_options(&context, &model, options)?;
+        let compiled = compile(&context, &plan(&model, options))?;
         let compile_ms = start.elapsed().as_secs_f64() * 1e3;
         kernels.push((format!("SIMD2 rolling {cap}, sums 2"), compiled, compile_ms));
     }
@@ -166,7 +167,7 @@ mod tests {
     fn workload_agrees_and_dependent_trace_visits_multiple_rows() {
         let (model, rows) = workload(Workload::Mixed);
         let context = Context::create();
-        let compiled = compile_with_options(&context, &model, CompileOptions::default()).unwrap();
+        let compiled = compile(&context, &plan(&model, SortOptions::default())).unwrap();
         let (scores, distinct) = verify(&model, &compiled, &rows);
         assert_eq!(scores.len(), ROWS);
         assert!(distinct > 1);
@@ -208,14 +209,16 @@ mod tests {
                     );
                 }
             }
-            let compiled = compile_with_options(
+            let compiled = compile(
                 &context,
-                &model,
-                CompileOptions {
-                    order: Order::Rolling(NonZeroUsize::new(2).unwrap()),
-                    accumulators: NonZeroUsize::new(2).unwrap(),
-                    comparisons: ComparisonMode::Simd2,
-                },
+                &plan(
+                    &model,
+                    SortOptions {
+                        order: Order::Rolling(NonZeroUsize::new(2).unwrap()),
+                        accumulators: NonZeroUsize::new(2).unwrap(),
+                        comparisons: ComparisonMode::Simd2,
+                    },
+                ),
             )
             .unwrap();
             let (_, distinct) = verify(&model, &compiled, &rows);

@@ -1,7 +1,8 @@
 use inkwell::context::Context;
 use std::num::NonZeroUsize;
-use tigerboost::jit::{ComparisonMode, CompileOptions, Order, compile_with_options};
+use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
+use tigerboost::sort_policy::{ComparisonMode, Order, SortOptions, plan};
 
 fn next(state: &mut u64, limit: usize) -> usize {
     *state ^= *state >> 12;
@@ -68,23 +69,23 @@ fn seeded_forests_preserve_every_trees_leaf_index() {
         let accumulators = NonZeroUsize::new([1, 2, 4][case / 32]).unwrap();
         let context = Context::create();
         for options in [
-            CompileOptions {
+            SortOptions {
                 order: Order::TreeOrder,
                 accumulators: NonZeroUsize::new(1).unwrap(),
                 comparisons: ComparisonMode::Scalar,
             },
-            CompileOptions {
+            SortOptions {
                 order: Order::Rolling(cap),
                 accumulators,
                 comparisons: ComparisonMode::Scalar,
             },
-            CompileOptions {
+            SortOptions {
                 order: Order::Rolling(cap),
                 accumulators,
                 comparisons: ComparisonMode::Simd2,
             },
         ] {
-            let compiled = compile_with_options(&context, &model, options).unwrap();
+            let compiled = compile(&context, &plan(&model, options)).unwrap();
             for (row_index, row) in rows.iter().enumerate() {
                 assert_eq!(
                     compiled.predict(row),

@@ -11,6 +11,7 @@ features, and probability transforms are not implemented.
 use inkwell::context::Context;
 use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
+use tigerboost::sort_policy::{SortOptions, plan};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = Trees::new(
@@ -26,7 +27,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         -1.0, // bias
     )?;
     let context = Context::create();
-    let predictor = compile(&context, &model)?;
+    let plan = plan(&model, SortOptions::default());
+    let predictor = compile(&context, &plan)?;
+    drop(plan);
     drop(model);
     assert_eq!(predictor.predict(&[1.0])?, 3.0);
     assert_eq!(predictor.predict(&[2.0])?, 9.0);
@@ -55,13 +58,16 @@ with the reference are not promised. Comparisons retain NaN/infinity semantics.
 
 ## Scheduling
 
-`compile` defaults to scalar comparisons, up to four active trees, and two
-independent sums. The compile-time schedule shares feature loads and predicates,
+`SortOptions::default()` selects scalar comparisons, up to four active trees,
+and two independent sums. The compile-time schedule shares feature loads and predicates,
 updates original leaf-index bits, and retires/refills trees as they finish.
 Prediction does not walk split metadata or run the scheduler.
 
-`jit::compile_with_options` accepts `CompileOptions { order, accumulators,
-comparisons }`. Counts use `NonZeroUsize`. Choose `Order::TreeOrder`, one
+`sort_policy::plan(&model, SortOptions { order, accumulators, comparisons })`
+produces a complete plan without LLVM. Its read-only commands specify feature
+lifetimes, comparisons, leaf accumulation, sum reduction, and return behavior.
+`jit::compile(&context, &plan)` emits that plan. Counts use `NonZeroUsize`.
+Choose `Order::TreeOrder`, one
 accumulator, and `ComparisonMode::Scalar` for the direct baseline. Choose
 `Order::Rolling(cap)` and `ComparisonMode::Simd2` for opt-in two-lane comparisons
 sharing a feature; tree order remains scalar regardless of that option.

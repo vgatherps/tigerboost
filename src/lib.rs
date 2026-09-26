@@ -2,4 +2,4 @@
 
 pub mod jit;
 pub mod parsed_tree;
-mod sort_policy;
+pub mod sort_policy;

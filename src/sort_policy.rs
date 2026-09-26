@@ -3,16 +3,19 @@ use std::{cmp::Reverse, num::NonZeroUsize};
 use crate::parsed_tree::{Discriminator, FeatureIndex, Trees};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TreeId(pub usize);
+pub struct TreeId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct PredicateId(pub usize);
+pub struct PredicateId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FeatureValueId(pub usize);
+pub struct FeatureValueId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Consumer {
+pub struct SumId(pub usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Consumer {
     pub tree: TreeId,
     pub level: usize,
 }
@@ -23,14 +26,38 @@ pub enum ComparisonMode {
     Simd2,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum Order {
+    TreeOrder,
+    Rolling(NonZeroUsize),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SortOptions {
+    pub order: Order,
+    pub accumulators: NonZeroUsize,
+    /// Packs comparisons only for rolling order; tree order remains scalar.
+    pub comparisons: ComparisonMode,
+}
+
+impl Default for SortOptions {
+    fn default() -> Self {
+        Self {
+            order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
+            accumulators: NonZeroUsize::new(2).unwrap(),
+            comparisons: ComparisonMode::Scalar,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Comparison {
+pub struct Comparison {
     pub predicate: PredicateId,
     pub consumers: Vec<Consumer>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Action {
+pub enum Action {
     Admit(TreeId),
     Load {
         value: FeatureValueId,
@@ -41,18 +68,69 @@ pub(crate) enum Action {
         comparisons: Vec<Comparison>,
     },
     Release(FeatureValueId),
-    Retire(TreeId),
+    Retire {
+        tree: TreeId,
+        sum: SumId,
+    },
+    AddSums {
+        destination: SumId,
+        source: SumId,
+    },
+    ReturnScaled(SumId),
+    ReturnBias,
 }
 
-pub(crate) struct Schedule {
-    pub predicates: Vec<Discriminator>,
-    pub actions: Vec<Action>,
+pub struct Plan<'model> {
+    model: &'model Trees,
+    predicates: Vec<Discriminator>,
+    actions: Vec<Action>,
+    sum_count: usize,
 }
 
-pub(crate) fn tree_order(trees: &Trees) -> Schedule {
-    let mut plan = Schedule {
+impl Plan<'_> {
+    pub fn model(&self) -> &Trees {
+        self.model
+    }
+
+    pub fn predicates(&self) -> &[Discriminator] {
+        &self.predicates
+    }
+
+    pub fn actions(&self) -> &[Action] {
+        &self.actions
+    }
+
+    pub fn sum_count(&self) -> usize {
+        self.sum_count
+    }
+}
+
+pub fn plan(model: &Trees, options: SortOptions) -> Plan<'_> {
+    let sum_count = options.accumulators.get().min(model.trees().len().max(1));
+    let mut plan = match options.order {
+        Order::TreeOrder => tree_order(model, sum_count),
+        Order::Rolling(cap) => schedule(model, cap, options.comparisons, sum_count),
+    };
+    for source in 1..sum_count {
+        plan.actions.push(Action::AddSums {
+            destination: SumId(0),
+            source: SumId(source),
+        });
+    }
+    plan.actions.push(if model.trees().is_empty() {
+        Action::ReturnBias
+    } else {
+        Action::ReturnScaled(SumId(0))
+    });
+    plan
+}
+
+fn tree_order(trees: &Trees, sum_count: usize) -> Plan<'_> {
+    let mut plan = Plan {
+        model: trees,
         predicates: Vec::new(),
         actions: Vec::new(),
+        sum_count,
     };
     let mut next_value = 0;
     for (tree, description) in trees.trees().iter().enumerate() {
@@ -76,7 +154,10 @@ pub(crate) fn tree_order(trees: &Trees) -> Schedule {
             });
             plan.actions.push(Action::Release(value));
         }
-        plan.actions.push(Action::Retire(tree));
+        plan.actions.push(Action::Retire {
+            tree,
+            sum: SumId(tree.0 % sum_count),
+        });
     }
     plan
 }
@@ -86,7 +167,8 @@ struct ActiveTree {
     remaining: usize,
 }
 
-struct Planner {
+struct Planner<'model> {
+    model: &'model Trees,
     predicates: Vec<Discriminator>,
     splits: Vec<Vec<PredicateId>>,
     scores: Vec<usize>,
@@ -96,13 +178,16 @@ struct Planner {
     actions: Vec<Action>,
     limit: usize,
     comparisons: ComparisonMode,
+    sum_count: usize,
+    retired: usize,
 }
 
-pub(crate) fn schedule(
+fn schedule(
     trees: &Trees,
     max_live_trees: NonZeroUsize,
     comparisons: ComparisonMode,
-) -> Schedule {
+    sum_count: usize,
+) -> Plan<'_> {
     let mut predicates: Vec<Discriminator> = Vec::new();
     let mut frequencies = vec![0; trees.feature_modes().len()];
     let splits = trees
@@ -136,6 +221,7 @@ pub(crate) fn schedule(
         })
         .collect();
     Planner {
+        model: trees,
         predicates,
         splits,
         scores,
@@ -145,11 +231,13 @@ pub(crate) fn schedule(
         actions: Vec::new(),
         limit: max_live_trees.get(),
         comparisons,
+        sum_count,
+        retired: 0,
     }
     .run()
 }
 
-impl Planner {
+impl<'model> Planner<'model> {
     fn pending<'a>(
         &'a self,
         tree: &'a ActiveTree,
@@ -189,7 +277,11 @@ impl Planner {
             self.actions.push(Action::Admit(tree));
             let remaining = (1 << self.splits[tree.0].len()) - 1;
             if remaining == 0 {
-                self.actions.push(Action::Retire(tree));
+                self.actions.push(Action::Retire {
+                    tree,
+                    sum: SumId(self.retired % self.sum_count),
+                });
+                self.retired += 1;
             } else {
                 self.active.push(ActiveTree {
                     id: tree,
@@ -233,7 +325,7 @@ impl Planner {
         self.predicates[predicate.0].feature_idx
     }
 
-    fn run(mut self) -> Schedule {
+    fn run(mut self) -> Plan<'model> {
         let mut next_value = 0;
         self.fill();
         while !self.active.is_empty() {
@@ -288,7 +380,11 @@ impl Planner {
             });
             self.active.retain(|tree| {
                 if tree.remaining == 0 {
-                    self.actions.push(Action::Retire(tree.id));
+                    self.actions.push(Action::Retire {
+                        tree: tree.id,
+                        sum: SumId(self.retired % self.sum_count),
+                    });
+                    self.retired += 1;
                     false
                 } else {
                     true
@@ -300,9 +396,11 @@ impl Planner {
                 self.retained = None;
             }
         }
-        Schedule {
+        Plan {
+            model: self.model,
             predicates: self.predicates,
             actions: self.actions,
+            sum_count: self.sum_count,
         }
     }
 }

@@ -1,6 +1,5 @@
-use crate::parsed_tree::{NanMode, RowLengthError, Trees};
-pub use crate::sort_policy::ComparisonMode;
-use crate::sort_policy::{self, Action};
+use crate::parsed_tree::{NanMode, RowLengthError};
+use crate::sort_policy::{Action, Comparison, Plan};
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::context::Context;
 use inkwell::execution_engine::JitFunction;
@@ -12,35 +11,11 @@ use inkwell::targets::{
 use inkwell::types::VectorType;
 use inkwell::values::{BasicValue, FastMathFlags, FloatValue};
 use inkwell::{AddressSpace, FloatPredicate, OptimizationLevel};
-use std::{error::Error, num::NonZeroUsize};
+use std::error::Error;
 
 type PredictFn = unsafe extern "C" fn(*const f64) -> f64;
 type CompileResult<T> = Result<T, Box<dyn Error>>;
 const BACKEND_OPTIMIZATION: OptimizationLevel = OptimizationLevel::Less;
-
-#[derive(Clone, Copy, Debug)]
-pub enum Order {
-    TreeOrder,
-    Rolling(NonZeroUsize),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct CompileOptions {
-    pub order: Order,
-    pub accumulators: NonZeroUsize,
-    /// Packs comparisons only for rolling order; tree order remains scalar.
-    pub comparisons: ComparisonMode,
-}
-
-impl Default for CompileOptions {
-    fn default() -> Self {
-        Self {
-            order: Order::Rolling(NonZeroUsize::new(4).unwrap()),
-            accumulators: NonZeroUsize::new(2).unwrap(),
-            comparisons: ComparisonMode::Scalar,
-        }
-    }
-}
 
 pub struct CompiledModel<'ctx> {
     // Retains the engine, including executable code and private constant globals.
@@ -62,45 +37,38 @@ impl CompiledModel<'_> {
     }
 }
 
-pub fn compile<'ctx>(context: &'ctx Context, model: &Trees) -> CompileResult<CompiledModel<'ctx>> {
-    compile_with_options(context, model, CompileOptions::default())
-}
-
-pub fn compile_with_options<'ctx>(
+pub fn compile<'ctx>(
     context: &'ctx Context,
-    model: &Trees,
-    options: CompileOptions,
+    plan: &Plan<'_>,
 ) -> CompileResult<CompiledModel<'ctx>> {
     Target::initialize_native(&InitializationConfig::default())?;
     let triple = TargetMachine::get_default_triple();
-    let (module, _) = prepare_module(context, model, options, &triple)?;
+    let (module, _) = prepare_module(context, plan, &triple)?;
     let engine = module.create_jit_execution_engine(BACKEND_OPTIMIZATION)?;
-    // SAFETY: emit_model builds exactly C ABI double(const double*).
+    // SAFETY: emit_plan builds exactly C ABI double(const double*).
     let function = unsafe { engine.get_function::<PredictFn>("predict")? };
     Ok(CompiledModel {
         function,
-        feature_count: model.feature_modes().len(),
+        feature_count: plan.model().feature_modes().len(),
     })
 }
 
 /// Separate target emission for inspection, not disassembly of MCJIT's executable bytes.
 pub fn emit_assembly(
     context: &Context,
-    model: &Trees,
-    options: CompileOptions,
+    plan: &Plan<'_>,
     target_triple: &str,
 ) -> CompileResult<String> {
     Target::initialize_all(&InitializationConfig::default());
     let triple = TargetTriple::create(target_triple);
-    let (module, machine) = prepare_module(context, model, options, &triple)?;
+    let (module, machine) = prepare_module(context, plan, &triple)?;
     let buffer = machine.write_to_memory_buffer(&module, FileType::Assembly)?;
     Ok(String::from_utf8(buffer.as_slice().to_vec())?)
 }
 
 fn prepare_module<'ctx>(
     context: &'ctx Context,
-    model: &Trees,
-    options: CompileOptions,
+    plan: &Plan<'_>,
     triple: &TargetTriple,
 ) -> CompileResult<(Module<'ctx>, TargetMachine)> {
     let target = Target::from_triple(triple)?;
@@ -114,7 +82,7 @@ fn prepare_module<'ctx>(
             CodeModel::JITDefault,
         )
         .ok_or("could not create target machine")?;
-    let module = emit_model(context, model, options)?;
+    let module = emit_plan(context, plan)?;
     module.set_triple(triple);
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.verify()?;
@@ -127,15 +95,8 @@ fn prepare_module<'ctx>(
     Ok((module, machine))
 }
 
-fn emit_model<'ctx>(
-    context: &'ctx Context,
-    model: &Trees,
-    options: CompileOptions,
-) -> CompileResult<Module<'ctx>> {
-    let schedule = match options.order {
-        Order::TreeOrder => sort_policy::tree_order(model),
-        Order::Rolling(cap) => sort_policy::schedule(model, cap, options.comparisons),
-    };
+fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Module<'ctx>> {
+    let model = plan.model();
     let module = context.create_module("tigerboost");
     let builder = context.create_builder();
     let f64_type = context.f64_type();
@@ -170,10 +131,8 @@ fn emit_model<'ctx>(
     let row = function.get_first_param().unwrap().into_pointer_value();
     let mut indices = vec![None; model.trees().len()];
     let mut loaded_features = Vec::new();
-    let mut sums =
-        vec![f64_type.const_zero(); options.accumulators.get().min(model.trees().len().max(1))];
-    let mut retired = 0;
-    for action in schedule.actions {
+    let mut sums = vec![f64_type.const_zero(); plan.sum_count()];
+    for action in plan.actions() {
         match action {
             Action::Admit(tree) => indices[tree.0] = Some(zero),
             Action::Load { value: id, feature } => {
@@ -217,8 +176,8 @@ fn emit_model<'ctx>(
             } => {
                 let feature =
                     loaded_features[feature.0].expect("comparison requires a live feature value");
-                let threshold = |comparison: &sort_policy::Comparison| {
-                    f64_type.const_float(schedule.predicates[comparison.predicate.0].threshold)
+                let threshold = |comparison: &Comparison| {
+                    f64_type.const_float(plan.predicates()[comparison.predicate.0].threshold)
                 };
                 let bits = match comparisons.as_slice() {
                     [single] => vec![builder.build_float_compare(
@@ -261,9 +220,9 @@ fn emit_model<'ctx>(
                     }
                     _ => unreachable!("comparison pack must contain one or two predicates"),
                 };
-                for (comparison, bit) in comparisons.into_iter().zip(bits) {
+                for (comparison, bit) in comparisons.iter().zip(bits) {
                     let bit = builder.build_int_z_extend(bit, index_type, "bit")?;
-                    for consumer in comparison.consumers {
+                    for consumer in &comparison.consumers {
                         let level_bit = builder.build_left_shift(
                             bit,
                             index_type.const_int(consumer.level as u64, false),
@@ -281,7 +240,7 @@ fn emit_model<'ctx>(
                     .take()
                     .expect("release requires a live feature value");
             }
-            Action::Retire(tree_id) => {
+            Action::Retire { tree: tree_id, sum } => {
                 let index = indices[tree_id.0]
                     .take()
                     .expect("retirement requires an active tree");
@@ -310,37 +269,41 @@ fn emit_model<'ctx>(
                 };
                 let leaf = builder.build_load(f64_type, address, "leaf")?;
                 leaf.as_instruction_value().unwrap().set_alignment(8)?;
-                let slot = retired % sums.len();
-                let accumulator = &mut sums[slot];
+                let accumulator = &mut sums[sum.0];
                 *accumulator = reassociate(builder.build_float_add(
                     *accumulator,
                     leaf.into_float_value(),
                     "sum",
                 )?)?;
-                retired += 1;
+            }
+            Action::AddSums {
+                destination,
+                source,
+            } => {
+                sums[destination.0] = reassociate(builder.build_float_add(
+                    sums[destination.0],
+                    sums[source.0],
+                    "reduced",
+                )?)?;
+            }
+            Action::ReturnScaled(sum) => {
+                let scaled = reassociate(builder.build_float_mul(
+                    sums[sum.0],
+                    f64_type.const_float(model.scale()),
+                    "scaled",
+                )?)?;
+                let result = reassociate(builder.build_float_add(
+                    scaled,
+                    f64_type.const_float(model.bias()),
+                    "biased",
+                )?)?;
+                builder.build_return(Some(&result))?;
+            }
+            Action::ReturnBias => {
+                builder.build_return(Some(&f64_type.const_float(model.bias())))?;
             }
         }
     }
-    let mut sums = sums.into_iter();
-    let mut sum = sums.next().unwrap();
-    for partial in sums {
-        sum = reassociate(builder.build_float_add(sum, partial, "reduced")?)?;
-    }
-    let result = if model.trees().is_empty() {
-        f64_type.const_float(model.bias())
-    } else {
-        let scaled = reassociate(builder.build_float_mul(
-            sum,
-            f64_type.const_float(model.scale()),
-            "scaled",
-        )?)?;
-        reassociate(builder.build_float_add(
-            scaled,
-            f64_type.const_float(model.bias()),
-            "biased",
-        )?)?
-    };
-    builder.build_return(Some(&result))?;
     Ok(module)
 }
 
@@ -354,15 +317,9 @@ fn reassociate(value: FloatValue<'_>) -> CompileResult<FloatValue<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsed_tree::{Discriminator, FeatureIndex, SingleTree};
-
-    #[test]
-    fn default_uses_rolling_scalar_with_two_accumulators() {
-        let options = CompileOptions::default();
-        assert!(matches!(options.order, Order::Rolling(cap) if cap.get() == 4));
-        assert_eq!(options.accumulators.get(), 2);
-        assert!(matches!(options.comparisons, ComparisonMode::Scalar));
-    }
+    use crate::parsed_tree::{Discriminator, FeatureIndex, SingleTree, Trees};
+    use crate::sort_policy::{ComparisonMode, Order, SortOptions, plan};
+    use std::num::NonZeroUsize;
 
     #[test]
     fn emits_predict_for_aarch64_and_x86_64() {
@@ -382,7 +339,7 @@ mod tests {
         .unwrap();
         for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
             let assembly =
-                emit_assembly(&context, &model, CompileOptions::default(), triple).unwrap();
+                emit_assembly(&context, &plan(&model, SortOptions::default()), triple).unwrap();
             assert!(assembly.contains("predict"), "{triple}: {assembly}");
         }
     }
@@ -434,14 +391,16 @@ mod tests {
                 1,
             ),
         ] {
-            let module = emit_model(
+            let module = emit_plan(
                 &context,
-                &model,
-                CompileOptions {
-                    order,
-                    comparisons,
-                    ..CompileOptions::default()
-                },
+                &plan(
+                    &model,
+                    SortOptions {
+                        order,
+                        comparisons,
+                        ..SortOptions::default()
+                    },
+                ),
             )
             .unwrap();
             module.verify().unwrap();
@@ -469,7 +428,7 @@ mod tests {
             3.0,
         )
         .unwrap();
-        let module = emit_model(&context, &model, CompileOptions::default()).unwrap();
+        let module = emit_plan(&context, &plan(&model, SortOptions::default())).unwrap();
         module.verify().unwrap();
         let ir = module.print_to_string().to_string();
         for expected in [
