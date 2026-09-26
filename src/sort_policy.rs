@@ -2,6 +2,9 @@ use std::{cmp::Reverse, num::NonZeroUsize};
 
 use crate::parsed_tree::{Discriminator, FeatureIndex, Trees};
 
+mod continuation;
+pub use continuation::{Chunk, Slots};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TreeId(pub usize);
 
@@ -112,6 +115,7 @@ pub struct Plan<'model> {
     predicates: Vec<Discriminator>,
     actions: Vec<Action>,
     sum_count: usize,
+    chunks: Vec<Chunk>,
 }
 
 impl Plan<'_> {
@@ -129,6 +133,10 @@ impl Plan<'_> {
 
     pub fn sum_count(&self) -> usize {
         self.sum_count
+    }
+
+    pub fn chunks(&self) -> &[Chunk] {
+        &self.chunks
     }
 }
 
@@ -161,6 +169,7 @@ pub fn plan(model: &Trees, options: SortOptions) -> Result<Plan<'_>, Insufficien
     } else {
         Action::ReturnScaled(SumId(0))
     });
+    plan.chunks = continuation::partition(&plan, 16);
     Ok(plan)
 }
 
@@ -170,6 +179,7 @@ fn tree_order(trees: &Trees, sum_count: usize) -> Plan<'_> {
         predicates: Vec::new(),
         actions: Vec::new(),
         sum_count,
+        chunks: Vec::new(),
     };
     let mut next_value = 0;
     for (tree, description) in trees.trees().iter().enumerate() {
@@ -553,6 +563,7 @@ impl<'model> Planner<'model> {
             predicates: self.predicates,
             actions: self.actions,
             sum_count: self.sum_count,
+            chunks: Vec::new(),
         }
     }
 }

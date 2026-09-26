@@ -509,6 +509,10 @@ fn released_features_reload_as_fresh_values_in_both_orders() {
             assert!(
                 plan.actions[loads[0].0 + 1..loads[1].0].contains(&Action::Release(loads[0].1))
             );
+            let chunks = verify_chunks(&plan, 1);
+            for (_, value) in loads {
+                assert!(chunks.iter().any(|c| c.incoming.features == [Some(value)]));
+            }
         }
     }
 }
@@ -916,5 +920,191 @@ fn mixed_pairs_charge_the_union_of_new_selectors_before_retiring_any() {
             .position(|a| *a == Action::Admit(TreeId(2)))
             .unwrap();
         assert!(first_retire < third_start);
+    }
+}
+
+fn verify_chunks(plan: &Plan<'_>, limit: usize) -> Vec<Chunk> {
+    let chunks = continuation::partition(plan, limit);
+    assert_eq!(chunks, continuation::partition(plan, limit));
+    let mut slots = [Vec::<Option<usize>>::new(), Vec::new()];
+    let has_index = |tree: usize| !plan.model().trees()[tree].selections.is_empty();
+    let mut cursor = 0;
+    for chunk in &chunks {
+        assert_eq!(chunk.actions.start, cursor);
+        assert!(chunk.actions.end > cursor);
+        assert_eq!(
+            chunk
+                .incoming
+                .indices
+                .iter()
+                .map(|v| v.map(|v| v.0))
+                .collect::<Vec<_>>(),
+            slots[0]
+        );
+        assert_eq!(
+            chunk
+                .incoming
+                .features
+                .iter()
+                .map(|v| v.map(|v| v.0))
+                .collect::<Vec<_>>(),
+            slots[1]
+        );
+        let mut tests = 0;
+        for action in &plan.actions()[chunk.actions.clone()] {
+            let change = match action {
+                Action::Admit(tree) if has_index(tree.0) => Some((0, tree.0, true)),
+                Action::Load { value, .. } => Some((1, value.0, true)),
+                Action::Release(value) => Some((1, value.0, false)),
+                Action::Retire { tree, .. } if has_index(tree.0) => Some((0, tree.0, false)),
+                Action::Compare {
+                    feature,
+                    comparisons,
+                } => {
+                    assert!(slots[1].contains(&Some(feature.0)));
+                    tests += comparisons.len();
+                    for consumer in comparisons.iter().flat_map(|c| &c.consumers) {
+                        assert!(slots[0].contains(&Some(consumer.tree.0)));
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some((kind, id, add)) = change {
+                let values = &mut slots[kind];
+                if add {
+                    assert!(!values.contains(&Some(id)));
+                    let slot = values
+                        .iter()
+                        .position(Option::is_none)
+                        .unwrap_or(values.len());
+                    values.resize(values.len().max(slot + 1), None);
+                    values[slot] = Some(id);
+                } else {
+                    let slot = values.iter().position(|v| *v == Some(id)).unwrap();
+                    values[slot] = None;
+                }
+            }
+        }
+        assert_eq!(tests, chunk.tests);
+        assert!(tests <= limit);
+        cursor = chunk.actions.end;
+        if cursor < plan.actions().len() {
+            assert!(!matches!(
+                plan.actions()[cursor],
+                Action::Release(_) | Action::Retire { .. }
+            ));
+            assert!(matches!(
+                plan.actions()[..cursor]
+                    .iter()
+                    .rev()
+                    .find(|a| !matches!(a, Action::Release(_) | Action::Retire { .. })),
+                Some(Action::Compare { .. })
+            ));
+        }
+    }
+    assert_eq!(cursor, plan.actions().len());
+    assert!(slots.iter().flatten().all(Option::is_none));
+    chunks
+}
+
+#[test]
+fn chunks_carry_unfinished_indices_and_reused_features_in_stable_slots() {
+    let trees = forest(vec![
+        tree(&[(0, 0.0)]),
+        tree(&[(0, 0.0)]),
+        tree(&[(0, 0.0), (1, 0.0), (0, 2.0)]),
+        tree(&[(0, 0.0), (1, 1.0), (0, 3.0)]),
+        tree(&[]),
+    ]);
+    for mode in [ComparisonMode::Scalar, ComparisonMode::Simd2] {
+        let plan = check_mode(&trees, 12, &[0.5; 4], mode);
+        assert_eq!(plan.chunks(), verify_chunks(&plan, 16));
+        let chunks = verify_chunks(&plan, 2);
+        assert!(chunks[1].incoming.indices.contains(&Some(TreeId(2))));
+        assert!(chunks[1].incoming.indices.contains(&Some(TreeId(3))));
+        assert!(
+            chunks[1]
+                .incoming
+                .features
+                .contains(&Some(FeatureValueId(0)))
+        );
+        assert!(
+            plan.actions()[chunks[1].actions.start..]
+                .iter()
+                .any(|a| matches!(
+                    a,
+                    Action::Compare {
+                        feature: FeatureValueId(0),
+                        ..
+                    }
+                ))
+        );
+        replay(&plan, Some(budget(12, 8)), &[f64::NAN; 4]);
+    }
+}
+
+#[test]
+fn chunks_cut_before_a_pair_that_would_exceed_the_test_limit() {
+    let trees = forest(
+        (0..10)
+            .map(|t| {
+                tree(&[
+                    (0, (t * 3) as f64),
+                    (0, (t * 3 + 1) as f64),
+                    (0, (t * 3 + 2) as f64),
+                ])
+            })
+            .collect(),
+    );
+    let plan = check_mode(&trees, 12, &[5.5; 4], ComparisonMode::Simd2);
+    let chunks = verify_chunks(&plan, 3);
+    assert!(chunks.len() > 1);
+    assert!(chunks.iter().all(|chunk| chunk.tests == 2));
+    assert_eq!(plan.chunks(), verify_chunks(&plan, 16));
+}
+
+#[test]
+fn constant_trees_never_take_index_slots_even_among_nine_live_selectors() {
+    let mut descriptions: Vec<_> = (1..=9).map(|f| tree(&[(0, 0.0), (f, 1.0)])).collect();
+    descriptions.push(tree(&[]));
+    let trees = Trees::new(descriptions, vec![NanMode::AsIs; 10], 1.0, 0.0).unwrap();
+    let plan = plan(
+        &trees,
+        SortOptions {
+            order: Order::Scheduled(budget(12, 9)),
+            ..SortOptions::default()
+        },
+    )
+    .unwrap();
+    let chunks = verify_chunks(&plan, 1);
+    let constant = plan
+        .actions()
+        .iter()
+        .position(|a| *a == Action::Admit(TreeId(9)))
+        .unwrap();
+    let chunk = chunks
+        .iter()
+        .find(|chunk| chunk.actions.contains(&constant))
+        .unwrap();
+    assert_eq!(chunk.incoming.indices.iter().flatten().count(), 9);
+    assert!(chunks.iter().all(|c| c.incoming.indices.len() <= 9));
+    replay(&plan, Some(budget(12, 9)), &[0.5; 10]);
+    for trees in [forest(vec![]), forest(vec![tree(&[]), tree(&[])])] {
+        for order in [Order::TreeOrder, Order::Scheduled(budget(12, 12))] {
+            let plan = super::plan(
+                &trees,
+                SortOptions {
+                    order,
+                    ..SortOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(plan.chunks(), verify_chunks(&plan, 16));
+            assert_eq!(plan.chunks().len(), 1);
+            assert_eq!(plan.chunks()[0].tests, 0);
+            assert_eq!(plan.chunks()[0].incoming, Slots::default());
+            replay(&plan, None, &[0.0; 4]);
+        }
     }
 }

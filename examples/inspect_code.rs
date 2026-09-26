@@ -74,9 +74,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                 },
             ),
         ] {
-            let assembly = emit_assembly(&context, &plan(&model, options)?, triple)?;
+            let plan = plan(&model, options)?;
+            let assembly = emit_assembly(&context, &plan, triple)?;
             let path = output.join(format!("{triple}-{name}.s"));
             File::create_new(&path)?.write_all(assembly.as_bytes())?;
+            println!("{}", path.display());
+            let path = path.with_extension("plan.txt");
+            let mut dump = File::create_new(&path)?;
+            writeln!(dump, "{options:?}\nsums={}\nchunks:", plan.sum_count())?;
+            for chunk in plan.chunks() {
+                writeln!(dump, "{chunk:?}")?;
+            }
+            writeln!(dump, "predicates:")?;
+            for (id, predicate) in plan.predicates().iter().enumerate() {
+                writeln!(dump, "{id}: {predicate:?}")?;
+            }
+            writeln!(dump, "commands:")?;
+            for (id, action) in plan.actions().iter().enumerate() {
+                writeln!(dump, "{id}: {action:?}")?;
+            }
             println!("{}", path.display());
         }
     }
