@@ -2,9 +2,9 @@ use super::*;
 use crate::parsed_tree::{NanMode, SingleTree};
 
 #[test]
-fn default_uses_twelve_register_budgets_scalar_and_two_sums() {
+fn default_uses_twelve_general_nine_floating_registers_scalar_and_two_sums() {
     let options = SortOptions::default();
-    assert!(matches!(options.order, Order::Scheduled(b) if b == budget(12, 12)));
+    assert!(matches!(options.order, Order::Scheduled(b) if b == budget(12, 9)));
     assert_eq!(options.accumulators.get(), 2);
     assert!(matches!(options.comparisons, ComparisonMode::Scalar));
 }

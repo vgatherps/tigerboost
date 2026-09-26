@@ -72,7 +72,7 @@ impl Default for SortOptions {
         Self {
             order: Order::Scheduled(RegisterBudget {
                 general: NonZeroUsize::new(12).unwrap(),
-                floating: NonZeroUsize::new(12).unwrap(),
+                floating: NonZeroUsize::new(9).unwrap(),
             }),
             accumulators: NonZeroUsize::new(2).unwrap(),
             comparisons: ComparisonMode::Scalar,
