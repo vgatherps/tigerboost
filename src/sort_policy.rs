@@ -9,6 +9,9 @@ pub(crate) struct TreeId(pub usize);
 pub(crate) struct PredicateId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FeatureValueId(pub usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Consumer {
     pub tree: TreeId,
     pub level: usize,
@@ -29,8 +32,15 @@ pub(crate) struct Comparison {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     Admit(TreeId),
-    Load(FeatureIndex),
-    Compare(Vec<Comparison>),
+    Load {
+        value: FeatureValueId,
+        feature: FeatureIndex,
+    },
+    Compare {
+        feature: FeatureValueId,
+        comparisons: Vec<Comparison>,
+    },
+    Release(FeatureValueId),
     Retire(TreeId),
 }
 
@@ -44,17 +54,27 @@ pub(crate) fn tree_order(trees: &Trees) -> Schedule {
         predicates: Vec::new(),
         actions: Vec::new(),
     };
+    let mut next_value = 0;
     for (tree, description) in trees.trees().iter().enumerate() {
         let tree = TreeId(tree);
         plan.actions.push(Action::Admit(tree));
         for (level, split) in description.selections.iter().enumerate() {
             let predicate = PredicateId(plan.predicates.len());
             plan.predicates.push(split.clone());
-            plan.actions.push(Action::Load(split.feature_idx));
-            plan.actions.push(Action::Compare(vec![Comparison {
-                predicate,
-                consumers: vec![Consumer { tree, level }],
-            }]));
+            let value = FeatureValueId(next_value);
+            next_value += 1;
+            plan.actions.push(Action::Load {
+                value,
+                feature: split.feature_idx,
+            });
+            plan.actions.push(Action::Compare {
+                feature: value,
+                comparisons: vec![Comparison {
+                    predicate,
+                    consumers: vec![Consumer { tree, level }],
+                }],
+            });
+            plan.actions.push(Action::Release(value));
         }
         plan.actions.push(Action::Retire(tree));
     }
@@ -72,7 +92,7 @@ struct Planner {
     scores: Vec<usize>,
     waiting: Vec<TreeId>,
     active: Vec<ActiveTree>,
-    retained: Option<FeatureIndex>,
+    retained: Option<(FeatureIndex, FeatureValueId)>,
     actions: Vec<Action>,
     limit: usize,
     comparisons: ComparisonMode,
@@ -158,7 +178,7 @@ impl Planner {
                         .iter()
                         .filter(|id| {
                             let feature = self.predicates[id.0].feature_idx;
-                            self.retained == Some(feature)
+                            self.retained.map(|(feature, _)| feature) == Some(feature)
                                 || self.active.iter().any(|tree| self.uses(tree, feature) > 0)
                         })
                         .count();
@@ -180,7 +200,7 @@ impl Planner {
     }
 
     fn select_feature(&self) -> FeatureIndex {
-        if let Some(feature) = self.retained
+        if let Some((feature, _)) = self.retained
             && self.active.iter().any(|tree| self.uses(tree, feature) > 0)
         {
             return feature;
@@ -214,13 +234,20 @@ impl Planner {
     }
 
     fn run(mut self) -> Schedule {
+        let mut next_value = 0;
         self.fill();
         while !self.active.is_empty() {
             let feature = self.select_feature();
-            if self.retained != Some(feature) {
-                self.actions.push(Action::Load(feature));
-                self.retained = Some(feature);
-            }
+            let value = match self.retained {
+                Some((_, value)) => value,
+                None => {
+                    let value = FeatureValueId(next_value);
+                    next_value += 1;
+                    self.actions.push(Action::Load { value, feature });
+                    self.retained = Some((feature, value));
+                    value
+                }
+            };
             let width = match self.comparisons {
                 ComparisonMode::Scalar => 1,
                 ComparisonMode::Simd2 => 2,
@@ -255,7 +282,10 @@ impl Planner {
                     consumers,
                 });
             }
-            self.actions.push(Action::Compare(comparisons));
+            self.actions.push(Action::Compare {
+                feature: value,
+                comparisons,
+            });
             self.active.retain(|tree| {
                 if tree.remaining == 0 {
                     self.actions.push(Action::Retire(tree.id));
@@ -265,6 +295,10 @@ impl Planner {
                 }
             });
             self.fill();
+            if self.active.iter().all(|tree| self.uses(tree, feature) == 0) {
+                self.actions.push(Action::Release(value));
+                self.retained = None;
+            }
         }
         Schedule {
             predicates: self.predicates,

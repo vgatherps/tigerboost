@@ -169,14 +169,14 @@ fn emit_model<'ctx>(
     builder.position_at_end(context.append_basic_block(function, "entry"));
     let row = function.get_first_param().unwrap().into_pointer_value();
     let mut indices = vec![None; model.trees().len()];
-    let mut loaded_feature = None;
+    let mut loaded_features = Vec::new();
     let mut sums =
         vec![f64_type.const_zero(); options.accumulators.get().min(model.trees().len().max(1))];
     let mut retired = 0;
     for action in schedule.actions {
         match action {
             Action::Admit(tree) => indices[tree.0] = Some(zero),
-            Action::Load(feature) => {
+            Action::Load { value: id, feature } => {
                 // SAFETY: Trees validates the feature index and row byte span;
                 // CompiledModel::predict checks that the caller supplies that span.
                 let address = unsafe {
@@ -208,10 +208,15 @@ fn emit_model<'ctx>(
                         )?
                         .into_float_value();
                 }
-                loaded_feature = Some(value);
+                assert_eq!(id.0, loaded_features.len(), "feature value loaded twice");
+                loaded_features.push(Some(value));
             }
-            Action::Compare(comparisons) => {
-                let feature = loaded_feature.expect("comparison requires a loaded feature");
+            Action::Compare {
+                feature,
+                comparisons,
+            } => {
+                let feature =
+                    loaded_features[feature.0].expect("comparison requires a live feature value");
                 let threshold = |comparison: &sort_policy::Comparison| {
                     f64_type.const_float(schedule.predicates[comparison.predicate.0].threshold)
                 };
@@ -270,6 +275,11 @@ fn emit_model<'ctx>(
                             Some(builder.build_or(index, level_bit, "leaf_index")?);
                     }
                 }
+            }
+            Action::Release(feature) => {
+                loaded_features[feature.0]
+                    .take()
+                    .expect("release requires a live feature value");
             }
             Action::Retire(tree_id) => {
                 let index = indices[tree_id.0]
