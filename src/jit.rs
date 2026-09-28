@@ -8,8 +8,9 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
 };
-use inkwell::types::VectorType;
-use inkwell::values::{BasicValue, FastMathFlags, FloatValue};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValue, FastMathFlags, FloatValue, PointerValue,
+};
 use inkwell::{AddressSpace, FloatPredicate, OptimizationLevel};
 use std::error::Error;
 
@@ -84,8 +85,7 @@ fn prepare_module<'ctx>(
             CodeModel::JITDefault,
         )
         .ok_or("could not create target machine")?;
-    let module = emit_plan(context, plan)?;
-    module.set_triple(triple);
+    let module = emit_plan(context, plan, triple)?;
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.verify()?;
     module.run_passes(
@@ -97,15 +97,89 @@ fn prepare_module<'ctx>(
     Ok((module, machine))
 }
 
-fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Module<'ctx>> {
+fn emit_plan<'ctx>(
+    context: &'ctx Context,
+    plan: &Plan<'_>,
+    triple: &TargetTriple,
+) -> CompileResult<Module<'ctx>> {
     let model = plan.model();
     let module = context.create_module("tigerboost");
+    module.set_triple(triple);
+    let architecture = triple.as_str().to_bytes();
+    let arm64 = architecture.starts_with(b"aarch64") || architecture.starts_with(b"arm64");
     let builder = context.create_builder();
     let f64_type = context.f64_type();
     let index_type = context.i64_type();
     let zero = index_type.const_zero();
+    let mut predicate_slots = vec![None; plan.predicates().len()];
+    let mut next_predicate_slot = 0;
+    for action in plan.actions() {
+        if let Action::Compare { comparisons, .. } = action {
+            for comparison in comparisons {
+                let slot = &mut predicate_slots[comparison.predicate.0];
+                if slot.is_none() {
+                    *slot = Some(next_predicate_slot);
+                    next_predicate_slot += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        next_predicate_slot,
+        plan.predicates().len(),
+        "predicate is never compared"
+    );
+    let predicate_slots: Vec<_> = predicate_slots.into_iter().map(Option::unwrap).collect();
+    let leaf_start = plan
+        .predicates()
+        .len()
+        .checked_next_multiple_of(8)
+        .ok_or("constant block exceeds addressable entry count")?;
+    let mut entry_count = leaf_start;
+    let mut leaf_base = Vec::with_capacity(model.trees().len());
+    for tree in model.trees() {
+        leaf_base.push(entry_count);
+        entry_count = entry_count
+            .checked_add(tree.leafs.len())
+            .ok_or("constant block exceeds addressable entry count")?;
+    }
+    entry_count = entry_count.max(1);
+    let array_length =
+        u32::try_from(entry_count).map_err(|_| "constant block exceeds LLVM array length limit")?;
+    let constant_bytes = entry_count
+        .checked_mul(size_of::<f64>())
+        .and_then(|bytes| isize::try_from(bytes).ok())
+        .ok_or("constant block exceeds addressable byte count")? as u64;
+    let constant_type = f64_type.array_type(array_length);
+    let constants = module.add_global(constant_type, None, "constants");
+    constants.set_linkage(Linkage::Private);
+    constants.set_constant(true);
+    constants.set_alignment(64);
+    let mut values = vec![f64_type.const_zero(); plan.predicates().len()];
+    for (predicate, &slot) in plan.predicates().iter().zip(&predicate_slots) {
+        values[slot] = f64_type.const_float(predicate.threshold);
+    }
+    values.resize(leaf_start, f64_type.const_zero());
+    for tree in model.trees() {
+        values.extend(tree.leafs.iter().map(|&leaf| f64_type.const_float(leaf)));
+    }
+    values.resize(entry_count, f64_type.const_zero());
+    constants.set_initializer(&f64_type.const_array(&values));
     let chunks = plan.chunks();
-    let split = chunks.len() > 1;
+    let chunk_first_slot: Vec<_> = chunks
+        .iter()
+        .map(|chunk| {
+            plan.actions()[chunk.actions.clone()]
+                .iter()
+                .flat_map(|action| match action {
+                    Action::Compare { comparisons, .. } => comparisons.as_slice(),
+                    _ => &[],
+                })
+                .map(|comparison| predicate_slots[comparison.predicate.0])
+                .min()
+                .unwrap_or(0)
+        })
+        .collect();
     let index_slots = chunks
         .iter()
         .map(|c| c.incoming.indices.len())
@@ -116,28 +190,25 @@ fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Mod
         .map(|c| c.incoming.features.len())
         .max()
         .unwrap();
-    let sum_offset = 1 + index_slots;
+    let pointer_count = 2 + usize::from(arm64);
+    let sum_offset = pointer_count + index_slots;
     let feature_offset = sum_offset + plan.sum_count();
     let row_type = context.ptr_type(AddressSpace::default());
-    let mut parameter_types = vec![row_type.into()];
+    let mut parameter_types = vec![row_type.into(); pointer_count];
     parameter_types.resize(sum_offset, index_type.into());
     parameter_types.resize(feature_offset + feature_slots, f64_type.into());
     let continuation_type = f64_type.fn_type(&parameter_types, false);
     let wrapper = module.add_function("predict", f64_type.fn_type(&[row_type.into()], false), None);
-    let functions = if split {
-        (0..chunks.len())
-            .map(|n| {
-                module.add_function(
-                    &format!("continuation{n}"),
-                    continuation_type,
-                    Some(Linkage::Internal),
-                )
-            })
-            .collect()
-    } else {
-        vec![wrapper]
-    };
-    for function in functions.iter().copied().chain(split.then_some(wrapper)) {
+    let functions: Vec<_> = (0..chunks.len())
+        .map(|n| {
+            module.add_function(
+                &format!("continuation{n}"),
+                continuation_type,
+                Some(Linkage::Internal),
+            )
+        })
+        .collect();
+    for (number, function) in functions.iter().copied().chain(Some(wrapper)).enumerate() {
         function.set_call_conventions(if function == wrapper {
             0
         } else {
@@ -148,14 +219,32 @@ fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Mod
             assert_ne!(kind, 0, "missing LLVM attribute {name}");
             function.add_attribute(location, context.create_enum_attribute(kind, value));
         };
-        if split {
-            attribute(AttributeLoc::Function, "noinline", 0);
-        }
+        attribute(AttributeLoc::Function, "noinline", 0);
+        attribute(AttributeLoc::Param(0), "noalias", 0);
         attribute(AttributeLoc::Param(0), "readonly", 0);
         attribute(AttributeLoc::Param(0), "align", 8);
         let row_bytes = model.feature_modes().len() * size_of::<f64>();
         if row_bytes != 0 {
             attribute(AttributeLoc::Param(0), "dereferenceable", row_bytes as u64);
+        }
+        if function != wrapper {
+            attribute(AttributeLoc::Param(1), "noalias", 0);
+            attribute(AttributeLoc::Param(1), "readonly", 0);
+            attribute(AttributeLoc::Param(1), "align", 64);
+            attribute(AttributeLoc::Param(1), "dereferenceable", constant_bytes);
+            if arm64 {
+                let remaining_bytes = constant_bytes
+                    .checked_sub(
+                        (chunk_first_slot[number] as u64)
+                            .checked_mul(size_of::<f64>() as u64)
+                            .ok_or("chunk base exceeds addressable byte count")?,
+                    )
+                    .ok_or("chunk base exceeds constant block")?;
+                attribute(AttributeLoc::Param(2), "noalias", 0);
+                attribute(AttributeLoc::Param(2), "readonly", 0);
+                attribute(AttributeLoc::Param(2), "align", 8);
+                attribute(AttributeLoc::Param(2), "dereferenceable", remaining_bytes);
+            }
         }
         // LLVM 21: Ref=1 in each of four two-bit memory locations, including globals.
         attribute(AttributeLoc::Function, "memory", 0b01_01_01_01);
@@ -166,36 +255,55 @@ fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Mod
             );
         }
     }
-    let arguments = |row: inkwell::values::PointerValue<'ctx>| {
-        let mut args = vec![row.into()];
+    let arguments = |row: PointerValue<'ctx>,
+                     constants: PointerValue<'ctx>,
+                     chunk: usize|
+     -> CompileResult<Vec<BasicMetadataValueEnum<'ctx>>> {
+        let mut args = vec![row.into(), constants.into()];
+        if arm64 {
+            // SAFETY: the base is a threshold entry, or entry zero for a chunk without tests.
+            let base = unsafe {
+                builder.build_in_bounds_gep(
+                    f64_type,
+                    constants,
+                    &[index_type.const_int(chunk_first_slot[chunk] as u64, false)],
+                    "chunk_base",
+                )?
+            };
+            args.push(base.into());
+        }
         args.resize(sum_offset, index_type.get_undef().into());
         args.resize(feature_offset + feature_slots, f64_type.get_undef().into());
-        args
+        Ok(args)
     };
-    if split {
-        builder.position_at_end(context.append_basic_block(wrapper, "entry"));
-        // The first chunk has no carried values and initializes its sums to zero.
-        let call = builder.build_call(
-            functions[0],
-            &arguments(wrapper.get_first_param().unwrap().into_pointer_value()),
-            "prediction",
-        )?;
-        call.set_call_convention(PRESERVE_NONE_CALL_CONVENTION);
-        builder.build_return(Some(&call.try_as_basic_value().unwrap_basic()))?;
-    }
+    builder.position_at_end(context.append_basic_block(wrapper, "entry"));
+    // The first chunk has no carried values and initializes its sums to zero.
+    let call = builder.build_call(
+        functions[0],
+        &arguments(
+            wrapper.get_first_param().unwrap().into_pointer_value(),
+            constants.as_pointer_value(),
+            0,
+        )?,
+        "prediction",
+    )?;
+    call.set_call_convention(PRESERVE_NONE_CALL_CONVENTION);
+    builder.build_return(Some(&call.try_as_basic_value().unwrap_basic()))?;
     let mut indices: Vec<Option<inkwell::values::IntValue<'ctx>>> = vec![None; model.trees().len()];
     let mut loaded_features: Vec<Option<FloatValue<'ctx>>> = Vec::new();
     for (chunk_number, chunk) in chunks.iter().enumerate() {
         let function = functions[chunk_number];
         builder.position_at_end(context.append_basic_block(function, "entry"));
         let row = function.get_first_param().unwrap().into_pointer_value();
+        let constants = function.get_nth_param(1).unwrap().into_pointer_value();
+        let chunk_base = arm64.then(|| function.get_nth_param(2).unwrap().into_pointer_value());
         indices.fill(None);
         loaded_features.fill(None);
         for (slot, tree) in chunk.incoming.indices.iter().enumerate() {
             if let Some(tree) = tree {
                 indices[tree.0] = Some(
                     function
-                        .get_nth_param((1 + slot) as u32)
+                        .get_nth_param((pointer_count + slot) as u32)
                         .unwrap()
                         .into_int_value(),
                 );
@@ -271,14 +379,38 @@ fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Mod
                 } => {
                     let feature = loaded_features[feature.0]
                         .expect("comparison requires a live feature value");
-                    let threshold = |comparison: &Comparison| {
-                        f64_type.const_float(plan.predicates()[comparison.predicate.0].threshold)
+                    let threshold = |comparison: &Comparison| -> CompileResult<FloatValue<'ctx>> {
+                        let slot = predicate_slots[comparison.predicate.0];
+                        // SAFETY: every slot indexes the threshold prefix of constants.
+                        let address = unsafe {
+                            if let Some(base) = chunk_base {
+                                let offset = slot
+                                    .checked_sub(chunk_first_slot[chunk_number])
+                                    .ok_or("threshold slot precedes chunk base")?;
+                                builder.build_in_bounds_gep(
+                                    f64_type,
+                                    base,
+                                    &[index_type.const_int(offset as u64, false)],
+                                    "threshold_ptr",
+                                )?
+                            } else {
+                                builder.build_in_bounds_gep(
+                                    constant_type,
+                                    constants,
+                                    &[zero, index_type.const_int(slot as u64, false)],
+                                    "threshold_ptr",
+                                )?
+                            }
+                        };
+                        let loaded = builder.build_load(f64_type, address, "threshold")?;
+                        loaded.as_instruction_value().unwrap().set_alignment(8)?;
+                        Ok(loaded.into_float_value())
                     };
                     let bits = match comparisons.as_slice() {
                         [single] => vec![builder.build_float_compare(
                             FloatPredicate::OGT,
                             feature,
-                            threshold(single),
+                            threshold(single)?,
                             "split",
                         )?],
                         [first, second] => {
@@ -291,8 +423,15 @@ fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Mod
                                     "splat",
                                 )?;
                             }
-                            let thresholds =
-                                VectorType::const_vector(&[threshold(first), threshold(second)]);
+                            let mut thresholds = f64_type.vec_type(2).get_undef();
+                            for (lane, comparison) in [first, second].into_iter().enumerate() {
+                                thresholds = builder.build_insert_element(
+                                    thresholds,
+                                    threshold(comparison)?,
+                                    context.i32_type().const_int(lane as u64, false),
+                                    "thresholds",
+                                )?;
+                            }
                             let result = builder.build_float_compare(
                                 FloatPredicate::OGT,
                                 features,
@@ -357,27 +496,17 @@ fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Mod
                     let index = indices[tree_id.0]
                         .take()
                         .expect("retirement requires an active tree");
-                    let tree = &model.trees()[tree_id.0];
-                    let leaf_count = u32::try_from(tree.leafs.len())
-                        .map_err(|_| "leaf table exceeds LLVM array length limit")?;
-                    let leaf_type = f64_type.array_type(leaf_count);
-                    let leaves =
-                        module.add_global(leaf_type, None, &format!("leaves_{}", tree_id.0));
-                    leaves.set_linkage(Linkage::Private);
-                    leaves.set_constant(true);
-                    leaves.set_alignment(8);
-                    let values: Vec<_> = tree
-                        .leafs
-                        .iter()
-                        .map(|&leaf| f64_type.const_float(leaf))
-                        .collect();
-                    leaves.set_initializer(&f64_type.const_array(&values));
-                    // SAFETY: exactly depth bits form index, and Trees requires 2^depth leaves.
+                    let slot = builder.build_int_nuw_add(
+                        index,
+                        index_type.const_int(leaf_base[tree_id.0] as u64, false),
+                        "leaf_slot",
+                    )?;
+                    // SAFETY: depth bits bound index to this tree's leaf block in constants.
                     let address = unsafe {
                         builder.build_in_bounds_gep(
-                            leaf_type,
-                            leaves.as_pointer_value(),
-                            &[zero, index],
+                            constant_type,
+                            constants,
+                            &[zero, slot],
                             "leaf_ptr",
                         )?
                     };
@@ -419,10 +548,11 @@ fn emit_plan<'ctx>(context: &'ctx Context, plan: &Plan<'_>) -> CompileResult<Mod
             }
         }
         if let Some(next) = chunks.get(chunk_number + 1) {
-            let mut args = arguments(row);
+            let mut args = arguments(row, constants, chunk_number + 1)?;
             for (slot, tree) in next.incoming.indices.iter().enumerate() {
                 if let Some(tree) = tree {
-                    args[1 + slot] = indices[tree.0].expect("carried index must be live").into();
+                    args[pointer_count + slot] =
+                        indices[tree.0].expect("carried index must be live").into();
                 }
             }
             for (sum, value) in sums.iter().enumerate() {
@@ -456,8 +586,578 @@ mod tests {
     use super::*;
     use crate::parsed_tree::{Discriminator, FeatureIndex, SingleTree, Trees};
     use crate::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
-    use inkwell::values::AnyValue;
+    use inkwell::values::{AnyValue, FunctionValue, InstructionOpcode};
     use std::num::NonZeroUsize;
+
+    fn mixed_depth_model() -> Trees {
+        let shared = Discriminator {
+            feature_idx: FeatureIndex(2),
+            threshold: 1.37,
+        };
+        Trees::new(
+            vec![
+                SingleTree {
+                    leafs: vec![9.0],
+                    selections: vec![],
+                },
+                SingleTree {
+                    leafs: vec![10.0, 11.0],
+                    selections: vec![shared.clone()],
+                },
+                SingleTree {
+                    leafs: (20..28).map(|leaf| leaf as f64).collect(),
+                    selections: vec![
+                        shared,
+                        Discriminator {
+                            feature_idx: FeatureIndex(0),
+                            threshold: 2.61,
+                        },
+                        Discriminator {
+                            feature_idx: FeatureIndex(0),
+                            threshold: -0.42,
+                        },
+                    ],
+                },
+            ],
+            vec![NanMode::AsIs; 3],
+            2.0,
+            3.0,
+        )
+        .unwrap()
+    }
+
+    fn assert_opaque_constants(
+        function: FunctionValue<'_>,
+        comparisons: usize,
+        retirements: usize,
+    ) {
+        let mut thresholds = 0;
+        let mut leaves = 0;
+        for instruction in function.get_first_basic_block().unwrap().get_instructions() {
+            let is_threshold = instruction.get_opcode() == InstructionOpcode::FCmp;
+            let is_leaf = instruction.get_opcode() == InstructionOpcode::FAdd
+                && instruction
+                    .get_name()
+                    .unwrap()
+                    .to_bytes()
+                    .starts_with(b"sum");
+            if is_threshold || is_leaf {
+                let value = instruction.get_operand(1).unwrap().unwrap_value();
+                let load = value
+                    .as_instruction_value()
+                    .expect("constant must come from a load");
+                assert_eq!(load.get_opcode(), InstructionOpcode::Load);
+                assert_eq!(load.get_alignment().unwrap(), 8);
+                thresholds += usize::from(is_threshold);
+                leaves += usize::from(is_leaf);
+            }
+        }
+        assert_eq!((thresholds, leaves), (comparisons, retirements));
+    }
+
+    #[test]
+    fn constants_block_layout_matches_plan() {
+        let context = Context::create();
+        let model = mixed_depth_model();
+        let plan = plan(&model, SortOptions::default()).unwrap();
+        assert_eq!(plan.predicates().len(), 3);
+        assert_eq!(
+            plan.predicates()
+                .iter()
+                .map(|p| p.threshold)
+                .collect::<Vec<_>>(),
+            [1.37, 2.61, -0.42],
+        );
+        assert!(plan.actions().iter().any(|action| matches!(action,
+            Action::Compare { comparisons, .. }
+                if comparisons.iter().any(|comparison| comparison.consumers.len() == 2)
+        )));
+        let mut first_use = Vec::new();
+        for action in plan.actions() {
+            if let Action::Compare { comparisons, .. } = action {
+                for comparison in comparisons {
+                    if !first_use.contains(&comparison.predicate.0) {
+                        first_use.push(comparison.predicate.0);
+                    }
+                }
+            }
+        }
+        assert_eq!(first_use.len(), plan.predicates().len());
+        assert_ne!(first_use, (0..plan.predicates().len()).collect::<Vec<_>>());
+        let module = emit_plan(&context, &plan, &TargetMachine::get_default_triple()).unwrap();
+        module.verify().unwrap();
+        assert_eq!(module.get_globals().count(), 1);
+        let constants = module.get_global("constants").unwrap();
+        assert_eq!(constants.get_linkage(), Linkage::Private);
+        assert!(constants.is_constant());
+        assert_eq!(constants.get_alignment(), 64);
+        let mut expected: Vec<_> = first_use
+            .iter()
+            .map(|&predicate| plan.predicates()[predicate].threshold)
+            .collect();
+        expected.resize(8, 0.0);
+        expected.extend([
+            9.0, 10.0, 11.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0,
+        ]);
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|value| context.f64_type().const_float(value))
+            .collect();
+        assert_eq!(
+            constants.get_initializer().unwrap().into_array_value(),
+            context.f64_type().const_array(&expected),
+        );
+        let compiled = compile(&context, &plan).unwrap();
+        for row in [[0.0, -1.0, 0.0], [2.0, 0.0, 2.0], [3.0, 0.0, 3.0]] {
+            assert_eq!(compiled.predict(&row), model.predict(&row));
+        }
+    }
+
+    #[test]
+    fn one_chunk_model_keeps_wrapper_and_opaque_loads() {
+        let context = Context::create();
+        let model = mixed_depth_model();
+        let plan = plan(&model, SortOptions::default()).unwrap();
+        assert_eq!(plan.chunks().len(), 1);
+        Target::initialize_all(&InitializationConfig::default());
+        for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+            let (module, _) =
+                prepare_module(&context, &plan, &TargetTriple::create(triple)).unwrap();
+            assert_eq!(module.get_functions().count(), 2);
+            let wrapper = module.get_function("predict").unwrap();
+            assert_eq!(wrapper.count_params(), 1);
+            let ir = wrapper.print_to_string().to_string();
+            assert_eq!(
+                ir.matches("call preserve_nonecc double @continuation0")
+                    .count(),
+                1
+            );
+            let continuation = module.get_function("continuation0").unwrap();
+            assert_opaque_constants(continuation, 3, 3);
+            let ir = continuation.print_to_string().to_string();
+            assert_eq!(ir.matches("load double").count(), 8);
+            assert!(!ir.contains("@constants"));
+        }
+    }
+
+    #[test]
+    fn pointer_parameters_have_bounds() {
+        let context = Context::create();
+        let model = Trees::new(
+            (0..9)
+                .map(|tree| SingleTree {
+                    leafs: (0..8).map(|leaf| (tree * 8 + leaf) as f64).collect(),
+                    selections: [1.37, 2.61, -0.42]
+                        .map(|threshold| Discriminator {
+                            feature_idx: FeatureIndex(tree),
+                            threshold,
+                        })
+                        .into(),
+                })
+                .collect(),
+            vec![NanMode::AsIs; 9],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let plan = plan(
+            &model,
+            SortOptions {
+                order: Order::TreeOrder,
+                ..SortOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.chunks().len(), 2);
+        for (triple, pointer_count) in
+            [("x86_64-unknown-linux-gnu", 2), ("aarch64-apple-darwin", 3)]
+        {
+            let module = emit_plan(&context, &plan, &TargetTriple::create(triple)).unwrap();
+            module.verify().unwrap();
+            let constants = module.get_global("constants").unwrap();
+            let entries = constants
+                .get_initializer()
+                .unwrap()
+                .into_array_value()
+                .get_type()
+                .len();
+            assert_eq!(entries, 104);
+            for (number, first_predicate) in [0, 16].into_iter().enumerate() {
+                let function = module
+                    .get_function(&format!("continuation{number}"))
+                    .unwrap();
+                assert_eq!(
+                    function
+                        .get_param_iter()
+                        .filter(|value| value.is_pointer_value())
+                        .count(),
+                    pointer_count,
+                );
+                for parameter in 0..pointer_count {
+                    assert!(
+                        function
+                            .get_nth_param(parameter as u32)
+                            .unwrap()
+                            .is_pointer_value()
+                    );
+                    for (name, value) in [
+                        ("readonly", 0),
+                        ("noalias", 0),
+                        ("align", if parameter == 1 { 64 } else { 8 }),
+                        (
+                            "dereferenceable",
+                            match parameter {
+                                0 => 9 * 8,
+                                1 => u64::from(entries) * 8,
+                                2 => (u64::from(entries) - first_predicate) * 8,
+                                _ => unreachable!(),
+                            },
+                        ),
+                    ] {
+                        assert_eq!(
+                            function
+                                .get_enum_attribute(
+                                    AttributeLoc::Param(parameter as u32),
+                                    Attribute::get_named_enum_kind_id(name),
+                                )
+                                .unwrap()
+                                .get_enum_value(),
+                            value,
+                            "{triple} continuation{number} parameter {parameter} {name}",
+                        );
+                    }
+                }
+                let instructions: Vec<_> = function
+                    .get_first_basic_block()
+                    .unwrap()
+                    .get_instructions()
+                    .collect();
+                let thresholds: Vec<_> = instructions
+                    .iter()
+                    .filter(|instruction| {
+                        instruction.get_opcode() == InstructionOpcode::Load
+                            && instruction
+                                .get_name()
+                                .unwrap()
+                                .to_bytes()
+                                .starts_with(b"threshold")
+                    })
+                    .collect();
+                assert_eq!(thresholds.len(), plan.chunks()[number].tests);
+                for (offset, load) in thresholds.iter().enumerate() {
+                    let gep = load
+                        .get_operand(0)
+                        .unwrap()
+                        .unwrap_value()
+                        .as_instruction_value()
+                        .unwrap();
+                    assert_eq!(gep.get_opcode(), InstructionOpcode::GetElementPtr);
+                    let (parameter, operand, index) = if pointer_count == 3 {
+                        (2, 1, offset as u64)
+                    } else {
+                        (1, 2, first_predicate + offset as u64)
+                    };
+                    assert_eq!(
+                        gep.get_operand(0).unwrap().unwrap_value(),
+                        function.get_nth_param(parameter).unwrap(),
+                    );
+                    assert_eq!(
+                        gep.get_operand(operand)
+                            .unwrap()
+                            .unwrap_value()
+                            .into_int_value()
+                            .get_zero_extended_constant(),
+                        Some(index),
+                    );
+                }
+                if pointer_count == 3 && number == 0 {
+                    let call = instructions
+                        .iter()
+                        .find(|instruction| instruction.get_opcode() == InstructionOpcode::Call)
+                        .unwrap();
+                    let base = call
+                        .get_operand(2)
+                        .unwrap()
+                        .unwrap_value()
+                        .as_instruction_value()
+                        .unwrap();
+                    assert_eq!(base.get_opcode(), InstructionOpcode::GetElementPtr);
+                    assert_eq!(
+                        base.get_operand(0).unwrap().unwrap_value(),
+                        function.get_nth_param(1).unwrap(),
+                    );
+                    assert_eq!(
+                        base.get_operand(1)
+                            .unwrap()
+                            .unwrap_value()
+                            .into_int_value()
+                            .get_zero_extended_constant(),
+                        Some(16),
+                    );
+                }
+            }
+            let assembly = emit_assembly(&context, &plan, triple).unwrap();
+            if pointer_count == 2 {
+                assert!(
+                    assembly
+                        .lines()
+                        .any(|line| { line.contains("ucomisd") && line.contains("(%") }),
+                    "{assembly}"
+                );
+                assert!(
+                    !assembly
+                        .lines()
+                        .any(|line| { line.contains("movabsq") && line.contains("$.LCPI") }),
+                    "{assembly}"
+                );
+            } else {
+                assert!(
+                    assembly.lines().any(|line| {
+                        let mut words = line.split_whitespace();
+                        matches!(words.next(), Some("ldr" | "ldp"))
+                            && words
+                                .next()
+                                .is_some_and(|register| register.starts_with('d'))
+                    }),
+                    "{assembly}"
+                );
+                assert!(!assembly.contains("movk"), "{assembly}");
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_model_and_last_tree_leaf() {
+        let context = Context::create();
+        let model = Trees::new(
+            (0..70)
+                .map(|tree| SingleTree {
+                    leafs: (0..64).map(|leaf| (tree * 64 + leaf) as f64).collect(),
+                    selections: (0..6)
+                        .map(|feature| Discriminator {
+                            feature_idx: FeatureIndex(feature),
+                            threshold: 1.37,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            vec![NanMode::AsIs; 6],
+            2.0,
+            3.0,
+        )
+        .unwrap();
+        let rows = [[0.0; 6], [2.0; 6]];
+        assert_eq!(model.leaf_indices(&rows[0]).unwrap()[0], 0);
+        assert_eq!(model.leaf_indices(&rows[1]).unwrap()[69], 63);
+        let preceding_leaves: usize = model.trees()[..69]
+            .iter()
+            .map(|tree| tree.leafs.len())
+            .sum();
+        assert!(preceding_leaves > 4095);
+        let expected = rows.map(|row| model.predict(&row).unwrap());
+        let mut kernels = Vec::new();
+        for order in [Order::TreeOrder, SortOptions::default().order] {
+            let plan = plan(
+                &model,
+                SortOptions {
+                    order,
+                    ..SortOptions::default()
+                },
+            )
+            .unwrap();
+            kernels.push(compile(&context, &plan).unwrap());
+            drop(plan);
+        }
+        drop(model);
+        for compiled in kernels {
+            for (row, expected) in rows.iter().zip(expected) {
+                assert_eq!(compiled.predict(row), Ok(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_constant_forests_still_predict() {
+        let context = Context::create();
+        for leaves in [vec![], vec![1.5, -2.0, 4.0]] {
+            let empty = leaves.is_empty();
+            let model = Trees::new(
+                leaves
+                    .into_iter()
+                    .map(|leaf| SingleTree {
+                        leafs: vec![leaf],
+                        selections: vec![],
+                    })
+                    .collect(),
+                vec![],
+                if empty { f64::NAN } else { 2.0 },
+                3.0,
+            )
+            .unwrap();
+            let plan = plan(&model, SortOptions::default()).unwrap();
+            let module = emit_plan(&context, &plan, &TargetMachine::get_default_triple()).unwrap();
+            module.verify().unwrap();
+            let constants = module.get_global("constants").unwrap();
+            let expected = if empty {
+                vec![0.0]
+            } else {
+                vec![1.5, -2.0, 4.0]
+            };
+            let values: Vec<_> = expected
+                .into_iter()
+                .map(|value| context.f64_type().const_float(value))
+                .collect();
+            assert_eq!(
+                constants.get_initializer().unwrap().into_array_value(),
+                context.f64_type().const_array(&values),
+            );
+            let compiled = compile(&context, &plan).unwrap();
+            assert_eq!(compiled.predict(&[]), Ok(if empty { 3.0 } else { 10.0 }));
+            assert_eq!(compiled.predict(&[]), model.predict(&[]));
+        }
+    }
+
+    #[test]
+    fn simd_pair_loads_both_thresholds() {
+        let context = Context::create();
+        let mut outcomes = [false; 4];
+        for thresholds in [[1.37, 2.61], [2.61, 1.37]] {
+            let model = Trees::new(
+                vec![SingleTree {
+                    leafs: vec![0.0, 1.0, 2.0, 3.0],
+                    selections: thresholds
+                        .map(|threshold| Discriminator {
+                            feature_idx: FeatureIndex(0),
+                            threshold,
+                        })
+                        .into(),
+                }],
+                vec![NanMode::AsIs],
+                1.0,
+                0.0,
+            )
+            .unwrap();
+            let plan = plan(
+                &model,
+                SortOptions {
+                    comparisons: ComparisonMode::Simd2,
+                    ..SortOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(plan.actions().iter().any(|action| matches!(action,
+                Action::Compare { comparisons, .. } if comparisons.len() == 2
+            )));
+            let pair = plan
+                .actions()
+                .iter()
+                .find_map(|action| match action {
+                    Action::Compare { comparisons, .. } if comparisons.len() == 2 => {
+                        Some(comparisons)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let mut predicate_slots = vec![None; plan.predicates().len()];
+            let mut next_slot = 0;
+            for action in plan.actions() {
+                if let Action::Compare { comparisons, .. } = action {
+                    for comparison in comparisons {
+                        if predicate_slots[comparison.predicate.0].is_none() {
+                            predicate_slots[comparison.predicate.0] = Some(next_slot);
+                            next_slot += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(next_slot, plan.predicates().len());
+            let predicate_slots: Vec<_> = predicate_slots.into_iter().map(Option::unwrap).collect();
+            let chunk_min_slot = plan.actions()[plan.chunks()[0].actions.clone()]
+                .iter()
+                .flat_map(|action| match action {
+                    Action::Compare { comparisons, .. } => comparisons.as_slice(),
+                    _ => &[],
+                })
+                .map(|comparison| predicate_slots[comparison.predicate.0])
+                .min()
+                .unwrap();
+            for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+                let module = emit_plan(&context, &plan, &TargetTriple::create(triple)).unwrap();
+                module.verify().unwrap();
+                let function = module.get_function("continuation0").unwrap();
+                let compare = function
+                    .get_first_basic_block()
+                    .unwrap()
+                    .get_instructions()
+                    .find(|instruction| instruction.get_opcode() == InstructionOpcode::FCmp)
+                    .unwrap();
+                assert!(
+                    compare
+                        .print_to_string()
+                        .to_string()
+                        .contains("fcmp ogt <2 x double>")
+                );
+                let mut vector = compare.get_operand(1).unwrap().unwrap_value();
+                let mut loads = Vec::new();
+                for lane in [1usize, 0] {
+                    let insert = vector.as_instruction_value().unwrap();
+                    assert_eq!(insert.get_opcode(), InstructionOpcode::InsertElement);
+                    assert_eq!(
+                        insert
+                            .get_operand(2)
+                            .unwrap()
+                            .unwrap_value()
+                            .into_int_value()
+                            .get_zero_extended_constant(),
+                        Some(lane as u64),
+                    );
+                    let load = insert
+                        .get_operand(1)
+                        .unwrap()
+                        .unwrap_value()
+                        .as_instruction_value()
+                        .unwrap();
+                    assert_eq!(load.get_opcode(), InstructionOpcode::Load);
+                    assert_eq!(load.get_alignment().unwrap(), 8);
+                    let gep = load
+                        .get_operand(0)
+                        .unwrap()
+                        .unwrap_value()
+                        .as_instruction_value()
+                        .unwrap();
+                    assert_eq!(gep.get_opcode(), InstructionOpcode::GetElementPtr);
+                    let slot = predicate_slots[pair[lane].predicate.0];
+                    let (parameter, operand, index) = if triple.starts_with("aarch64") {
+                        (2, 1, slot - chunk_min_slot)
+                    } else {
+                        (1, 2, slot)
+                    };
+                    assert_eq!(
+                        gep.get_operand(0).unwrap().unwrap_value(),
+                        function.get_nth_param(parameter).unwrap(),
+                    );
+                    assert_eq!(
+                        gep.get_operand(operand)
+                            .unwrap()
+                            .unwrap_value()
+                            .into_int_value()
+                            .get_zero_extended_constant(),
+                        Some(index as u64),
+                    );
+                    loads.push(load);
+                    vector = insert.get_operand(0).unwrap().unwrap_value();
+                }
+                assert_ne!(loads[0], loads[1]);
+            }
+            let compiled = compile(&context, &plan).unwrap();
+            for value in [0.0, 1.37, 2.0, 2.61, 3.0, f64::NAN] {
+                let expected = model.predict(&[value]).unwrap();
+                assert_eq!(compiled.predict(&[value]), Ok(expected));
+                outcomes[expected as usize] = true;
+            }
+        }
+        assert!(outcomes.into_iter().all(|outcome| outcome));
+    }
 
     #[test]
     fn emits_predict_for_aarch64_and_x86_64() {
@@ -516,15 +1216,15 @@ mod tests {
         )
         .unwrap();
         for (order, comparisons, loads, scalars, pairs) in [
-            (Order::TreeOrder, ComparisonMode::Scalar, 6, 4, 0),
-            (Order::TreeOrder, ComparisonMode::Simd2, 6, 4, 0),
+            (Order::TreeOrder, ComparisonMode::Scalar, 10, 4, 0),
+            (Order::TreeOrder, ComparisonMode::Simd2, 10, 4, 0),
             (
                 Order::Scheduled(RegisterBudget {
                     general: NonZeroUsize::new(6).unwrap(),
                     floating: NonZeroUsize::new(12).unwrap(),
                 }),
                 ComparisonMode::Scalar,
-                3,
+                5,
                 2,
                 0,
             ),
@@ -534,7 +1234,7 @@ mod tests {
                     floating: NonZeroUsize::new(12).unwrap(),
                 }),
                 ComparisonMode::Simd2,
-                3,
+                5,
                 0,
                 1,
             ),
@@ -550,6 +1250,7 @@ mod tests {
                     },
                 )
                 .unwrap(),
+                &TargetMachine::get_default_triple(),
             )
             .unwrap();
             module.verify().unwrap();
@@ -580,14 +1281,27 @@ mod tests {
             3.0,
         )
         .unwrap();
-        let module = emit_plan(&context, &plan(&model, SortOptions::default()).unwrap()).unwrap();
+        let module = emit_plan(
+            &context,
+            &plan(&model, SortOptions::default()).unwrap(),
+            &TargetMachine::get_default_triple(),
+        )
+        .unwrap();
         module.verify().unwrap();
         let ir = module.print_to_string().to_string();
-        assert_eq!(module.get_functions().count(), 1);
+        assert_eq!(module.get_functions().count(), 2);
         assert_eq!(module.get_function("predict").unwrap().count_params(), 1);
-        assert!(!ir.contains("call "), "one chunk must not introduce calls");
+        assert_eq!(
+            ir.matches("call preserve_nonecc double @continuation0")
+                .count(),
+            1
+        );
+        let continuation = module.get_function("continuation0").unwrap();
+        assert_opaque_constants(continuation, 1, 1);
         for expected in [
-            "private constant [2 x double]",
+            "@constants = private constant [10 x double]",
+            "align 64",
+            "noalias readonly",
             "readonly align 8 dereferenceable(8)",
             "memory(read)",
             "fcmp ogt double",
@@ -638,7 +1352,7 @@ mod tests {
             )
             .unwrap();
             assert!(plan.chunks().len() > 1);
-            let module = emit_plan(&context, &plan).unwrap();
+            let module = emit_plan(&context, &plan, &TargetMachine::get_default_triple()).unwrap();
             module.verify().unwrap();
             assert_eq!(module.get_functions().count(), plan.chunks().len() + 1);
             let first = module.get_function("continuation0").unwrap();
@@ -669,7 +1383,7 @@ mod tests {
                     .iter()
                     .filter(|a| matches!(a, Action::Load { .. } | Action::Retire { .. }))
                     .count();
-                assert_eq!(ir.matches("load double").count(), loads);
+                assert_eq!(ir.matches("load double").count(), loads + chunk.tests);
                 let mut lines = ir.lines();
                 if number + 1 < plan.chunks().len() {
                     let call = lines.find(|line| line.contains("musttail call")).unwrap();
