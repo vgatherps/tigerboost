@@ -75,9 +75,26 @@ Static, tree-major 4 per chunk, 100 trees: ARM64 2253 instructions (22.5 per tre
 - The x86 side is untested at runtime; static counts fell 4015 → 2332 and the compare port cap
   (`ucomisd` 1/cycle) is gone, which is where the larger gain is expected.
 
+## Step 3: Rosetta 2 correctness gate and AVX2 emission (commits 716073e, 0a1187e)
+
+`tools/x86_check.sh <workload> [--avx2]` emits every variant for `x86_64-apple-darwin`, links each
+with a C driver (`-no_pie`, because the large code model leaves absolute text relocations), runs it
+under `arch -x86_64`, and compares all 256 predictions bit for bit with `Trees::predict`. All five
+variants pass on `special`, `100x100` and `300x100`, with and without AVX2. Rosetta timing carries
+no information (see `ROSETTA_AVX2_RESEARCH.md`); native ARM64 remains the semantic oracle.
+
+| x86-64 static, 100 trees, 100 features | instructions | per tree | compare form |
+|---|---:|---:|---|
+| scalar default (GP12/FP9, 2 sums) | 3330 | 33.3 | `ucomisd`, 1 per cycle on Zen 4 / Golden Cove |
+| tree-major 4 per chunk, SSE2 (generic) | 2332 | 23.3 | `cmpltpd` register operand, shift/or packing |
+| tree-major 4 per chunk, AVX2 (`EmitOptions { avx2: true }`) | 1486 | 14.9 | `vcmpgt_oqpd` memory operand, `vmovmskpd` |
+
+No native x86 timing exists. The llvm-mca estimate from the study (about 3x over scalar on Alder
+Lake, 1.7x on Zen 3) is the only performance indication for this path.
+
 ## Open
 
 - Default order: stay scalar, or tree-major 8 (spill-free) / 16 (fastest)? Maintainer decision.
-- AVX2 emission for tree-major (memory-operand compare + `vmovmskpd`, 4+2 lanes).
+- Native x86 timing of the AVX2 path (needs real hardware).
 - Within-chunk feature reuse for lane fills (the study bounds it at 13-20% fewer load slots).
 - x86 execution evidence (Rosetta for correctness; a real host for timing).
