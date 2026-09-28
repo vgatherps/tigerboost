@@ -11,7 +11,7 @@ use std::{
 use support::{ROWS, Workload};
 use tigerboost::jit::{EmitOptions, compile, emit_assembly_with};
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
-use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
+use tigerboost::sort_policy::{SortOptions, plan};
 
 const USAGE: &str = "usage: x86_check <workload> <fresh-output-dir> [--avx2]";
 
@@ -114,49 +114,21 @@ fn workload(choice: WorkloadChoice) -> (Trees, Vec<Vec<f64>>) {
     }
 }
 
-fn variants() -> [(&'static str, SortOptions); 5] {
+fn variants() -> [(&'static str, SortOptions); 3] {
     [
-        ("scalar-gp12-fp9-2sums", SortOptions::default()),
-        (
-            "scalar-gp4-fp9-2sums",
-            SortOptions {
-                order: Order::Scheduled(RegisterBudget {
-                    general: NonZeroUsize::new(4).unwrap(),
-                    floating: NonZeroUsize::new(9).unwrap(),
-                }),
-                accumulators: NonZeroUsize::new(2).unwrap(),
-                comparisons: ComparisonMode::Scalar,
-            },
-        ),
-        (
-            "tree-order-2sums",
-            SortOptions {
-                order: Order::TreeOrder,
-                accumulators: NonZeroUsize::new(2).unwrap(),
-                comparisons: ComparisonMode::Scalar,
-            },
-        ),
-        (
-            "tree-major-4-2sums",
-            SortOptions {
-                order: Order::TreeMajor {
-                    chunk_trees: NonZeroUsize::new(4).unwrap(),
-                },
-                accumulators: NonZeroUsize::new(2).unwrap(),
-                comparisons: ComparisonMode::Scalar,
-            },
-        ),
-        (
-            "tree-major-8-2sums",
-            SortOptions {
-                order: Order::TreeMajor {
-                    chunk_trees: NonZeroUsize::new(8).unwrap(),
-                },
-                accumulators: NonZeroUsize::new(2).unwrap(),
-                comparisons: ComparisonMode::Scalar,
-            },
-        ),
+        ("tree-major-4-2sums", 4, 2),
+        ("tree-major-8-2sums", 8, 2),
+        ("tree-major-8-1sum", 8, 1),
     ]
+    .map(|(name, chunk_trees, accumulators)| {
+        (
+            name,
+            SortOptions {
+                chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
+                accumulators: NonZeroUsize::new(accumulators).unwrap(),
+            },
+        )
+    })
 }
 
 fn reference_scores(model: &Trees, rows: &[Vec<f64>]) -> Result<Vec<f64>, Box<dyn Error>> {
@@ -170,7 +142,7 @@ fn check_variants_natively(model: &Trees, rows: &[Vec<f64>]) -> Result<(), Box<d
     let expected = reference_scores(model, rows)?;
     let context = Context::create();
     for (name, options) in variants() {
-        let plan = plan(model, options)?;
+        let plan = plan(model, options);
         let compiled = compile(&context, &plan)?;
         for (row, (&expected, features)) in expected.iter().zip(rows).enumerate() {
             assert_eq!(
@@ -205,7 +177,7 @@ fn write_outputs(
 
     fs::create_dir(output)?;
     for (name, options) in variants() {
-        let plan = plan(model, options)?;
+        let plan = plan(model, options);
         let compiled = compile(&context, &plan)?;
         for (row, (&expected, features)) in expected.iter().zip(rows).enumerate() {
             assert_eq!(
@@ -344,7 +316,7 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("variant "))
                 .count(),
-            5
+            3
         );
         for (name, _) in variants() {
             let assembly = fs::read(directory.0.join(format!("{name}.s"))).unwrap();
@@ -368,7 +340,7 @@ mod tests {
         let context = Context::create();
         for (name, options) in variants() {
             let assembly = fs::read_to_string(directory.0.join(format!("{name}.s"))).unwrap();
-            let plan = plan(&model, options).unwrap();
+            let plan = plan(&model, options);
             let expected = emit_assembly_with(
                 &context,
                 &plan,
@@ -377,10 +349,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(assembly, expected.trim_end_matches('\0'));
-            if matches!(options.order, Order::TreeMajor { .. }) {
-                assert_eq!(assembly.matches("vcmpgt_oqpd").count(), 10);
-                assert_eq!(assembly.matches("vmovmskpd").count(), 10);
-            }
+            assert_eq!(assembly.matches("vcmpgt_oqpd").count(), 10);
+            assert_eq!(assembly.matches("vmovmskpd").count(), 10);
         }
     }
 

@@ -8,23 +8,22 @@ use inkwell::context::Context;
 use std::{error::Error, hint::black_box, num::NonZeroUsize, time::Instant};
 use support::{ROWS, Workload, workload};
 use tigerboost::jit::compile;
-use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
+use tigerboost::sort_policy::{SortOptions, plan};
 
 const CALLS: usize = 50_000;
 const ROUNDS: usize = 5;
 
 fn tree_major_variants() -> impl Iterator<Item = (String, SortOptions)> {
-    [2, 4, 8].into_iter().map(|count| {
-        (
-            format!("Tree-major, {count} trees/chunk, sums 2"),
-            SortOptions {
-                order: Order::TreeMajor {
-                    chunk_trees: NonZeroUsize::new(count).unwrap(),
+    [4, 8, 16].into_iter().flat_map(|chunk_trees| {
+        [1, 2, 4].map(move |count| {
+            (
+                format!("Tree-major, {chunk_trees} trees/chunk, sums {count}"),
+                SortOptions {
+                    chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
+                    accumulators: NonZeroUsize::new(count).unwrap(),
                 },
-                accumulators: NonZeroUsize::new(2).unwrap(),
-                comparisons: ComparisonMode::Scalar,
-            },
-        )
+            )
+        })
     })
 }
 
@@ -47,53 +46,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (model, rows) = workload(choice);
     let context = Context::create();
     let mut kernels = Vec::new();
-    let orders = std::iter::once(Order::TreeOrder).chain([4, 6, 12, 20].map(|general| {
-        Order::Scheduled(RegisterBudget {
-            general: NonZeroUsize::new(general).unwrap(),
-            floating: NonZeroUsize::new(9).unwrap(),
-        })
-    }));
-    for order in orders {
-        for count in [1, 2, 4] {
-            let options = SortOptions {
-                order,
-                accumulators: NonZeroUsize::new(count).unwrap(),
-                comparisons: ComparisonMode::Scalar,
-            };
-            let start = Instant::now();
-            let compiled = compile(&context, &plan(&model, options)?)?;
-            let compile_ms = start.elapsed().as_secs_f64() * 1e3;
-            let label = match order {
-                Order::TreeOrder => format!("Tree order, sums {count}"),
-                Order::Scheduled(budget) => format!("Scheduled {:?}, sums {count}", budget),
-                Order::TreeMajor { chunk_trees } => {
-                    format!("Tree-major, {chunk_trees} trees/chunk, sums {count}")
-                }
-            };
-            kernels.push((label, compiled, compile_ms));
-        }
-    }
-    for general in [4, 6, 12, 20] {
-        let options = SortOptions {
-            order: Order::Scheduled(RegisterBudget {
-                general: NonZeroUsize::new(general).unwrap(),
-                floating: NonZeroUsize::new(9).unwrap(),
-            }),
-            accumulators: NonZeroUsize::new(2).unwrap(),
-            comparisons: ComparisonMode::Simd2,
-        };
-        let start = Instant::now();
-        let compiled = compile(&context, &plan(&model, options)?)?;
-        let compile_ms = start.elapsed().as_secs_f64() * 1e3;
-        kernels.push((
-            format!("SIMD2 scheduled GP {general}/FP 9, sums 2"),
-            compiled,
-            compile_ms,
-        ));
-    }
     for (label, options) in tree_major_variants() {
         let start = Instant::now();
-        let compiled = compile(&context, &plan(&model, options)?)?;
+        let compiled = compile(&context, &plan(&model, options))?;
         let compile_ms = start.elapsed().as_secs_f64() * 1e3;
         kernels.push((label, compiled, compile_ms));
     }
@@ -175,14 +130,14 @@ mod tests {
     fn workload_agrees_and_dependent_trace_visits_multiple_rows() {
         let (model, rows) = workload(Workload::Mixed);
         let context = Context::create();
-        let compiled = compile(&context, &plan(&model, SortOptions::default()).unwrap()).unwrap();
+        let compiled = compile(&context, &plan(&model, SortOptions::default())).unwrap();
         let (scores, distinct) = verify(&model, &compiled, &rows, CALLS);
         assert_eq!(scores.len(), ROWS);
         assert!(distinct > 1);
     }
 
     #[test]
-    fn fixed_workloads_have_expected_shapes_reuse_and_matching_simd_traces() {
+    fn fixed_workloads_have_expected_shapes_reuse_and_matching_traces() {
         let context = Context::create();
         for (kind, trees, features) in [
             (Workload::ReuseHeavy, 64, 4),
@@ -217,31 +172,18 @@ mod tests {
                     );
                 }
             }
-            let compiled = compile(
-                &context,
-                &plan(
-                    &model,
-                    SortOptions {
-                        order: Order::Scheduled(RegisterBudget {
-                            general: NonZeroUsize::new(6).unwrap(),
-                            floating: NonZeroUsize::new(9).unwrap(),
-                        }),
-                        accumulators: NonZeroUsize::new(2).unwrap(),
-                        comparisons: ComparisonMode::Simd2,
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            let (_, distinct) = verify(&model, &compiled, &rows, CALLS);
-            assert!(distinct > 1, "{kind:?}");
-            for ((label, options), count) in tree_major_variants().zip([2, 4, 8]) {
-                assert_eq!(label, format!("Tree-major, {count} trees/chunk, sums 2"));
-                assert!(
-                    matches!(options.order, Order::TreeMajor { chunk_trees } if chunk_trees.get() == count)
+            let expected = [4, 8, 16]
+                .into_iter()
+                .flat_map(|chunk_trees| [1, 2, 4].map(move |sums| (chunk_trees, sums)));
+            assert_eq!(tree_major_variants().count(), 9);
+            for ((label, options), (chunk_trees, sums)) in tree_major_variants().zip(expected) {
+                assert_eq!(
+                    label,
+                    format!("Tree-major, {chunk_trees} trees/chunk, sums {sums}")
                 );
-                assert_eq!(options.accumulators.get(), 2);
-                let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
+                assert_eq!(options.chunk_trees.get(), chunk_trees);
+                assert_eq!(options.accumulators.get(), sums);
+                let compiled = compile(&context, &plan(&model, options)).unwrap();
                 let (_, distinct) = verify(&model, &compiled, &rows, CALLS);
                 assert!(distinct > 1, "{kind:?} {label}");
             }
@@ -249,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_workloads_are_deterministic_and_match_scalar_and_simd() {
+    fn distinct_workloads_are_deterministic_and_match_reference() {
         let context = Context::create();
         for (name, trees, features) in [
             ("100x100", 100, 100),
@@ -277,19 +219,8 @@ mod tests {
                 }
             }
             assert_eq!(borders.len(), trees * 6);
-            for comparisons in [ComparisonMode::Scalar, ComparisonMode::Simd2] {
-                let compiled = compile(
-                    &context,
-                    &plan(
-                        &model,
-                        SortOptions {
-                            comparisons,
-                            ..SortOptions::default()
-                        },
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
+            for (_, options) in tree_major_variants() {
+                let compiled = compile(&context, &plan(&model, options)).unwrap();
                 for row in &rows {
                     assert_eq!(compiled.predict(row), model.predict(row));
                 }

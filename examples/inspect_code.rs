@@ -11,7 +11,7 @@ use std::{
 };
 use support::Workload;
 use tigerboost::jit::{EmitOptions, emit_assembly_with};
-use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
+use tigerboost::sort_policy::{SortOptions, plan};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
@@ -31,65 +31,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (model, _) = support::workload(choice);
     let context = Context::create();
     for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
-        for (name, options) in [
-            (
-                "tree-order-1",
-                SortOptions {
-                    order: Order::TreeOrder,
-                    accumulators: NonZeroUsize::new(1).unwrap(),
-                    comparisons: ComparisonMode::Scalar,
-                },
-            ),
-            (
-                "scheduled-12gp-9fp-2sums",
-                SortOptions {
-                    order: Order::Scheduled(RegisterBudget {
-                        general: NonZeroUsize::new(12).unwrap(),
-                        floating: NonZeroUsize::new(9).unwrap(),
-                    }),
-                    accumulators: NonZeroUsize::new(2).unwrap(),
-                    comparisons: ComparisonMode::Scalar,
-                },
-            ),
-            (
-                "simd2-scheduled-6gp-9fp-2sums",
-                SortOptions {
-                    order: Order::Scheduled(RegisterBudget {
-                        general: NonZeroUsize::new(6).unwrap(),
-                        floating: NonZeroUsize::new(9).unwrap(),
-                    }),
-                    accumulators: NonZeroUsize::new(2).unwrap(),
-                    comparisons: ComparisonMode::Simd2,
-                },
-            ),
-            (
-                "simd2-scheduled-12gp-9fp-2sums",
-                SortOptions {
-                    order: Order::Scheduled(RegisterBudget {
-                        general: NonZeroUsize::new(12).unwrap(),
-                        floating: NonZeroUsize::new(9).unwrap(),
-                    }),
-                    accumulators: NonZeroUsize::new(2).unwrap(),
-                    comparisons: ComparisonMode::Simd2,
-                },
-            ),
-            (
-                "tree-major-4-2sums",
-                SortOptions {
-                    order: Order::TreeMajor {
-                        chunk_trees: NonZeroUsize::new(4).unwrap(),
-                    },
-                    accumulators: NonZeroUsize::new(2).unwrap(),
-                    comparisons: ComparisonMode::Scalar,
-                },
-            ),
-        ] {
-            let plan = plan(&model, options)?;
-            let avx2_variant = (triple == "x86_64-unknown-linux-gnu"
-                && matches!(options.order, Order::TreeMajor { .. }))
-            .then_some(("tree-major-4-2sums-avx2", EmitOptions { avx2: true }));
+        for (name, chunk_trees) in [("tree-major-8-2sums", 8), ("tree-major-4-2sums", 4)] {
+            let options = SortOptions {
+                chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
+                accumulators: NonZeroUsize::new(2).unwrap(),
+            };
+            let plan = plan(&model, options);
+            let avx2_variant = (triple == "x86_64-unknown-linux-gnu")
+                .then_some((format!("{name}-avx2"), EmitOptions { avx2: true }));
             for (name, emit_options) in
-                std::iter::once((name, EmitOptions::default())).chain(avx2_variant)
+                std::iter::once((name.to_owned(), EmitOptions::default())).chain(avx2_variant)
             {
                 let assembly = emit_assembly_with(&context, &plan, triple, emit_options)?;
                 let path = output.join(format!("{triple}-{name}.s"));

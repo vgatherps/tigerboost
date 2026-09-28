@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         -1.0, // bias
     )?;
     let context = Context::create();
-    let plan = plan(&model, SortOptions::default())?;
+    let plan = plan(&model, SortOptions::default());
     let predictor = compile(&context, &plan)?;
     drop(plan);
     drop(model);
@@ -38,9 +38,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `Trees::new` validates leaf counts and feature indices. `Trees::predict` is the
-independent tree-order reference. Compiled models own their code and copied leaf
-tables, so the source `Trees` may be dropped; the LLVM `Context` must outlive the
-compiled model. `predict` checks that the row covers every declared feature.
+independent tree-order reference. Compiled models own their code and copied
+constants, so the source `Trees` may be dropped; the LLVM `Context` must outlive
+the compiled model. `predict` checks that the row covers every declared feature.
 Rows stay read-only during each call and may change between calls. Prediction
 writes neither caller memory nor model data.
 
@@ -56,47 +56,38 @@ trees are constants; an empty forest returns bias without applying scale.
 Arithmetic may reassociate: bitwise agreement and matching overflow behavior
 with the reference are not promised. Comparisons retain NaN/infinity semantics.
 
-## Scheduling
+## How a prediction runs
 
-`SortOptions::default()` selects scalar comparisons, logical budgets of twelve
-general and nine floating registers, and two independent sums. The schedule
-shares feature loads and predicates, checks operation peaks before starting
-selectors, and releases values as their uses finish or space is needed.
-Prediction does not walk split metadata or run the scheduler.
+`sort_policy::plan(&model, SortOptions { chunk_trees, accumulators })` produces
+a plan without LLVM: one action per tree, in tree order, grouped into chunks of
+`chunk_trees` whole trees, with leaves accumulated round-robin into
+`accumulators` independent sums that are added at the end. The default is eight
+trees per chunk and two sums.
 
-GP counts the row pointer, live selectors and primitive scratch; FP counts sums,
-resident features and primitive scratch. Plan-assigned IDs are dense and deterministic;
-reloads get fresh IDs. Feature frequencies count split occurrences; tree scores sum
-those frequencies. Within each operation, eligible admissions rank resident/pending
-feature overlap before tree score, with stable ID tie breaks.
+`jit::compile(&context, &plan)` emits that plan. All thresholds and all leaf
+tables live in one private constant block that every function reaches through a
+pointer argument, so inside a function each threshold is one load and each leaf
+lookup is one indexed load (on x86-64 the leaf load folds into the add). A tree of
+depth `d` is evaluated as `ceil(d/2)` two-lane vector comparisons: its feature
+values are loaded into lane pairs, compared against the tree's thresholds (stored
+consecutively), and the lane masks are packed with shift-left-insert into two
+signed lane values whose sum addresses a leaf table that was permuted at compile
+time to match. Odd depths get a constant-false padding level. The permutation is
+defined by simulating that lane arithmetic for every bit pattern, and checked to
+be a bijection when the model is compiled.
 
-`sort_policy::plan(&model, SortOptions { order, accumulators, comparisons })`
-returns a complete plan or an insufficient-budget error, without LLVM. Its
-read-only commands specify feature lifetimes, comparisons, leaf accumulation,
-sum reduction, and return behavior. The plan also supplies consecutive chunks
-of at most 16 comparison tests (a SIMD pair counts as two) and stable incoming
-value slots; unfinished trees may cross a boundary.
-`jit::compile(&context, &plan)` emits that plan. Counts use `NonZeroUsize`.
-Choose `Order::TreeOrder`, one
-accumulator, and `ComparisonMode::Scalar` for the direct baseline. Choose
-`Order::Scheduled(RegisterBudget { general, floating })` and
-`ComparisonMode::Simd2` for opt-in two-lane comparisons sharing a feature.
-Pairs fall back to scalar when their transient workspace cannot fit;
-tree order remains scalar regardless of that option.
+Each chunk is a separate `noinline preserve_nonecc` function that transfers only
+the row pointer, the constants pointer, and the running sums to the next chunk
+with a `musttail` call; a C `predict` wrapper calls the first one. The split
+exists to stop LLVM from hoisting loads across many trees and spilling; eight
+trees per chunk is the largest spill-free size measured on ARM64.
 
-The backend uses a generic CPU, LLVM `early-cse`, and backend optimization
-level `Less`. Immutable leaf tables and read-only row/function annotations remain
-in place. Multi-chunk kernels use identical `noinline preserve_nonecc`
-signatures and direct `musttail` transfers of the row pointer, live selectors,
-features, and sums. These transfer real computation state, bounding LLVM's
-reordering across chunks. One-chunk models emit a direct C `predict`, without
-an extra call or wrapper.
-
-Actual ARM64 MCJIT captures for the three distinct-threshold workloads below
-have stack-free continuation bodies and one 160-byte C-entry save frame.
-This is measured evidence, not a guarantee for arbitrary models or custom
-budgets. LLVM may still reorder within a chunk or spill. Scalar remains faster
-than SIMD in the current measurements; see [current results](plans/implementation.md#bounded-continuation-kernels).
+`jit::compile_with(&context, &plan, EmitOptions { avx2: true })` selects an
+x86-64 emission that compares four lanes then two per tree with the threshold
+vector as a memory operand and reads the level bits back with `vmovmskpd`. It
+sets `x86-64-v3` on the emitted functions and must not run on a host without
+AVX2; `EmitOptions::from_host()` enables it when LLVM reports `+avx2` for the
+host. `compile` never uses it.
 
 ## Build and checks
 
@@ -110,54 +101,52 @@ cargo test --offline --release --all-targets
 RUSTDOCFLAGS="-C link-arg=/opt/homebrew/lib/libzstd.dylib" cargo test --offline --doc
 cargo clippy --offline --all-targets -- -D warnings
 cargo fmt --check
+tools/x86_check.sh special && tools/x86_check.sh special --avx2
 ```
 
 The macOS ARM64 Cargo configuration links `/opt/homebrew/lib` for zstd;
-rustdoc does not inherit that setting. The explicit dylib avoids selecting the
-existing Intel zstd in `/usr/local/lib` first on this machine.
-Native execution was tested on ARM64. Generic x86-64 assembly was emitted and
-assembled, not executed; x86-64 correctness/performance is not established.
+rustdoc does not inherit that setting.
 
-## Historical synthetic measurements
+`tools/x86_check.sh <workload> [--avx2]` emits every benchmark variant for
+`x86_64-apple-darwin`, links each kernel with a C driver, runs it under Rosetta 2
+(`arch -x86_64`) and compares every prediction bit for bit with the reference.
+Rosetta executes the code but its timing says nothing about an x86 CPU; no x86
+performance has been measured.
 
-These cap-based fixtures included an artificial repeated-threshold reuse case.
-They do not validate the new scheduler; see the separate
-[resource-aware planning results](plans/implementation.md#resource-aware-planning).
+## Measurements
 
-SIMD regressed on reuse-heavy trees: 75.85 ns versus 52.04 ns for tree order.
-The scalar default was slightly slower on disjoint trees (about 1–2 ns across
-two runs, with overlapping ranges). It improved mixed/wide workloads and stayed
-near parity on reuse-heavy ones; those settings were not universally best.
+Apple M4 Pro, LLVM 21.1.8, generic target, serial runs. Hot numbers are
+`examples/scalar_bench.rs` medians of five rounds of 50,000 dependent calls, ns
+per call including about 5 ns of driver. Cold numbers are
+`examples/cold_bench.rs` per-call p50 over shuffled rows after 64 MiB of unrelated
+read-modify-write traffic. Both workloads are synthetic depth-6 forests with
+random feature reuse and globally distinct thresholds.
 
-Apple M4 Pro, LLVM 21.1.8, median ns/call including the roughly 5 ns row-selection
-driver; five interleaved rounds of 50,000 dependent single-row calls:
+| 100 trees, 100 features | hot median ns | cold p50 ns |
+|---|---:|---:|
+| scheduled scalar kernel before this work | 121 | 791 |
+| tree-major, 8 trees per chunk, 2 sums | 87 | 792 |
 
-| Workload | Reference | Tree order, 1 sum | Historical scalar, cap 4 / 2 sums | SIMD, cap 2 / 2 sums |
-|---|---:|---:|---:|---:|
-| Mixed | 179.07 | 92.25 | 80.43 | 74.38 |
-| Reuse-heavy | 176.51 | 52.04 | 51.99 | 75.85 |
-| Disjoint | 179.36 | 105.96 | 107.00 | 107.12 |
-| Wide | 346.32 | 226.25 | 184.95 | 202.34 |
+| 300 trees, 100 features | hot median ns |
+|---|---:|
+| scheduled scalar kernel before this work | ~345 |
+| tree-major, 8 trees per chunk, 2 sums | 237 |
 
-All cases have depth six and 256 rows. Mixed/reuse-heavy/disjoint have 64 trees
-and 16/4/384 features; wide has 128 trees and 128 features. All rows are checked
-against the reference before timing. The result-dependent traces visit only
-9/2/13/30 distinct rows respectively: these are warm synthetic measurements,
-especially the two-row reuse-heavy trace, not deployment-level evidence.
+Static, 100 trees: ARM64 2253 instructions (22.5 per tree, no continuation stack
+traffic); x86-64 2332 (SSE2) or 1486 with `avx2`. Rosetta 2 runs the SSE2 kernel at
+106 ns and the scalar kernel it replaced at 168 ns, the same ordering as native
+ARM64. Details, the study that led here, and the review record are in
+`plans/perf-study-2026-09-28/`.
 
-These commands exercise the current resource-aware implementation:
+Commands:
 
 ```sh
-cargo run --offline --release --example scalar_bench -- 500x100
-cargo run --offline --release --example inspect_code -- /private/tmp/tigerboost-code-new 100x100
+cargo run --offline --release --example scalar_bench -- 100x100
+cargo run --offline --release --example cold_bench -- 100x100 --samples 5000
+cargo run --offline --release --example inspect_code -- /tmp/tigerboost-code 100x100
 ```
 
-Both accept `100x100`, `500x100`, and `500x1000` (trees × declared features),
-plus the unchanged historical `mixed` (default), `reuse-heavy`, `disjoint`, and
-`wide` fixtures. The new cases randomly reuse features but have globally distinct
-thresholds: shuffled dyadic values in `[-4, 4)`, integer leaves 1–16, and 256
-dyadic rows. Depth six is a diagnostic assumption, not a supplied user model;
-some declared features may be unused.
+Workloads are `<trees>x<features>` (`100x100`, `300x100`, `500x100`, `500x1000`)
+plus the historical `mixed`, `reuse-heavy`, `disjoint`, and `wide` fixtures.
 Inspection requires a fresh output directory and emits separate ARM64/x86-64
-assembly and corresponding plan dumps, not MCJIT's executable bytes. See [implementation history](plans/implementation.md)
-for compilation times, code sizes, spills, regressions, and review history.
+assembly and plan dumps, not MCJIT's executable bytes.
