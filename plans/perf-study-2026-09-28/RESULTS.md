@@ -127,9 +127,14 @@ Hot medians in that run (ns, 100 / 300 trees): tree-major 8 per chunk 90.7 / 240
 identical code is the noise band of `cold_bench` on this host: cold differences under about
 150 ns at p50 carry no information.
 
-Remaining load counts, 100 trees, 8 per chunk: ARM64 316 `ldr d` + 172 `ld1.d` feature loads,
-186 `ldp` (threshold pairs), 26 `ldr q`; x86 SSE2 292 `movsd` + 174 `movhpd`; AVX2 274 `vmovsd`
-+ 161 `vmovhpd`. These are distinct features per chunk; no further reuse exists within a chunk.
+Remaining load counts, 100 trees, 8 per chunk, from the astra final review's classification
+(`VERDICT_FINAL_astra.md`): ARM64 feature loads are 216 `ldr d`, 39 `ldp d`, 172 `ld1.d` and 2
+`ld1r.2d` (468 feature doubles, no duplicate within a chunk); thresholds 137 `ldp q` + 26 `ldr q`
+(300 vectors); leaves 100 `ldr d`; the remaining `ldp` are wrapper restores. x86 SSE2 feature operands
+291 `movsd` + 174 `movhpd` + 5 `movupd`; AVX2 274 `vmovsd` + 161 `vmovhpd` + 27 `vbroadcastsd` + 3
+`vmovddup` + 3 `vmovupd` + 2 wide operands, with seven doubles re-read within chunks by backend
+packing choices. Per tree: ARM64 about 8.3 load slots (4.3 feature, 3 threshold, 1 leaf), SSE2 8.85,
+AVX2 7.7. The sum over chunks of distinct features is 468, which is what tree ordering targets.
 
 ## Do continuations still help under tree-major?
 
