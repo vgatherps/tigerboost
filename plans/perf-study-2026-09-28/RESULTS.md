@@ -202,6 +202,42 @@ What it says:
 Decision pending: keep continuations (recommended: they are the ABI-enforced residency bound and
 cost nothing measurable), or adopt fenced W8 on x86 only.
 
+## Volatile feature loads with emitter-scheduled residency (branch `impl/volatile-residency`, round 1)
+
+One function, no fences, every row feature load `volatile`, Belady residency against a budget K
+over the visit order (evict the resident feature whose next use is farthest). Row loads equal the
+simulated misses exactly on every target. Tables in `VERDICT_residency_astra.md`.
+
+| row loads, 100 / 300 trees | K8 | K12 | K16 | K20 | K24 | continuation |
+|---|---:|---:|---:|---:|---:|---:|
+| model order | 423 / 1242 | 375 / 1087 | 338 / 964 | 309 / 866 | 281 / 780 | 468 / 1419 |
+| shared-feature order | 347 / 936 | 299 / 789 | 268 / 681 | 248 / 611 | 228 / 550 | |
+
+| ARM64, 100 trees | instructions | row loads | body stack ops | hot ns (100 / 300) |
+|---|---:|---:|---:|---:|
+| continuation | 2143 | 468 | 0 | 88.9 / 242.1 |
+| K8 | 2320 | 423 | 140 | 108.9 / 313.1 |
+| K16 | 2299 | 338 | 136 | 102.1 / 287.5 |
+| K16 shared | 2267 | 268 | 131 | 102.7 / 285.0 |
+
+x86 AVX2 (static): K8 1681 instructions, 423 row loads, 0 spills; K12 1663 / 375 / 0; K16 1734 /
+338 / 89 spills. SSE2: K8 2662 / 423 / 0. Continuation: 1451 / 470 / 0.
+
+What it says:
+- The scheduled residency does exactly what the theory says to the load count (−28% at K16
+  model order, −43% at K16 shared order, both vs the continuation kernel).
+- On ARM64 the single-function kernel spills at every K, K1 included, and what it spills are
+  hoisted leaf values (and, with volatile leaves, other hoisted loads), not features: LLVM's
+  ARM64 scheduler hoists independent loads across the whole function and the allocator spills
+  them. Threshold `ldp q` pairing is also lost (163 → 268 threshold loads) because the base is
+  no longer an opaque argument. Net: 13 to 15% slower hot on ARM64 despite fewer row loads.
+- On x86 there is no such spilling until K12 to K16, and K8 already beats the continuation
+  kernel's load count with zero spills; +15% instructions come from lane inserts that no longer
+  fold into `vmovhpd m64`. Untimed natively.
+- The round-2 design combines both experiments: fence per chunk (scheduler containment, which
+  continuations provided), constants base laundered through the fence (pairing), volatile
+  features, Belady residency across fences.
+
 ## Open
 
 - Default order: stay scalar, or tree-major 8 (spill-free) / 16 (fastest)? Maintainer decision.
