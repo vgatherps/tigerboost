@@ -1,13 +1,27 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-    echo "usage: tools/x86_check.sh <workload> [<out-dir>]" >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
+    echo "usage: tools/x86_check.sh <workload> [--avx2] [<out-dir>]" >&2
     exit 2
 fi
 
 workload=$1
-output=${2:-target/x86-check/$workload}
+shift
+avx2=
+if [ "${1:-}" = --avx2 ]; then
+    avx2=--avx2
+    shift
+fi
+if [ "$#" -gt 1 ]; then
+    echo "usage: tools/x86_check.sh <workload> [--avx2] [<out-dir>]" >&2
+    exit 2
+fi
+output=${1:-target/x86-check/$workload${avx2:+-avx2}}
+set --
+if [ -n "$avx2" ]; then
+    set -- --avx2
+fi
 case "$output" in
     /|.)
         echo "refusing to remove output directory $output" >&2
@@ -17,7 +31,7 @@ esac
 rm -rf -- "$output"
 mkdir -p "$(dirname "$output")"
 
-if ! cargo run --offline --release --example x86_check -- "$workload" "$output"; then
+if ! cargo run --offline --release --example x86_check -- "$workload" "$output" "$@"; then
     echo "cargo run failed; check that LLVM_SYS_211_PREFIX is exported" >&2
     exit 1
 fi

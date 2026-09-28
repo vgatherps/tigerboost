@@ -21,6 +21,37 @@ const BACKEND_OPTIMIZATION: OptimizationLevel = OptimizationLevel::Less;
 // LLVM 21 preserve_nonecc; only used between matching continuation signatures.
 const PRESERVE_NONE_CALL_CONVENTION: u32 = 21;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EmitOptions {
+    pub avx2: bool,
+}
+
+impl EmitOptions {
+    pub fn from_host() -> Self {
+        Self {
+            avx2: TargetMachine::get_host_cpu_features()
+                .to_string()
+                .split(',')
+                .any(|feature| feature == "+avx2"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreePath {
+    Lanes2,
+    Avx2,
+}
+
+impl TreePath {
+    fn target_cpu(self) -> &'static str {
+        match self {
+            Self::Lanes2 => "generic",
+            Self::Avx2 => "x86-64-v3",
+        }
+    }
+}
+
 pub struct CompiledModel<'ctx> {
     // Retains the engine, including executable code and private constant globals.
     function: JitFunction<'ctx, PredictFn>,
@@ -45,9 +76,17 @@ pub fn compile<'ctx>(
     context: &'ctx Context,
     plan: &Plan<'_>,
 ) -> CompileResult<CompiledModel<'ctx>> {
+    compile_with(context, plan, EmitOptions::default())
+}
+
+pub fn compile_with<'ctx>(
+    context: &'ctx Context,
+    plan: &Plan<'_>,
+    options: EmitOptions,
+) -> CompileResult<CompiledModel<'ctx>> {
     Target::initialize_native(&InitializationConfig::default())?;
     let triple = TargetMachine::get_default_triple();
-    let (module, _) = prepare_module(context, plan, &triple)?;
+    let (module, _) = prepare_module(context, plan, &triple, options)?;
     let engine = module.create_jit_execution_engine(BACKEND_OPTIMIZATION)?;
     // SAFETY: emit_plan builds exactly C ABI double(const double*).
     let function = unsafe { engine.get_function::<PredictFn>("predict")? };
@@ -63,9 +102,19 @@ pub fn emit_assembly(
     plan: &Plan<'_>,
     target_triple: &str,
 ) -> CompileResult<String> {
+    emit_assembly_with(context, plan, target_triple, EmitOptions::default())
+}
+
+/// Separate target emission with explicit target options.
+pub fn emit_assembly_with(
+    context: &Context,
+    plan: &Plan<'_>,
+    target_triple: &str,
+    options: EmitOptions,
+) -> CompileResult<String> {
     Target::initialize_all(&InitializationConfig::default());
     let triple = TargetTriple::create(target_triple);
-    let (module, machine) = prepare_module(context, plan, &triple)?;
+    let (module, machine) = prepare_module(context, plan, &triple, options)?;
     let buffer = machine.write_to_memory_buffer(&module, FileType::Assembly)?;
     Ok(String::from_utf8(buffer.as_slice().to_vec())?)
 }
@@ -74,19 +123,25 @@ fn prepare_module<'ctx>(
     context: &'ctx Context,
     plan: &Plan<'_>,
     triple: &TargetTriple,
+    options: EmitOptions,
 ) -> CompileResult<(Module<'ctx>, TargetMachine)> {
+    let tree_path = if options.avx2 && triple.as_str().to_bytes().starts_with(b"x86_64-") {
+        TreePath::Avx2
+    } else {
+        TreePath::Lanes2
+    };
     let target = Target::from_triple(triple)?;
     let machine = target
         .create_target_machine(
             triple,
-            "generic",
+            tree_path.target_cpu(),
             "",
             BACKEND_OPTIMIZATION,
             RelocMode::Default,
             CodeModel::JITDefault,
         )
         .ok_or("could not create target machine")?;
-    let module = emit_plan(context, plan, triple)?;
+    let module = emit_plan(context, plan, triple, tree_path)?;
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.verify()?;
     module.run_passes(
@@ -102,6 +157,7 @@ fn emit_plan<'ctx>(
     context: &'ctx Context,
     plan: &Plan<'_>,
     triple: &TargetTriple,
+    tree_path: TreePath,
 ) -> CompileResult<Module<'ctx>> {
     let model = plan.model();
     let module = context.create_module("tigerboost");
@@ -156,11 +212,13 @@ fn emit_plan<'ctx>(
         let length = tree
             .leafs
             .len()
-            .checked_mul(if evaluated && tree.selections.len() % 2 != 0 {
-                2
-            } else {
-                1
-            })
+            .checked_mul(
+                if tree_path == TreePath::Lanes2 && evaluated && tree.selections.len() % 2 != 0 {
+                    2
+                } else {
+                    1
+                },
+            )
             .ok_or("tree-major leaf block exceeds addressable entry count")?;
         entry_count = entry_count
             .checked_add(length)
@@ -185,7 +243,7 @@ fn emit_plan<'ctx>(
     values.resize(leaf_start, f64_type.const_zero());
     let mut leaf_bias = vec![0; model.trees().len()];
     for (id, tree) in model.trees().iter().enumerate() {
-        if evaluated_trees[id] {
+        if tree_path == TreePath::Lanes2 && evaluated_trees[id] {
             let (bias, leaves) = permuted_leaves(tree);
             leaf_bias[id] = bias;
             values.extend(leaves.into_iter().map(|leaf| f64_type.const_float(leaf)));
@@ -284,7 +342,10 @@ fn emit_plan<'ctx>(
         }
         // LLVM 21: Ref=1 in each of four two-bit memory locations, including globals.
         attribute(AttributeLoc::Function, "memory", 0b01_01_01_01);
-        for (name, value) in [("target-cpu", "generic"), ("target-features", "")] {
+        for (name, value) in [
+            ("target-cpu", tree_path.target_cpu()),
+            ("target-features", ""),
+        ] {
             function.add_attribute(
                 AttributeLoc::Function,
                 context.create_string_attribute(name, value),
@@ -342,6 +403,24 @@ fn emit_plan<'ctx>(
     } else {
         None
     };
+    let avx2_intrinsics = (tree_path == TreePath::Avx2).then(|| {
+        let declaration = |name| {
+            Intrinsic::find(name)
+                .unwrap()
+                .get_declaration(&module, &[])
+                .unwrap()
+        };
+        (
+            (
+                declaration("llvm.x86.avx.cmp.pd.256"),
+                declaration("llvm.x86.avx.movmsk.pd.256"),
+            ),
+            (
+                declaration("llvm.x86.sse2.cmp.pd"),
+                declaration("llvm.x86.sse2.movmsk.pd"),
+            ),
+        )
+    });
     for (chunk_number, chunk) in chunks.iter().enumerate() {
         let function = functions[chunk_number];
         builder.position_at_end(context.append_basic_block(function, "entry"));
@@ -537,6 +616,146 @@ fn emit_plan<'ctx>(
                                 Some(builder.build_or(index, level_bit, "leaf_index")?);
                         }
                     }
+                }
+                Action::EvaluateTree {
+                    tree,
+                    predicates,
+                    sum,
+                } if tree_path == TreePath::Avx2 => {
+                    let (wide, narrow) = avx2_intrinsics.unwrap();
+                    let mut index = zero;
+                    for (group_number, group) in predicates.chunks(4).enumerate() {
+                        let lanes = group.len();
+                        assert!(lanes == 2 || lanes == 4);
+                        let first_level = group_number * 4;
+                        let slot = predicate_slots[group[0].0];
+                        for (lane, predicate) in group.iter().enumerate() {
+                            assert_eq!(
+                                predicate_slots[predicate.0],
+                                slot.checked_add(lane).unwrap()
+                            );
+                        }
+                        // SAFETY: consecutive slots cover this group's thresholds in constants.
+                        let address = unsafe {
+                            builder.build_in_bounds_gep(
+                                constant_type,
+                                constants,
+                                &[zero, index_type.const_int(slot as u64, false)],
+                                "threshold_ptr",
+                            )?
+                        };
+                        let vector_type = f64_type.vec_type(lanes as u32);
+                        let thresholds = builder.build_load(vector_type, address, "thresholds")?;
+                        thresholds
+                            .as_instruction_value()
+                            .unwrap()
+                            .set_alignment(8)?;
+                        let mut features = vector_type.get_undef();
+                        let mut first_value = None;
+                        for (lane, predicate) in group.iter().enumerate() {
+                            let value = if first_level + lane
+                                == model.trees()[tree.0].selections.len()
+                            {
+                                first_value.expect("padding follows a real level")
+                            } else {
+                                let feature = plan.predicates()[predicate.0].feature_idx;
+                                // SAFETY: Trees validates features; predict checks the row span.
+                                let address = unsafe {
+                                    builder.build_in_bounds_gep(
+                                        f64_type,
+                                        row,
+                                        &[index_type.const_int(feature.0 as u64, false)],
+                                        "feature_ptr",
+                                    )?
+                                };
+                                let loaded = builder.build_load(f64_type, address, "feature")?;
+                                loaded.as_instruction_value().unwrap().set_alignment(8)?;
+                                let mut value = loaded.into_float_value();
+                                let mode = model.feature_modes()[feature.0];
+                                if mode != NanMode::AsIs {
+                                    let is_nan = builder.build_float_compare(
+                                        FloatPredicate::UNO,
+                                        value,
+                                        value,
+                                        "is_nan",
+                                    )?;
+                                    let replacement = if mode == NanMode::AsFalse {
+                                        f64::NEG_INFINITY
+                                    } else {
+                                        f64::INFINITY
+                                    };
+                                    value = builder
+                                        .build_select(
+                                            is_nan,
+                                            f64_type.const_float(replacement),
+                                            value,
+                                            "nan_value",
+                                        )?
+                                        .into_float_value();
+                                }
+                                value
+                            };
+                            if lane == 0 {
+                                first_value = Some(value);
+                            }
+                            features = builder.build_insert_element(
+                                features,
+                                value,
+                                context.i32_type().const_int(lane as u64, false),
+                                "features",
+                            )?;
+                        }
+                        let (compare, movemask) = if lanes == 4 { wide } else { narrow };
+                        let masks = builder
+                            .build_call(
+                                compare,
+                                &[
+                                    features.into(),
+                                    thresholds.into(),
+                                    context.i8_type().const_int(30, false).into(),
+                                ],
+                                "splits",
+                            )?
+                            .try_as_basic_value()
+                            .unwrap_basic();
+                        let mask = builder
+                            .build_call(movemask, &[masks.into()], "mask")?
+                            .try_as_basic_value()
+                            .unwrap_basic()
+                            .into_int_value();
+                        let mask = builder.build_int_z_extend(mask, index_type, "group_index")?;
+                        let shifted = if first_level == 0 {
+                            mask
+                        } else {
+                            builder.build_left_shift(
+                                mask,
+                                index_type.const_int(first_level as u64, false),
+                                "upper",
+                            )?
+                        };
+                        index = builder.build_or(index, shifted, "leaf_index")?;
+                    }
+                    let slot = builder.build_int_nuw_add(
+                        index,
+                        index_type.const_int(leaf_base[tree.0] as u64, false),
+                        "leaf_slot",
+                    )?;
+                    // SAFETY: depth bits bound index to this tree's original leaf block.
+                    let address = unsafe {
+                        builder.build_in_bounds_gep(
+                            constant_type,
+                            constants,
+                            &[zero, slot],
+                            "leaf_ptr",
+                        )?
+                    };
+                    let leaf = builder.build_load(f64_type, address, "leaf")?;
+                    leaf.as_instruction_value().unwrap().set_alignment(8)?;
+                    sums[sum.0] = reassociate(builder.build_float_add(
+                        sums[sum.0],
+                        leaf.into_float_value(),
+                        "sum",
+                    )?)?;
                 }
                 Action::EvaluateTree {
                     tree,
@@ -1023,7 +1242,13 @@ mod tests {
             [("aarch64-apple-darwin", 3), ("x86_64-unknown-linux-gnu", 2)]
         {
             let arm64 = pointer_count == 3;
-            let module = emit_plan(&context, &plan, &TargetTriple::create(triple)).unwrap();
+            let module = emit_plan(
+                &context,
+                &plan,
+                &TargetTriple::create(triple),
+                TreePath::Lanes2,
+            )
+            .unwrap();
             module.verify().unwrap();
             for number in 0..2 {
                 let function = module
@@ -1054,6 +1279,217 @@ mod tests {
                 assert!(!assembly.contains("ucomisd"));
             }
         }
+    }
+
+    #[test]
+    fn avx2_off_is_byte_identical() {
+        let context = Context::create();
+        for model in [mixed_depth_model(), tree_major_model(&[0, 1, 3, 5, 6, 8])] {
+            for options in [SortOptions::default(), tree_major_options(1)] {
+                let plan = plan(&model, options).unwrap();
+                for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+                    let original = emit_assembly(&context, &plan, triple).unwrap();
+                    assert_eq!(
+                        original,
+                        emit_assembly_with(&context, &plan, triple, EmitOptions::default())
+                            .unwrap(),
+                    );
+                    if triple == "aarch64-apple-darwin" {
+                        assert_eq!(
+                            original,
+                            emit_assembly_with(&context, &plan, triple, EmitOptions { avx2: true })
+                                .unwrap(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avx2_tree_major_emits_folded_compares() {
+        let context = Context::create();
+        Target::initialize_all(&InitializationConfig::default());
+        let triple = "x86_64-unknown-linux-gnu";
+        for depth in [1usize, 3, 5, 6, 8] {
+            let model = tree_major_model(&[depth]);
+            let plan = plan(&model, tree_major_options(1)).unwrap();
+            let (module, _) = prepare_module(
+                &context,
+                &plan,
+                &TargetTriple::create(triple),
+                EmitOptions { avx2: true },
+            )
+            .unwrap();
+            let ir = module.print_to_string().to_string();
+            let padded = depth.next_multiple_of(2);
+            assert_eq!(
+                ir.matches("call <4 x double> @llvm.x86.avx.cmp.pd.256")
+                    .count(),
+                padded / 4
+            );
+            assert_eq!(
+                ir.matches("call <2 x double> @llvm.x86.sse2.cmp.pd")
+                    .count(),
+                padded % 4 / 2
+            );
+            assert!(!ir.contains("fcmp"));
+            assert!(!ir.contains("vsli"));
+            for function in module
+                .get_functions()
+                .filter(|function| function.count_basic_blocks() != 0)
+            {
+                for (name, value) in [("target-cpu", "x86-64-v3"), ("target-features", "")] {
+                    assert_eq!(
+                        function
+                            .get_string_attribute(AttributeLoc::Function, name)
+                            .unwrap()
+                            .get_string_value()
+                            .to_str()
+                            .unwrap(),
+                        value,
+                    );
+                }
+                for block in function.get_basic_blocks() {
+                    for instruction in block.get_instructions() {
+                        if instruction.get_opcode() == InstructionOpcode::Load {
+                            assert_eq!(instruction.get_alignment().unwrap(), 8);
+                        }
+                    }
+                }
+            }
+            let assembly =
+                emit_assembly_with(&context, &plan, triple, EmitOptions { avx2: true }).unwrap();
+            let instructions: Vec<_> = assembly
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    line.split_once(char::is_whitespace)
+                })
+                .collect();
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|(op, _)| *op == "vcmpgt_oqpd")
+                    .count(),
+                padded.div_ceil(4)
+            );
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|(op, operands)| *op == "vcmpgt_oqpd" && operands.contains('('))
+                    .count(),
+                padded.div_ceil(4),
+                "depth={depth}\n{assembly}"
+            );
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|(op, _)| *op == "vmovmskpd")
+                    .count(),
+                padded.div_ceil(4)
+            );
+            let leaf_adds: Vec<_> = instructions
+                .iter()
+                .enumerate()
+                .filter(|(_, (op, _))| *op == "vaddsd")
+                .collect();
+            assert_eq!(leaf_adds.len(), 1, "depth={depth}\n{assembly}");
+            for (position, (_, operands)) in leaf_adds {
+                let (displacement, address) = operands.split_once('(').unwrap();
+                assert!(
+                    displacement
+                        .strip_prefix('-')
+                        .unwrap_or(displacement)
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit())
+                );
+                let (address, registers) = address.split_once(')').unwrap();
+                let parts: Vec<_> = address.split(',').collect();
+                assert!(parts.len() == 2 || parts.len() == 3);
+                for register in &parts[..2] {
+                    let register = register.strip_prefix('%').unwrap();
+                    assert!(!register.is_empty());
+                    assert!(
+                        register
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                    );
+                }
+                if parts.len() == 3 {
+                    assert!(["1", "2", "4", "8"].contains(&parts[2]));
+                }
+                assert!(registers.starts_with(", %xmm"), "depth={depth}\n{assembly}");
+                if position != 0 {
+                    let (op, operands) = instructions[position - 1];
+                    assert!(
+                        !(op == "vmovsd"
+                            && operands
+                                .split_once(')')
+                                .is_some_and(|(_, registers)| registers.starts_with(", %xmm"))),
+                        "separate leaf load: depth={depth}\n{assembly}"
+                    );
+                }
+            }
+            for forbidden in [
+                "ucomisd", "vucomisd", "cmpltpd", "vcmpltpd", "psllq", "pshufd",
+            ] {
+                assert!(
+                    !instructions.iter().any(|(op, _)| *op == forbidden),
+                    "{forbidden}: depth={depth}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn avx2_leaf_blocks_are_unpermuted() {
+        let context = Context::create();
+        Target::initialize_all(&InitializationConfig::default());
+        let model = tree_major_model(&[0, 1, 3, 5, 6, 8]);
+        let plan = plan(&model, tree_major_options(2)).unwrap();
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"] {
+            let (module, _) = prepare_module(
+                &context,
+                &plan,
+                &TargetTriple::create(triple),
+                EmitOptions { avx2: true },
+            )
+            .unwrap();
+            let mut expected: Vec<_> = plan.predicates().iter().map(|p| p.threshold).collect();
+            expected.resize(expected.len().next_multiple_of(8), 0.0);
+            for tree in model.trees() {
+                if triple == "aarch64-apple-darwin" && !tree.selections.is_empty() {
+                    expected.extend(permuted_leaves(tree).1);
+                } else {
+                    expected.extend(&tree.leafs);
+                }
+            }
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|value| context.f64_type().const_float(value))
+                .collect();
+            let actual = module
+                .get_global("constants")
+                .unwrap()
+                .get_initializer()
+                .unwrap()
+                .into_array_value();
+            assert_eq!(actual.get_type().len() as usize, expected.len());
+            assert_eq!(actual, context.f64_type().const_array(&expected));
+        }
+    }
+
+    #[test]
+    fn emit_options_from_host_matches_llvm() {
+        assert_eq!(
+            EmitOptions::from_host().avx2,
+            TargetMachine::get_host_cpu_features()
+                .to_string()
+                .split(',')
+                .any(|f| f == "+avx2"),
+        );
+        assert!(!EmitOptions::default().avx2);
     }
 
     fn mixed_depth_model() -> Trees {
@@ -1151,7 +1587,13 @@ mod tests {
         }
         assert_eq!(first_use.len(), plan.predicates().len());
         assert_ne!(first_use, (0..plan.predicates().len()).collect::<Vec<_>>());
-        let module = emit_plan(&context, &plan, &TargetMachine::get_default_triple()).unwrap();
+        let module = emit_plan(
+            &context,
+            &plan,
+            &TargetMachine::get_default_triple(),
+            TreePath::Lanes2,
+        )
+        .unwrap();
         module.verify().unwrap();
         assert_eq!(module.get_globals().count(), 1);
         let constants = module.get_global("constants").unwrap();
@@ -1188,8 +1630,13 @@ mod tests {
         assert_eq!(plan.chunks().len(), 1);
         Target::initialize_all(&InitializationConfig::default());
         for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
-            let (module, _) =
-                prepare_module(&context, &plan, &TargetTriple::create(triple)).unwrap();
+            let (module, _) = prepare_module(
+                &context,
+                &plan,
+                &TargetTriple::create(triple),
+                EmitOptions::default(),
+            )
+            .unwrap();
             assert_eq!(module.get_functions().count(), 2);
             let wrapper = module.get_function("predict").unwrap();
             assert_eq!(wrapper.count_params(), 1);
@@ -1239,7 +1686,13 @@ mod tests {
         for (triple, pointer_count) in
             [("x86_64-unknown-linux-gnu", 2), ("aarch64-apple-darwin", 3)]
         {
-            let module = emit_plan(&context, &plan, &TargetTriple::create(triple)).unwrap();
+            let module = emit_plan(
+                &context,
+                &plan,
+                &TargetTriple::create(triple),
+                TreePath::Lanes2,
+            )
+            .unwrap();
             module.verify().unwrap();
             let constants = module.get_global("constants").unwrap();
             let entries = constants
@@ -1462,7 +1915,13 @@ mod tests {
             )
             .unwrap();
             let plan = plan(&model, SortOptions::default()).unwrap();
-            let module = emit_plan(&context, &plan, &TargetMachine::get_default_triple()).unwrap();
+            let module = emit_plan(
+                &context,
+                &plan,
+                &TargetMachine::get_default_triple(),
+                TreePath::Lanes2,
+            )
+            .unwrap();
             module.verify().unwrap();
             let constants = module.get_global("constants").unwrap();
             let expected = if empty {
@@ -1549,7 +2008,13 @@ mod tests {
                 .min()
                 .unwrap();
             for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
-                let module = emit_plan(&context, &plan, &TargetTriple::create(triple)).unwrap();
+                let module = emit_plan(
+                    &context,
+                    &plan,
+                    &TargetTriple::create(triple),
+                    TreePath::Lanes2,
+                )
+                .unwrap();
                 module.verify().unwrap();
                 let function = module.get_function("continuation0").unwrap();
                 let compare = function
@@ -1718,6 +2183,7 @@ mod tests {
                 )
                 .unwrap(),
                 &TargetMachine::get_default_triple(),
+                TreePath::Lanes2,
             )
             .unwrap();
             module.verify().unwrap();
@@ -1752,6 +2218,7 @@ mod tests {
             &context,
             &plan(&model, SortOptions::default()).unwrap(),
             &TargetMachine::get_default_triple(),
+            TreePath::Lanes2,
         )
         .unwrap();
         module.verify().unwrap();
@@ -1819,7 +2286,13 @@ mod tests {
             )
             .unwrap();
             assert!(plan.chunks().len() > 1);
-            let module = emit_plan(&context, &plan, &TargetMachine::get_default_triple()).unwrap();
+            let module = emit_plan(
+                &context,
+                &plan,
+                &TargetMachine::get_default_triple(),
+                TreePath::Lanes2,
+            )
+            .unwrap();
             module.verify().unwrap();
             assert_eq!(module.get_functions().count(), plan.chunks().len() + 1);
             let first = module.get_function("continuation0").unwrap();

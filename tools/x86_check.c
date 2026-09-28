@@ -56,6 +56,7 @@ static int read_manifest(const char *directory, size_t *features, size_t *rows) 
     char line[512];
     int have_features = 0;
     int have_rows = 0;
+    int have_avx2 = 0;
     int variants = 0;
     int valid = 1;
     while (fgets(line, sizeof(line), file) != NULL) {
@@ -79,6 +80,15 @@ static int read_manifest(const char *directory, size_t *features, size_t *rows) 
                 break;
             }
             have_rows = 1;
+            continue;
+        }
+        if (strncmp(line, "avx2 ", 5) == 0) {
+            if (have_avx2 || (strcmp(line, "avx2 0\n") != 0 && strcmp(line, "avx2 1\n") != 0 &&
+                             strcmp(line, "avx2 0") != 0 && strcmp(line, "avx2 1") != 0)) {
+                valid = 0;
+                break;
+            }
+            have_avx2 = 1;
             continue;
         }
         if (strncmp(line, "variant ", 8) == 0 && line[8] != '\0' && line[8] != '\n') {

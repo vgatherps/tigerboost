@@ -1,6 +1,6 @@
 use inkwell::context::Context;
 use std::num::NonZeroUsize;
-use tigerboost::jit::compile;
+use tigerboost::jit::{EmitOptions, compile, compile_with};
 use tigerboost::parsed_tree::{
     Discriminator, FeatureIndex, NanMode, RowLengthError, SingleTree, Trees,
 };
@@ -17,6 +17,49 @@ fn indexed_tree(selections: Vec<Discriminator>) -> SingleTree {
     SingleTree {
         leafs: (0..1usize << selections.len()).map(|i| i as f64).collect(),
         selections,
+    }
+}
+
+#[test]
+fn tree_major_host_options_match_default() {
+    let context = Context::create();
+    let model = Trees::new(
+        [0, 1, 3, 5, 6, 8]
+            .into_iter()
+            .map(|depth| {
+                indexed_tree(
+                    (0..depth)
+                        .map(|level| split(level % 3, level as f64 - 2.0))
+                        .collect(),
+                )
+            })
+            .collect(),
+        vec![NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue],
+        2.5,
+        -3.0,
+    )
+    .unwrap();
+    let plan = plan(
+        &model,
+        SortOptions {
+            order: Order::TreeMajor {
+                chunk_trees: NonZeroUsize::new(2).unwrap(),
+            },
+            ..SortOptions::default()
+        },
+    )
+    .unwrap();
+    let original = compile(&context, &plan).unwrap();
+    let from_host = compile_with(&context, &plan, EmitOptions::from_host()).unwrap();
+    for row in [
+        [f64::NAN; 3],
+        [f64::NEG_INFINITY; 3],
+        [f64::INFINITY; 3],
+        [-0.0, 0.0, 1.0],
+        [3.0, 2.0, -1.0],
+    ] {
+        assert_eq!(from_host.predict(&row), original.predict(&row));
+        assert_eq!(from_host.predict(&row), model.predict(&row));
     }
 }
 

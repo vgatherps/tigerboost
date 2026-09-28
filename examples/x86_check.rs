@@ -9,11 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 use support::{ROWS, Workload};
-use tigerboost::jit::{compile, emit_assembly};
+use tigerboost::jit::{EmitOptions, compile, emit_assembly_with};
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
 use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
 
-const USAGE: &str = "usage: x86_check <workload> <fresh-output-dir>";
+const USAGE: &str = "usage: x86_check <workload> <fresh-output-dir> [--avx2]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkloadChoice {
@@ -192,7 +192,12 @@ fn write_f64s(path: &Path, values: impl IntoIterator<Item = f64>) -> Result<(), 
     Ok(())
 }
 
-fn write_outputs(output: &Path, model: &Trees, rows: &[Vec<f64>]) -> Result<(), Box<dyn Error>> {
+fn write_outputs(
+    output: &Path,
+    model: &Trees,
+    rows: &[Vec<f64>],
+    emit_options: EmitOptions,
+) -> Result<(), Box<dyn Error>> {
     assert_eq!(rows.len(), ROWS);
     let expected = reference_scores(model, rows)?;
     let feature_count = model.feature_modes().len();
@@ -209,7 +214,7 @@ fn write_outputs(output: &Path, model: &Trees, rows: &[Vec<f64>]) -> Result<(), 
                 "native {name} mismatch at row {row}"
             );
         }
-        let assembly = emit_assembly(&context, &plan, "x86_64-apple-darwin")?;
+        let assembly = emit_assembly_with(&context, &plan, "x86_64-apple-darwin", emit_options)?;
         let assembly = assembly.trim_end_matches('\0');
         assert!(
             !assembly.as_bytes().contains(&0),
@@ -230,6 +235,7 @@ fn write_outputs(output: &Path, model: &Trees, rows: &[Vec<f64>]) -> Result<(), 
     let mut manifest = File::create_new(&manifest_path)?;
     writeln!(manifest, "features {feature_count}")?;
     writeln!(manifest, "rows {ROWS}")?;
+    writeln!(manifest, "avx2 {}", u8::from(emit_options.avx2))?;
     for (name, _) in variants() {
         writeln!(manifest, "variant {name}")?;
     }
@@ -241,11 +247,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let choice = parse_workload(&arguments.next().ok_or(USAGE)?)?;
     let output = PathBuf::from(arguments.next().ok_or(USAGE)?);
+    let avx2 = match arguments.next().as_deref() {
+        None => false,
+        Some("--avx2") => true,
+        Some(_) => return Err(USAGE.into()),
+    };
     if arguments.next().is_some() {
         return Err(USAGE.into());
     }
     let (model, rows) = workload(choice);
-    write_outputs(&output, &model, &rows)
+    write_outputs(&output, &model, &rows, EmitOptions { avx2 })
 }
 
 #[cfg(test)]
@@ -315,7 +326,7 @@ mod tests {
     fn outputs_have_the_documented_sizes_and_symbols() {
         let directory = TempDirectory::new();
         let (model, rows) = support::workload(Workload::Distinct(5, 8));
-        write_outputs(&directory.0, &model, &rows).unwrap();
+        write_outputs(&directory.0, &model, &rows, EmitOptions::default()).unwrap();
         assert_eq!(
             fs::metadata(directory.0.join("rows.bin")).unwrap().len(),
             256 * 8 * 8
@@ -327,6 +338,7 @@ mod tests {
             256 * 8
         );
         let manifest = fs::read_to_string(directory.0.join("manifest.txt")).unwrap();
+        assert_eq!(manifest.lines().filter(|line| *line == "avx2 0").count(), 1);
         assert_eq!(
             manifest
                 .lines()
@@ -343,6 +355,32 @@ mod tests {
                     .windows("_predict".len())
                     .any(|window| window == b"_predict")
             );
+        }
+    }
+
+    #[test]
+    fn avx2_outputs_record_options_and_emit_vector_compares() {
+        let directory = TempDirectory::new();
+        let (model, rows) = support::workload(Workload::Distinct(5, 8));
+        write_outputs(&directory.0, &model, &rows, EmitOptions { avx2: true }).unwrap();
+        let manifest = fs::read_to_string(directory.0.join("manifest.txt")).unwrap();
+        assert_eq!(manifest.lines().filter(|line| *line == "avx2 1").count(), 1);
+        let context = Context::create();
+        for (name, options) in variants() {
+            let assembly = fs::read_to_string(directory.0.join(format!("{name}.s"))).unwrap();
+            let plan = plan(&model, options).unwrap();
+            let expected = emit_assembly_with(
+                &context,
+                &plan,
+                "x86_64-apple-darwin",
+                EmitOptions { avx2: true },
+            )
+            .unwrap();
+            assert_eq!(assembly, expected.trim_end_matches('\0'));
+            if matches!(options.order, Order::TreeMajor { .. }) {
+                assert_eq!(assembly.matches("vcmpgt_oqpd").count(), 10);
+                assert_eq!(assembly.matches("vmovmskpd").count(), 10);
+            }
         }
     }
 
