@@ -238,6 +238,34 @@ What it says:
   continuations provided), constants base laundered through the fence (pairing), volatile
   features, Belady residency across fences.
 
+## Cross-boundary feature reuse: six attempts, all rejected on ARM64 time
+
+Each row below changed several things at once, so none isolates one cause. They are recorded as
+evidence, not as clean ablations. ARM64 hot medians at 100 / 300 trees against the continuation
+kernel measured in the same run. Full reports are the `VERDICT_*` files named.
+
+| attempt | what it bundled | row loads (100 trees) | ARM64 stack ops | hot vs continuation |
+|---|---|---:|---:|---|
+| fenced window (`VERDICT_fenced_astra`) | one function, memory-clobber fence, no early-cse, reuse window | 298 (W16) | 265 | slower |
+| residency round 1 (`VERDICT_residency_astra`) | one function, volatile features, Belady K, no early-cse | 338 (K16) | 136 | +13 to 15% |
+| round 2 (`VERDICT_residency_round2_astra`) | + memory-clobber fence per chunk, laundered pointers, visit-order leaves | – | spills at K1 | never faster |
+| round 3 (`VERDICT_all_volatile_astra`) | every load volatile and emitter-placed | – | spills every K | slower |
+| round 4 (`VERDICT_barrier_residency_astra`) | ordinary loads, no-clobber barrier, Belady K, no early-cse, visit-order leaves | 376 (K8) | 119, spills at K1 | not faster |
+| source-order scheduling (`VERDICT_scheduler_options_sol`) | one function, ordinary loads, early-cse on, `-pre-RA-sched=source`, misched off | 99 | 282 | 103.5 vs 90.2 |
+| carried vectors (`VERDICT_carried_vectors_astra`) | continuations, features and sums packed in `<2 x double>` arguments | 296 | 11 | 99.2 vs 92.0 |
+
+Common result: every approach cut row loads, and every one paid it back in spills, register
+copies, lost `ldp` pairing or pack/extract instructions, because each avoided load was a single
+L1-hit instruction. In one function, `early-cse` merges each feature's loads into one value for
+the whole kernel (99 loads) and the resulting long live ranges are what spill; scheduler options
+reduce but do not remove that. The cheap reuse that pays is grouping trees that share features into
+the same chunk (`TreeOrdering::SharedFeatures`), the fastest ARM64 kernel measured: 233.9 ns at
+300 trees vs 248.7 in model order. x86 AVX2 with the round-4 barrier at K8 had fewer loads and
+instructions than the continuation kernel and no spills; untimed natively.
+
+A single-variable test of carrying up to six features as plain `double` continuation arguments
+(no packing) is running on branch `impl/scalar-carry`.
+
 ## Open
 
 - Default order: stay scalar, or tree-major 8 (spill-free) / 16 (fastest)? Maintainer decision.
