@@ -263,8 +263,19 @@ the same chunk (`TreeOrdering::SharedFeatures`), the fastest ARM64 kernel measur
 300 trees vs 248.7 in model order. x86 AVX2 with the round-4 barrier at K8 had fewer loads and
 instructions than the continuation kernel and no spills; untimed natively.
 
-A single-variable test of carrying up to six features as plain `double` continuation arguments
-(no packing) is running on branch `impl/scalar-carry`.
+Single-variable test (`VERDICT_scalar_carry_astra`): carrying up to six already-loaded features as
+plain `double` continuation arguments, nothing else changed. ARM64 hot, 100 / 300 trees:
+
+| kernel | instructions | row loads | hot ns |
+|---|---:|---:|---:|
+| continuation, model order | 2143 | 429 | 88.4 / 239.8 |
+| + carry 6 | 2195 | 374 | 88.6 / 239.0 |
+| continuation, shared-feature order | 2086 | 332 | 85.3 / 228.2 |
+| + carry 6 | 2112 | 279 | 87.1 / 236.8 |
+
+Each carried feature saves one row load and costs about one register move (the allocator shuffles
+incoming arguments into place). Neutral in model order, slower in shared order. Decision: the
+kernel is continuations + shared-feature order, 8 trees per chunk, 2 sums, with no other option.
 
 ## Open
 
