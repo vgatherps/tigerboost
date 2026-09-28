@@ -1,6 +1,9 @@
 //! Single-call prediction latency with cache and code disturbance.
+#[path = "support/bench.rs"]
+mod bench;
 mod support;
 
+use bench::{next_row, verify};
 use inkwell::context::Context;
 use std::{
     error::Error,
@@ -12,7 +15,6 @@ use std::{
 };
 use support::{ROWS, Workload, workload};
 use tigerboost::jit::{CompiledModel, compile};
-use tigerboost::parsed_tree::Trees;
 use tigerboost::sort_policy::{SortOptions, plan};
 
 const DEFAULT_SAMPLES: usize = 10_000;
@@ -90,35 +92,6 @@ fn shuffled_rows() -> [usize; ROWS] {
     let mut state = 0x434f4c44524f5753;
     shuffle(&mut rows, &mut state);
     rows
-}
-
-fn next_row(index: usize, prediction: f64) -> usize {
-    (index + (prediction as usize | 1)) & (ROWS - 1)
-}
-
-fn verify(model: &Trees, compiled: &CompiledModel<'_>, rows: &[Vec<f64>]) -> (Vec<f64>, usize) {
-    let scores: Vec<_> = rows.iter().map(|row| model.predict(row).unwrap()).collect();
-    for (row, &score) in rows.iter().zip(&scores) {
-        assert_eq!(compiled.predict(row).unwrap(), score);
-    }
-    let (mut reference, mut jit, mut floor) = (0, 0, 0);
-    let mut visited = [false; ROWS];
-    for _ in 0..VERIFY_CALLS {
-        assert_eq!((reference, reference), (jit, floor));
-        visited[reference] = true;
-        reference = next_row(reference, model.predict(&rows[reference]).unwrap());
-        jit = next_row(jit, compiled.predict(&rows[jit]).unwrap());
-        floor = next_row(floor, scores[floor]);
-    }
-    assert_eq!((reference, reference), (jit, floor));
-    let distinct = visited.into_iter().filter(|&seen| seen).count();
-    assert!(distinct > 1, "dependent chain must visit varied rows");
-    assert_ne!(
-        reference,
-        next_row(reference, scores[reference]),
-        "dependent chain settled on one row"
-    );
-    (scores, distinct)
 }
 
 #[derive(Clone, Copy)]
@@ -413,7 +386,7 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
     let feature_count = model.feature_modes().len();
     let context = Context::create();
     let compiled = compile(&context, &plan(&model, SortOptions::default())?)?;
-    let (scores, distinct_rows) = verify(&model, &compiled, &rows);
+    let (scores, distinct_rows) = verify(&model, &compiled, &rows, VERIFY_CALLS);
     let timer_resolution_ns = timer_resolution()?;
     for call in 0..config.warmup_calls {
         black_box(
@@ -603,7 +576,7 @@ mod tests {
         let (model, rows) = workload(Workload::Distinct(20, 30));
         let context = Context::create();
         let compiled = compile(&context, &plan(&model, SortOptions::default()).unwrap()).unwrap();
-        let (scores, _) = verify(&model, &compiled, &rows);
+        let (scores, _) = verify(&model, &compiled, &rows, VERIFY_CALLS);
         assert_eq!(scores.len(), ROWS);
         for (row, score) in rows.iter().zip(scores) {
             assert_eq!(score, model.predict(row).unwrap());

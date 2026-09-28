@@ -1,44 +1,17 @@
 //! Synthetic dependent-call timings, including the row-selection driver.
+#[path = "support/bench.rs"]
+mod bench;
 mod support;
 
+use bench::{next_row, verify};
 use inkwell::context::Context;
 use std::{error::Error, hint::black_box, num::NonZeroUsize, time::Instant};
 use support::{ROWS, Workload, workload};
-use tigerboost::jit::{CompiledModel, compile};
-use tigerboost::parsed_tree::Trees;
+use tigerboost::jit::compile;
 use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions, plan};
 
 const CALLS: usize = 50_000;
 const ROUNDS: usize = 5;
-
-fn next_row(index: usize, prediction: f64) -> usize {
-    (index + (prediction as usize | 1)) & (ROWS - 1)
-}
-
-fn verify(model: &Trees, compiled: &CompiledModel<'_>, rows: &[Vec<f64>]) -> (Vec<f64>, usize) {
-    let scores: Vec<_> = rows.iter().map(|row| model.predict(row).unwrap()).collect();
-    for (row, &score) in rows.iter().zip(&scores) {
-        assert_eq!(compiled.predict(row).unwrap(), score);
-    }
-    let (mut reference, mut jit, mut floor) = (0, 0, 0);
-    let mut visited = [false; ROWS];
-    for _ in 0..CALLS {
-        assert_eq!((reference, reference), (jit, floor));
-        visited[reference] = true;
-        reference = next_row(reference, model.predict(&rows[reference]).unwrap());
-        jit = next_row(jit, compiled.predict(&rows[jit]).unwrap());
-        floor = next_row(floor, scores[floor]);
-    }
-    assert_eq!((reference, reference), (jit, floor));
-    let distinct = visited.into_iter().filter(|&seen| seen).count();
-    assert!(distinct > 1, "dependent chain must visit varied rows");
-    assert_ne!(
-        reference,
-        next_row(reference, scores[reference]),
-        "dependent chain settled on one row"
-    );
-    (scores, distinct)
-}
 
 fn measure(predict: impl Fn(usize) -> f64, calls: usize) -> f64 {
     let mut index = 0;
@@ -100,9 +73,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             compile_ms,
         ));
     }
-    let (scores, distinct) = verify(&model, &kernels[0].1, &rows);
+    let (scores, distinct) = verify(&model, &kernels[0].1, &rows, CALLS);
     for (_, compiled, _) in &kernels[1..] {
-        verify(&model, compiled, &rows);
+        verify(&model, compiled, &rows, CALLS);
     }
     let reference = |index: usize| model.predict(black_box(rows[index].as_slice())).unwrap();
     let floor = |index| scores[index];
@@ -179,7 +152,7 @@ mod tests {
         let (model, rows) = workload(Workload::Mixed);
         let context = Context::create();
         let compiled = compile(&context, &plan(&model, SortOptions::default()).unwrap()).unwrap();
-        let (scores, distinct) = verify(&model, &compiled, &rows);
+        let (scores, distinct) = verify(&model, &compiled, &rows, CALLS);
         assert_eq!(scores.len(), ROWS);
         assert!(distinct > 1);
     }
@@ -236,7 +209,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            let (_, distinct) = verify(&model, &compiled, &rows);
+            let (_, distinct) = verify(&model, &compiled, &rows, CALLS);
             assert!(distinct > 1, "{kind:?}");
         }
     }
