@@ -1,4 +1,4 @@
-use crate::parsed_tree::{NanMode, RowLengthError, SingleTree};
+use crate::parsed_tree::{FeatureIndex, NanMode, RowLengthError, SingleTree};
 use crate::sort_policy::{Action, Comparison, Plan};
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::context::Context;
@@ -9,6 +9,7 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
 };
+use inkwell::types::IntType;
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, FastMathFlags, FloatValue, PointerValue,
 };
@@ -465,41 +466,8 @@ fn emit_plan<'ctx>(
             match action {
                 Action::Admit(tree) => indices[tree.0] = Some(zero),
                 Action::Load { value: id, feature } => {
-                    // SAFETY: Trees validates the feature index and row byte span;
-                    // CompiledModel::predict checks that the caller supplies that span.
-                    let address = unsafe {
-                        builder.build_in_bounds_gep(
-                            f64_type,
-                            row,
-                            &[index_type.const_int(feature.0 as u64, false)],
-                            "feature_ptr",
-                        )?
-                    };
-                    let loaded = builder.build_load(f64_type, address, "feature")?;
-                    loaded.as_instruction_value().unwrap().set_alignment(8)?;
-                    let mut value = loaded.into_float_value();
                     let mode = model.feature_modes()[feature.0];
-                    if mode != NanMode::AsIs {
-                        let is_nan = builder.build_float_compare(
-                            FloatPredicate::UNO,
-                            value,
-                            value,
-                            "is_nan",
-                        )?;
-                        let replacement = if mode == NanMode::AsFalse {
-                            f64::NEG_INFINITY
-                        } else {
-                            f64::INFINITY
-                        };
-                        value = builder
-                            .build_select(
-                                is_nan,
-                                f64_type.const_float(replacement),
-                                value,
-                                "nan_value",
-                            )?
-                            .into_float_value();
-                    }
+                    let value = load_feature(&builder, f64_type, index_type, row, *feature, mode)?;
                     assert_eq!(id.0, loaded_features.len(), "feature value loaded twice");
                     loaded_features.push(Some(value));
                 }
@@ -659,41 +627,8 @@ fn emit_plan<'ctx>(
                                 first_value.expect("padding follows a real level")
                             } else {
                                 let feature = plan.predicates()[predicate.0].feature_idx;
-                                // SAFETY: Trees validates features; predict checks the row span.
-                                let address = unsafe {
-                                    builder.build_in_bounds_gep(
-                                        f64_type,
-                                        row,
-                                        &[index_type.const_int(feature.0 as u64, false)],
-                                        "feature_ptr",
-                                    )?
-                                };
-                                let loaded = builder.build_load(f64_type, address, "feature")?;
-                                loaded.as_instruction_value().unwrap().set_alignment(8)?;
-                                let mut value = loaded.into_float_value();
                                 let mode = model.feature_modes()[feature.0];
-                                if mode != NanMode::AsIs {
-                                    let is_nan = builder.build_float_compare(
-                                        FloatPredicate::UNO,
-                                        value,
-                                        value,
-                                        "is_nan",
-                                    )?;
-                                    let replacement = if mode == NanMode::AsFalse {
-                                        f64::NEG_INFINITY
-                                    } else {
-                                        f64::INFINITY
-                                    };
-                                    value = builder
-                                        .build_select(
-                                            is_nan,
-                                            f64_type.const_float(replacement),
-                                            value,
-                                            "nan_value",
-                                        )?
-                                        .into_float_value();
-                                }
-                                value
+                                load_feature(&builder, f64_type, index_type, row, feature, mode)?
                             };
                             if lane == 0 {
                                 first_value = Some(value);
@@ -803,41 +738,8 @@ fn emit_plan<'ctx>(
                                 first_value.expect("padding follows a real level")
                             } else {
                                 let feature = plan.predicates()[predicate.0].feature_idx;
-                                // SAFETY: Trees validates features; predict checks the row span.
-                                let address = unsafe {
-                                    builder.build_in_bounds_gep(
-                                        f64_type,
-                                        row,
-                                        &[index_type.const_int(feature.0 as u64, false)],
-                                        "feature_ptr",
-                                    )?
-                                };
-                                let loaded = builder.build_load(f64_type, address, "feature")?;
-                                loaded.as_instruction_value().unwrap().set_alignment(8)?;
-                                let mut value = loaded.into_float_value();
                                 let mode = model.feature_modes()[feature.0];
-                                if mode != NanMode::AsIs {
-                                    let is_nan = builder.build_float_compare(
-                                        FloatPredicate::UNO,
-                                        value,
-                                        value,
-                                        "is_nan",
-                                    )?;
-                                    let replacement = if mode == NanMode::AsFalse {
-                                        f64::NEG_INFINITY
-                                    } else {
-                                        f64::INFINITY
-                                    };
-                                    value = builder
-                                        .build_select(
-                                            is_nan,
-                                            f64_type.const_float(replacement),
-                                            value,
-                                            "nan_value",
-                                        )?
-                                        .into_float_value();
-                                }
-                                value
+                                load_feature(&builder, f64_type, index_type, row, feature, mode)?
                             };
                             if lane == 0 {
                                 first_value = Some(value);
@@ -1024,6 +926,46 @@ fn emit_plan<'ctx>(
         }
     }
     Ok(module)
+}
+
+fn load_feature<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    f64_type: inkwell::types::FloatType<'ctx>,
+    index_type: IntType<'ctx>,
+    row: PointerValue<'ctx>,
+    feature: FeatureIndex,
+    mode: NanMode,
+) -> CompileResult<FloatValue<'ctx>> {
+    // SAFETY: Trees validates the feature index and row byte span;
+    // CompiledModel::predict checks that the caller supplies that span.
+    let address = unsafe {
+        builder.build_in_bounds_gep(
+            f64_type,
+            row,
+            &[index_type.const_int(feature.0 as u64, false)],
+            "feature_ptr",
+        )?
+    };
+    let loaded = builder.build_load(f64_type, address, "feature")?;
+    loaded.as_instruction_value().unwrap().set_alignment(8)?;
+    let mut value = loaded.into_float_value();
+    if mode != NanMode::AsIs {
+        let is_nan = builder.build_float_compare(FloatPredicate::UNO, value, value, "is_nan")?;
+        let replacement = if mode == NanMode::AsFalse {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+        value = builder
+            .build_select(
+                is_nan,
+                f64_type.const_float(replacement),
+                value,
+                "nan_value",
+            )?
+            .into_float_value();
+    }
+    Ok(value)
 }
 
 fn raw_of(pattern: u32, pairs: usize) -> i64 {
