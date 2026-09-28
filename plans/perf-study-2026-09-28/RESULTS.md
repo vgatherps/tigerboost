@@ -89,6 +89,20 @@ no information (see `ROSETTA_AVX2_RESEARCH.md`); native ARM64 remains the semant
 | tree-major 4 per chunk, SSE2 (generic) | 2332 | 23.3 | `cmpltpd` register operand, shift/or packing |
 | tree-major 4 per chunk, AVX2 (`EmitOptions { avx2: true }`) | 1486 | 14.9 | `vcmpgt_oqpd` memory operand, `vmovmskpd` |
 
+### Rosetta 2 wall-clock (translator speed, not x86 speed)
+
+100 trees, dependent calls, best of five rounds of 200,000, ns per call, `arch -x86_64` on the M4 Pro.
+
+| kernel | SSE2 build | AVX2 build | native ARM64, same shape |
+|---|---:|---:|---:|
+| scalar default (GP12/FP9, 2 sums) | 168.5 | 190.7 | 91.9 |
+| tree-major, 4 per chunk | 107.9 | 408.8 | 92.5 |
+| tree-major, 8 per chunk | 105.9 | 402.6 | 86.8 |
+
+Rosetta's SSE2 translation lands within 1.2x of native ARM64 for the tree-major kernel and keeps the
+scalar-versus-tree-major ordering. Its AVX2 translation is about 4x slower than its own SSE2 build,
+which says nothing about a real x86 core and is why no AVX2 speed claim exists.
+
 No native x86 timing exists. The llvm-mca estimate from the study (about 3x over scalar on Alder
 Lake, 1.7x on Zen 3) is the only performance indication for this path.
 
