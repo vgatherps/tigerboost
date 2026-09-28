@@ -1,0 +1,83 @@
+# Results of the 2026-09-28 experiments
+
+Apple M4 Pro, LLVM 21.1.8, generic target, offline release builds. Hot numbers are
+`scalar_bench` medians of five rounds of 50,000 dependent calls, ns per call including the
+~5.5 ns driver. Cold numbers are `cold_bench` per-call percentiles over shuffled rows, 5,000
+samples per condition, 41.7 ns timer ticks. Every kernel is checked against `Trees::predict` on all
+256 rows before timing. Runs were serial; load average 2 to 3.5 (a build from another project was
+running on the machine), so treat differences under about 3% as noise.
+
+## Step 1: constants block through a pointer argument (commit a487af0)
+
+| hot median, ns | 100 trees | 500 trees |
+|---|---:|---:|
+| before, scheduled GP12/FP9, 2 sums | 120.6 | 572 (historical) |
+| after, scheduled GP12/FP9, 2 sums | 92.1 | 433.4 |
+| after, scheduled GP4/FP9, 2 sums | 92.0 | 421.0 |
+
+| cold p50, ns (shuffled rows) | 100 trees before → after | 300 trees before → after |
+|---|---:|---:|
+| hot | 125 → 83 | 334 → 250 |
+| after 64 MiB read-modify-write | 791 → 500 | 2000 → 1917 |
+| after one call of a 2000-tree model | 292 → 208 | 917 → 708 |
+
+Static, 100 trees: ARM64 4453 → 2963 instructions (300 `ldp` threshold pairs, no continuation stack
+traffic); x86-64 4015 → 3330 (no `movabsq` to constants). Cold improved as well as hot: the code
+shrank from 17.8 KB to 11.9 KB and the 100 per-tree GOT loads disappeared, which outweighs the
+threshold lines the block adds.
+
+## Step 2: tree-major order (commit 97fb5b0), same run for every row
+
+| hot median, ns | 100 trees | 300 trees |
+|---|---:|---:|
+| scalar, scheduled GP12/FP9, 2 sums (default) | 91.9 | 260.5 |
+| scalar, scheduled GP4/FP9, 2 sums | 93.5 | 254.9 |
+| scalar, tree order, 2 sums | 96.3 | 266.7 |
+| tree-major, 2 trees per chunk | 96.4 | 262.6 |
+| tree-major, 4 trees per chunk | 92.5 | 252.4 |
+| tree-major, 8 trees per chunk | 86.8 | 236.6 |
+
+Second run, chunk sweep (scalar default measured again in the same run: 94.3 / 260.9):
+
+| tree-major, trees per chunk | 100 trees | 300 trees | ARM64 continuation stack accesses | x86 |
+|---|---:|---:|---:|---:|
+| 8 | 88.0 | 239.2 | 0 | 4 |
+| 16 | 86.5 | 230.6 | 43 | 188 |
+| 32 | 89.6 | 241.7 | 277 | 529 |
+| 64 | 87.0 | 237.5 | 371 | 753 |
+
+| cold p50 / p90 / p99, ns, 100 trees | scalar default | tree-major, 4 per chunk |
+|---|---|---|
+| hot | 83 / 125 / 125 | 83 / 125 / 125 |
+| after 16 MiB | 209 / 250 / 333 | 250 / 292 / 334 |
+| after 64 MiB | 792 / 916 / 2125 | 792 / 917 / 1625 |
+| after other-model call | 209 / 250 / 291 | 208 / 209 / 250 |
+
+| cold p50 / p90 / p99, ns, 300 trees | scalar default | tree-major, 4 per chunk |
+|---|---|---|
+| hot | 250 / 292 / 292 | 250 / 250 / 292 |
+| after 16 MiB | 584 / 625 / 750 | 666 / 792 / 1250 |
+| after 64 MiB | 2084 / 2250 / 6250 | 2125 / 2291 / 5833 |
+| after other-model call | 708 / 750 / 792 | 542 / 584 / 625 |
+
+Static, tree-major 4 per chunk, 100 trees: ARM64 2253 instructions (22.5 per tree; 300 `fcmgt.2d`,
+200 `sli`, 238 `ld1` lane loads, 106 `ldp q` + 88 `ldr q` threshold loads), x86-64 2332 (SSE2
+`cmpltpd`; the AVX2 `vcmpgt_oqpd` + `vmovmskpd` path is not built yet).
+
+## Reading
+
+- Tree-major at 8 trees per chunk is the largest spill-free configuration and is 6% (100 trees) to
+  9% (300 trees) faster hot than the scalar default; 16 per chunk is 8% / 12% faster with a few
+  spills. The reviews' prediction (8-12% headroom on NEON because the load pipes become the limit)
+  holds.
+- Cold is neutral: equal after 64 MiB, better after an other-model call (smaller code), slightly
+  worse after 16 MiB at 300 trees (one to two timer ticks).
+- The x86 side is untested at runtime; static counts fell 4015 → 2332 and the compare port cap
+  (`ucomisd` 1/cycle) is gone, which is where the larger gain is expected.
+
+## Open
+
+- Default order: stay scalar, or tree-major 8 (spill-free) / 16 (fastest)? Maintainer decision.
+- AVX2 emission for tree-major (memory-operand compare + `vmovmskpd`, 4+2 lanes).
+- Within-chunk feature reuse for lane fills (the study bounds it at 13-20% fewer load slots).
+- x86 execution evidence (Rosetta for correctness; a real host for timing).
