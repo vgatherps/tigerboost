@@ -131,6 +131,25 @@ Remaining load counts, 100 trees, 8 per chunk: ARM64 316 `ldr d` + 172 `ld1.d` f
 186 `ldp` (threshold pairs), 26 `ldr q`; x86 SSE2 292 `movsd` + 174 `movhpd`; AVX2 274 `vmovsd`
 + 161 `vmovhpd`. These are distinct features per chunk; no further reuse exists within a chunk.
 
+## Do continuations still help under tree-major?
+
+Chunk-size sweep on the tree-major kernel, 100 / 300 trees, hot medians under a load average of
+about 3.5 (indicative), plus exact static counts for 100 trees:
+
+| trees per chunk | hot 100 / 300 ns | ARM64 instr | ARM64 body stack accesses | x86 AVX2 instr | x86 AVX2 body stack accesses |
+|---|---:|---:|---:|---:|---:|
+| 8 | 91.4 / 254.6 | 2143 | 0 | 1451 | 0 |
+| 16 | 88.9 / 242.0 | 2133 | 43 | | |
+| 64 | 91.8 / 247.2 | | 371 | | |
+| one function | 90.4 / 244.3 | 2459 | 422 | 1868 | 733 |
+
+On the M4 the hot time does not change between eight trees per chunk and no chunking at all,
+although the unchunked kernel is 15% larger and makes 422 stack round trips: store-to-load
+forwarding hides them. Sixteen per chunk is the fastest point. The chunks therefore do not buy
+measured speed on ARM64; they keep the kernel spill-free and smaller, which matters for the cold
+case and for x86, where the unchunked AVX2 kernel grows 29% with 733 stack accesses and cannot be
+timed here. Keep chunking; 16 per chunk is the better default candidate.
+
 ## Open
 
 - Default order: stay scalar, or tree-major 8 (spill-free) / 16 (fastest)? Maintainer decision.
