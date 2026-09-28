@@ -10,18 +10,16 @@ use std::{
     fs::File,
     hint::black_box,
     io::{BufWriter, Write},
-    num::NonZeroUsize,
     path::PathBuf,
     time::Instant,
 };
-use support::{ROWS, Workload, workload};
+use support::{ROWS, Workload, random, workload};
 use tigerboost::jit::{CompiledModel, compile};
-use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
+use tigerboost::sort_policy::plan;
 
 const DEFAULT_SAMPLES: usize = 10_000;
 const VERIFY_CALLS: usize = 50_000;
-const USAGE: &str =
-    "usage: cold_bench <workload> [--samples N] [--out PATH] [--chunk-trees N] [--shared-features]";
+const USAGE: &str = "usage: cold_bench <workload> [--samples N] [--out PATH]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Arguments {
@@ -29,31 +27,14 @@ struct Arguments {
     workload_name: String,
     samples: usize,
     out: Option<PathBuf>,
-    chunk_trees: NonZeroUsize,
-    order: TreeOrdering,
-}
-
-fn parse_workload(name: &str) -> Result<Workload, &'static str> {
-    if let Ok(workload) = Workload::parse(name) {
-        return Ok(workload);
-    }
-    let (trees, features) = name.split_once('x').ok_or(USAGE)?;
-    let trees = trees.parse::<usize>().map_err(|_| USAGE)?;
-    let features = features.parse::<usize>().map_err(|_| USAGE)?;
-    if trees == 0 || features == 0 || trees > 10_922 {
-        return Err(USAGE);
-    }
-    Ok(Workload::Distinct(trees, features))
 }
 
 fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Arguments, &'static str> {
     let mut arguments = arguments.into_iter();
     let workload_name = arguments.next().ok_or(USAGE)?;
-    let workload = parse_workload(&workload_name)?;
+    let workload = Workload::parse(&workload_name).map_err(|_| USAGE)?;
     let mut samples = None;
     let mut out = None;
-    let mut chunk_trees = None;
-    let mut shared_features = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--samples" if samples.is_none() => {
@@ -67,10 +48,6 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
             "--out" if out.is_none() => {
                 out = Some(PathBuf::from(arguments.next().ok_or(USAGE)?));
             }
-            "--chunk-trees" if chunk_trees.is_none() => {
-                chunk_trees = Some(arguments.next().ok_or(USAGE)?.parse().map_err(|_| USAGE)?);
-            }
-            "--shared-features" if !shared_features => shared_features = true,
             _ => return Err(USAGE),
         }
     }
@@ -79,21 +56,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
         workload_name,
         samples: samples.unwrap_or(DEFAULT_SAMPLES),
         out,
-        chunk_trees: chunk_trees.unwrap_or(SortOptions::default().chunk_trees),
-        order: if shared_features {
-            TreeOrdering::SharedFeatures
-        } else {
-            TreeOrdering::Model
-        },
     })
-}
-
-fn random(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9e3779b97f4a7c15);
-    let mut value = *state;
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
-    value ^ (value >> 31)
 }
 
 fn shuffle<T>(values: &mut [T], state: &mut u64) {
@@ -269,8 +232,6 @@ struct Measurement {
 
 struct Report {
     workload_name: String,
-    chunk_trees: NonZeroUsize,
-    order: TreeOrdering,
     tree_count: usize,
     feature_count: usize,
     timer_resolution_ns: f64,
@@ -403,12 +364,7 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
     let tree_count = model.trees().len();
     let feature_count = model.feature_modes().len();
     let context = Context::create();
-    let options = SortOptions {
-        chunk_trees: arguments.chunk_trees,
-        order: arguments.order,
-        ..SortOptions::default()
-    };
-    let compiled = compile(&context, &plan(&model, options))?;
+    let compiled = compile(&context, &plan(&model))?;
     let (scores, distinct_rows) = verify(&model, &compiled, &rows, VERIFY_CALLS);
     let timer_resolution_ns = timer_resolution()?;
     for call in 0..config.warmup_calls {
@@ -423,7 +379,7 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
         config.other_trees,
         config.other_features,
     ));
-    let other = compile(&context, &plan(&other_model, SortOptions::default()))?;
+    let other = compile(&context, &plan(&other_model))?;
     let mut pollution = std::array::from_fn(|index| {
         PollutionBuffer::new(config.data_bytes[index], 0x504f4c4c5554494f ^ index as u64)
     });
@@ -447,8 +403,6 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
     }
     Ok(Report {
         workload_name: arguments.workload_name.clone(),
-        chunk_trees: arguments.chunk_trees,
-        order: arguments.order,
         tree_count,
         feature_count,
         timer_resolution_ns,
@@ -460,12 +414,8 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
 
 fn print_report(report: &Report) {
     println!(
-        "Workload {}: {} trees, depth 6, {} features, {ROWS} rows; tree-major, {} trees/chunk, {:?}",
-        report.workload_name,
-        report.tree_count,
-        report.feature_count,
-        report.chunk_trees,
-        report.order
+        "Workload {}: {} trees, {} features, {ROWS} rows; shared-feature order, 8 trees/chunk, 2 sums",
+        report.workload_name, report.tree_count, report.feature_count
     );
     println!(
         "timer resolution about {:.1} ns",
@@ -510,7 +460,7 @@ fn print_report(report: &Report) {
 
 fn write_csv(path: &PathBuf, report: &Report) -> Result<(), Box<dyn Error>> {
     let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(writer, "chunk_trees,condition,ns")?;
+    writeln!(writer, "condition,ns")?;
     for sequence in [RowSequence::Shuffled, RowSequence::Dependent] {
         for condition in Condition::ALL {
             let measurement = report
@@ -523,8 +473,7 @@ fn write_csv(path: &PathBuf, report: &Report) -> Result<(), Box<dyn Error>> {
             for sample in &measurement.samples {
                 writeln!(
                     writer,
-                    "{},{} {},{}",
-                    report.chunk_trees,
+                    "{} {},{}",
                     sequence.label(),
                     condition.label(),
                     sample
@@ -563,29 +512,14 @@ mod tests {
 
     #[test]
     fn cli_parses_named_and_generic_workloads() {
-        let defaults = arguments(&["100x100"]).unwrap();
-        assert_eq!(defaults.chunk_trees.get(), 8);
-        assert_eq!(defaults.order, TreeOrdering::Model);
-        assert_eq!(
-            arguments(&["100x100", "--shared-features"]).unwrap().order,
-            TreeOrdering::SharedFeatures
-        );
-        for (value, expected) in [("1", 1), ("4", 4), ("16", 16)] {
-            assert_eq!(
-                arguments(&["100x100", "--chunk-trees", value])
-                    .unwrap()
-                    .chunk_trees
-                    .get(),
-                expected
-            );
-        }
         for values in [
             vec!["100x100", "--chunk-trees"],
             vec!["100x100", "--chunk-trees", "other"],
             vec!["100x100", "--chunk-trees", "0"],
             vec!["100x100", "--chunk-trees", "-1"],
             vec!["100x100", "--chunk-trees", "4", "--chunk-trees", "8"],
-            vec!["100x100", "--shared-features", "--shared-features"],
+            vec!["100x100", "--shared-features"],
+            vec!["100x100", "--chunk-trees", "8"],
         ] {
             assert_eq!(arguments(&values), Err(USAGE));
         }
@@ -597,8 +531,23 @@ mod tests {
             arguments(&["300x100"]).unwrap().workload,
             Workload::Distinct(300, 100)
         );
-        assert_eq!(arguments(&["mixed"]).unwrap().workload, Workload::Mixed);
-        for invalid in ["0x5", "5x0", "abc", "20000x100"] {
+        for (name, kind) in [
+            ("special", Workload::Special),
+            ("depths", Workload::Depths),
+            ("depths2", Workload::Depths2),
+        ] {
+            assert_eq!(arguments(&[name]).unwrap().workload, kind);
+        }
+        for invalid in [
+            "0x5",
+            "5x0",
+            "abc",
+            "20000x100",
+            "mixed",
+            "reuse-heavy",
+            "disjoint",
+            "wide",
+        ] {
             assert_eq!(arguments(&[invalid]), Err(USAGE));
         }
     }
@@ -631,20 +580,11 @@ mod tests {
     fn verified_kernel_matches_reference_before_timing() {
         let (model, rows) = workload(Workload::Distinct(20, 30));
         let context = Context::create();
-        for order in [TreeOrdering::Model, TreeOrdering::SharedFeatures] {
-            for chunk_trees in [4, 8] {
-                let options = SortOptions {
-                    chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                    order,
-                    ..SortOptions::default()
-                };
-                let compiled = compile(&context, &plan(&model, options)).unwrap();
-                let (scores, _) = verify(&model, &compiled, &rows, VERIFY_CALLS);
-                assert_eq!(scores.len(), ROWS);
-                for (row, score) in rows.iter().zip(scores) {
-                    assert_eq!(score, model.predict(row).unwrap());
-                }
-            }
+        let compiled = compile(&context, &plan(&model)).unwrap();
+        let (scores, _) = verify(&model, &compiled, &rows, VERIFY_CALLS);
+        assert_eq!(scores.len(), ROWS);
+        for (row, score) in rows.iter().zip(scores) {
+            assert_eq!(score, model.predict(row).unwrap());
         }
     }
 
@@ -664,34 +604,29 @@ mod tests {
 
     #[test]
     fn one_sample_round_trip() {
-        for chunk_trees in ["4", "8"] {
-            let arguments =
-                arguments(&["5x8", "--samples", "20", "--chunk-trees", chunk_trees]).unwrap();
-            let report = benchmark(
-                &arguments,
-                BenchmarkConfig {
-                    data_bytes: [64, 128, 256, 512],
-                    other_trees: 5,
-                    other_features: 8,
-                    warmup_calls: 10,
-                },
-            )
-            .unwrap();
-            assert_eq!(report.chunk_trees.to_string(), chunk_trees);
-            assert_eq!(report.order, TreeOrdering::Model);
-            assert_eq!(report.measurements.len(), Condition::ALL.len() * 2);
-            for sequence in [RowSequence::Shuffled, RowSequence::Dependent] {
-                for condition in Condition::ALL {
-                    let matching: Vec<_> = report
-                        .measurements
-                        .iter()
-                        .filter(|measurement| {
-                            measurement.sequence == sequence && measurement.condition == condition
-                        })
-                        .collect();
-                    assert_eq!(matching.len(), 1);
-                    assert_eq!(matching[0].samples.len(), 20);
-                }
+        let arguments = arguments(&["5x8", "--samples", "20"]).unwrap();
+        let report = benchmark(
+            &arguments,
+            BenchmarkConfig {
+                data_bytes: [64, 128, 256, 512],
+                other_trees: 5,
+                other_features: 8,
+                warmup_calls: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.measurements.len(), Condition::ALL.len() * 2);
+        for sequence in [RowSequence::Shuffled, RowSequence::Dependent] {
+            for condition in Condition::ALL {
+                let matching: Vec<_> = report
+                    .measurements
+                    .iter()
+                    .filter(|measurement| {
+                        measurement.sequence == sequence && measurement.condition == condition
+                    })
+                    .collect();
+                assert_eq!(matching.len(), 1);
+                assert_eq!(matching[0].samples.len(), 20);
             }
         }
     }

@@ -1,8 +1,7 @@
 use inkwell::context::Context;
-use std::num::NonZeroUsize;
 use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
-use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
+use tigerboost::sort_policy::plan;
 
 fn next(state: &mut u64, limit: usize) -> usize {
     *state ^= *state >> 12;
@@ -65,30 +64,16 @@ fn seeded_forests_preserve_every_trees_leaf_index() {
                     .collect()
             })
             .collect();
-        let accumulators = NonZeroUsize::new([1, 2, 4][case / 32]).unwrap();
         let context = Context::create();
         let expected: Vec<_> = rows.iter().map(|row| model.predict(row).unwrap()).collect();
-        let mut kernels = Vec::new();
-        for order in [TreeOrdering::Model, TreeOrdering::SharedFeatures] {
-            for chunk_trees in [1, 3, 8] {
-                let options = SortOptions {
-                    chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                    accumulators,
-                    order,
-                };
-                let plan = plan(&model, options);
-                kernels.push((options, compile(&context, &plan).unwrap()));
-            }
-        }
+        let compiled = compile(&context, &plan(&model)).unwrap();
         drop(model);
-        for (options, compiled) in kernels {
-            for (row_index, row) in rows.iter().enumerate() {
-                assert_eq!(
-                    compiled.predict(row),
-                    Ok(expected[row_index]),
-                    "seed={seed:#x} case={case} options={options:?} row_index={row_index} row={row:?}"
-                );
-            }
+        for (row_index, row) in rows.iter().enumerate() {
+            assert_eq!(
+                compiled.predict(row),
+                Ok(expected[row_index]),
+                "seed={seed:#x} case={case} row_index={row_index} row={row:?}"
+            );
         }
     }
 }

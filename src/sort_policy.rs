@@ -1,4 +1,4 @@
-use std::{fmt, num::NonZeroUsize};
+use std::num::NonZeroUsize;
 
 use crate::parsed_tree::{Discriminator, Trees};
 
@@ -14,46 +14,12 @@ pub struct PredicateId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SumId(pub usize);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TreeOrdering {
-    Model,
-    SharedFeatures,
-}
-
-#[derive(Clone, Copy)]
-pub struct SortOptions {
-    pub chunk_trees: NonZeroUsize,
-    pub accumulators: NonZeroUsize,
-    pub order: TreeOrdering,
-}
-
-impl Default for SortOptions {
-    fn default() -> Self {
-        Self {
-            chunk_trees: NonZeroUsize::new(8).unwrap(),
-            accumulators: NonZeroUsize::new(2).unwrap(),
-            order: TreeOrdering::Model,
-        }
-    }
-}
-
-impl fmt::Debug for SortOptions {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut debug = formatter.debug_struct("SortOptions");
-        debug
-            .field("chunk_trees", &self.chunk_trees)
-            .field("accumulators", &self.accumulators);
-        if self.order != TreeOrdering::Model {
-            debug.field("order", &self.order);
-        }
-        debug.finish()
-    }
-}
+const CHUNK_TREES: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+const SUMS: usize = 2;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    Admit(TreeId),
-    Retire {
+    Constant {
         tree: TreeId,
         sum: SumId,
     },
@@ -100,12 +66,19 @@ impl Plan<'_> {
     }
 }
 
-pub fn plan(model: &Trees, options: SortOptions) -> Plan<'_> {
-    let sum_count = options.accumulators.get().min(model.trees().len().max(1));
-    let visit_order = match options.order {
-        TreeOrdering::Model => (0..model.trees().len()).map(TreeId).collect(),
-        TreeOrdering::SharedFeatures => shared_feature_order(model, options.chunk_trees),
-    };
+pub fn plan(model: &Trees) -> Plan<'_> {
+    build_plan(model, CHUNK_TREES, SUMS)
+}
+
+#[cfg(test)]
+pub(crate) fn plan_with(model: &Trees, chunk_trees: usize, sums: usize) -> Plan<'_> {
+    assert!(sums > 0);
+    build_plan(model, NonZeroUsize::new(chunk_trees).unwrap(), sums)
+}
+
+fn build_plan(model: &Trees, chunk_trees: NonZeroUsize, sums: usize) -> Plan<'_> {
+    let sum_count = sums.min(model.trees().len().max(1));
+    let visit_order = shared_feature_order(model, chunk_trees);
     let mut plan = tree_major(model, sum_count, &visit_order);
     for source in 1..sum_count {
         plan.actions.push(Action::AddSums {
@@ -118,7 +91,7 @@ pub fn plan(model: &Trees, options: SortOptions) -> Plan<'_> {
     } else {
         Action::ReturnScaled(SumId(0))
     });
-    plan.chunks = continuation::partition_trees(&plan, options.chunk_trees);
+    plan.chunks = continuation::partition_trees(&plan, chunk_trees);
     plan
 }
 
@@ -138,8 +111,7 @@ fn tree_major<'model>(
         let description = &trees.trees()[tree.0];
         let sum = SumId(visit_position % sum_count);
         if description.selections.is_empty() {
-            plan.actions.push(Action::Admit(tree));
-            plan.actions.push(Action::Retire { tree, sum });
+            plan.actions.push(Action::Constant { tree, sum });
         } else {
             let start = plan.predicates.len();
             plan.predicates

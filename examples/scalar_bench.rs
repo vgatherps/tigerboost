@@ -5,39 +5,13 @@ mod support;
 
 use bench::{next_row, verify};
 use inkwell::context::Context;
-use std::{error::Error, hint::black_box, num::NonZeroUsize, time::Instant};
+use std::{error::Error, hint::black_box, time::Instant};
 use support::{ROWS, Workload, workload};
-use tigerboost::jit::compile;
-use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
+use tigerboost::jit::{EmitOptions, compile, compile_with};
+use tigerboost::sort_policy::plan;
 
 const CALLS: usize = 50_000;
 const ROUNDS: usize = 5;
-
-fn tree_major_variants() -> impl Iterator<Item = (String, SortOptions)> {
-    let model = [4, 8, 16].into_iter().flat_map(|chunk_trees| {
-        [1, 2, 4].map(move |count| {
-            (
-                format!("Tree-major, {chunk_trees} trees/chunk, sums {count}"),
-                SortOptions {
-                    chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                    accumulators: NonZeroUsize::new(count).unwrap(),
-                    order: TreeOrdering::Model,
-                },
-            )
-        })
-    });
-    let shared = [8, 16].into_iter().map(|chunk_trees| {
-        (
-            format!("Tree-major, {chunk_trees} trees/chunk, sums 2, shared features"),
-            SortOptions {
-                chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                accumulators: NonZeroUsize::new(2).unwrap(),
-                order: TreeOrdering::SharedFeatures,
-            },
-        )
-    });
-    model.chain(shared)
-}
 
 fn measure(predict: impl Fn(usize) -> f64, calls: usize) -> f64 {
     let mut index = 0;
@@ -51,18 +25,20 @@ fn measure(predict: impl Fn(usize) -> f64, calls: usize) -> f64 {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
-    let choice = Workload::parse(arguments.next().as_deref().unwrap_or("mixed"))?;
+    let choice = Workload::parse(arguments.next().as_deref().unwrap_or("100x100"))?;
     if arguments.next().is_some() {
         return Err("usage: scalar_bench [workload]".into());
     }
     let (model, rows) = workload(choice);
     let context = Context::create();
-    let mut kernels = Vec::new();
-    for (label, options) in tree_major_variants() {
+    let start = Instant::now();
+    let plan = plan(&model);
+    let compiled = compile(&context, &plan)?;
+    let mut kernels = vec![("Kernel", compiled, start.elapsed().as_secs_f64() * 1e3)];
+    if cfg!(target_arch = "x86_64") && EmitOptions::from_host().avx2 {
         let start = Instant::now();
-        let compiled = compile(&context, &plan(&model, options))?;
-        let compile_ms = start.elapsed().as_secs_f64() * 1e3;
-        kernels.push((label, compiled, compile_ms));
+        let compiled = compile_with(&context, &plan, EmitOptions { avx2: true })?;
+        kernels.push(("Kernel AVX2", compiled, start.elapsed().as_secs_f64() * 1e3));
     }
     let (scores, distinct) = verify(&model, &kernels[0].1, &rows, CALLS);
     for (_, compiled, _) in &kernels[1..] {
@@ -93,7 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         order.reverse();
     }
     println!(
-        "Synthetic {choice:?}: {} trees, depth 6, {} features, {ROWS} rows; generic target",
+        "Synthetic {choice:?}: {} trees, {} features, {ROWS} rows; shared-feature order, 8 trees/chunk, 2 sums",
         model.trees().len(),
         model.feature_modes().len()
     );
@@ -106,10 +82,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let (label, compile_ms) = match variant {
             0 => ("Reference", "-".to_owned()),
             last if last == kernels.len() + 1 => ("Driver floor", "-".to_owned()),
-            index => (
-                kernels[index - 1].0.as_str(),
-                format!("{:.3}", kernels[index - 1].2),
-            ),
+            index => (kernels[index - 1].0, format!("{:.3}", kernels[index - 1].2)),
         };
         let mut values: Vec<_> = samples.iter().map(|sample| sample[variant]).collect();
         values.sort_by(f64::total_cmp);
@@ -140,79 +113,12 @@ mod tests {
 
     #[test]
     fn workload_agrees_and_dependent_trace_visits_multiple_rows() {
-        let (model, rows) = workload(Workload::Mixed);
+        let (model, rows) = workload(Workload::Distinct(20, 30));
         let context = Context::create();
-        let compiled = compile(&context, &plan(&model, SortOptions::default())).unwrap();
+        let compiled = compile(&context, &plan(&model)).unwrap();
         let (scores, distinct) = verify(&model, &compiled, &rows, CALLS);
         assert_eq!(scores.len(), ROWS);
         assert!(distinct > 1);
-    }
-
-    #[test]
-    fn fixed_workloads_have_expected_shapes_reuse_and_matching_traces() {
-        let context = Context::create();
-        for (kind, trees, features) in [
-            (Workload::ReuseHeavy, 64, 4),
-            (Workload::Disjoint, 64, 384),
-            (Workload::Wide, 128, 128),
-        ] {
-            let (model, rows) = workload(kind);
-            assert_eq!(model.trees().len(), trees);
-            assert_eq!(model.feature_modes().len(), features);
-            assert_eq!(rows.len(), ROWS);
-            assert!(rows.iter().all(|row| row.len() == features));
-            assert!(
-                model
-                    .trees()
-                    .iter()
-                    .all(|tree| tree.selections.len() == 6 && tree.leafs.len() == 64)
-            );
-            for (index, split) in model
-                .trees()
-                .iter()
-                .flat_map(|tree| &tree.selections)
-                .enumerate()
-            {
-                if kind == Workload::Disjoint {
-                    assert_eq!(split.feature_idx.0, index);
-                } else if kind == Workload::ReuseHeavy {
-                    assert!(split.feature_idx.0 < 4);
-                    assert!(
-                        split.threshold >= -4.0
-                            && split.threshold < 4.0
-                            && split.threshold.fract() == 0.0
-                    );
-                }
-            }
-            let expected = [4, 8, 16]
-                .into_iter()
-                .flat_map(|chunk_trees| {
-                    [1, 2, 4].map(move |sums| (chunk_trees, sums, TreeOrdering::Model))
-                })
-                .chain([8, 16].map(|chunk_trees| (chunk_trees, 2, TreeOrdering::SharedFeatures)));
-            assert_eq!(tree_major_variants().count(), 11);
-            for ((label, options), (chunk_trees, sums, order)) in
-                tree_major_variants().zip(expected)
-            {
-                assert_eq!(
-                    label,
-                    format!(
-                        "Tree-major, {chunk_trees} trees/chunk, sums {sums}{}",
-                        if order == TreeOrdering::SharedFeatures {
-                            ", shared features"
-                        } else {
-                            ""
-                        }
-                    )
-                );
-                assert_eq!(options.chunk_trees.get(), chunk_trees);
-                assert_eq!(options.accumulators.get(), sums);
-                assert_eq!(options.order, order);
-                let compiled = compile(&context, &plan(&model, options)).unwrap();
-                let (_, distinct) = verify(&model, &compiled, &rows, CALLS);
-                assert!(distinct > 1, "{kind:?} {label}");
-            }
-        }
     }
 
     #[test]
@@ -244,11 +150,9 @@ mod tests {
                 }
             }
             assert_eq!(borders.len(), trees * 6);
-            for (_, options) in tree_major_variants() {
-                let compiled = compile(&context, &plan(&model, options)).unwrap();
-                for row in &rows {
-                    assert_eq!(compiled.predict(row), model.predict(row));
-                }
+            let compiled = compile(&context, &plan(&model)).unwrap();
+            for row in &rows {
+                assert_eq!(compiled.predict(row), model.predict(row));
             }
         }
         assert!(Workload::parse("not-a-workload").is_err());

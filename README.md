@@ -11,7 +11,7 @@ features, and probability transforms are not implemented.
 use inkwell::context::Context;
 use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
-use tigerboost::sort_policy::{SortOptions, plan};
+use tigerboost::sort_policy::plan;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = Trees::new(
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         -1.0, // bias
     )?;
     let context = Context::create();
-    let plan = plan(&model, SortOptions::default());
+    let plan = plan(&model);
     let predictor = compile(&context, &plan)?;
     drop(plan);
     drop(model);
@@ -58,12 +58,14 @@ with the reference are not promised. Comparisons retain NaN/infinity semantics.
 
 ## How a prediction runs
 
-`sort_policy::plan(&model, SortOptions { chunk_trees, accumulators })` produces
-a plan without LLVM: one action per tree with splits (a constant tree keeps an
-`Admit`/`Retire` pair), in tree order, grouped into chunks of
-`chunk_trees` whole trees, with leaves accumulated round-robin into
-`accumulators` independent sums that are added at the end. The default is eight
-trees per chunk and two sums.
+`sort_policy::plan(&model)` produces a plan without LLVM. Trees use one fixed
+shared-feature order: each chunk starts with the tree whose features occur most
+often in the forest, then adds trees sharing the most features with that chunk.
+Ties use original tree order; constant trees follow the trees with splits.
+Each tree has one `EvaluateTree` or `Constant` action. Chunks hold eight whole
+trees, with selected leaves accumulated round-robin into two sums (clamped to
+the tree count, with one sum for an empty forest). The sums are added at the end.
+There are no planning options.
 
 `jit::compile(&context, &plan)` emits that plan. All thresholds and all leaf
 tables live in one private constant block that every function reaches through a
@@ -87,9 +89,9 @@ trees per chunk is the largest spill-free size measured on ARM64.
 `jit::compile_with(&context, &plan, EmitOptions { avx2: true })` selects an
 x86-64 emission that compares four lanes then two per tree with the threshold
 vector as a memory operand and reads the level bits back with `vmovmskpd`. It
-sets `x86-64-v3` on the emitted functions and must not run on a host without
-AVX2; `EmitOptions::from_host()` enables it when LLVM reports `+avx2` for the
-host. `compile` never uses it.
+sets `x86-64-v3` on the emitted functions. `compile_with` returns an error if
+AVX2 is requested on a host without it. `EmitOptions::from_host()` enables it
+when LLVM reports `+avx2`; `compile` uses the default two-lane emission.
 
 ## Build and checks
 
@@ -98,19 +100,22 @@ Homebrew LLVM installation used here on ARM64:
 
 ```sh
 export LLVM_SYS_211_PREFIX=/opt/homebrew/opt/llvm@21
+cargo build --offline --release --examples
 cargo test --offline --all-targets
 cargo test --offline --release --all-targets
 RUSTDOCFLAGS="-C link-arg=/opt/homebrew/lib/libzstd.dylib" cargo test --offline --doc
 cargo clippy --offline --all-targets -- -D warnings
-cargo fmt --check
-tools/x86_check.sh special && tools/x86_check.sh special --avx2
+tools/x86_check.sh special
+tools/x86_check.sh special --avx2
+tools/x86_check.sh depths --avx2
+tools/x86_check.sh depths2
 ```
 
 The macOS ARM64 Cargo configuration links `/opt/homebrew/lib` for zstd;
 rustdoc does not inherit that setting.
 
-`tools/x86_check.sh <workload> [--avx2]` emits every benchmark variant for
-`x86_64-apple-darwin`, links each kernel with a C driver, runs it under Rosetta 2
+`tools/x86_check.sh <workload> [--avx2]` emits the kernel (or its AVX2 twin) for
+`x86_64-apple-darwin`, links it with a C driver, runs it under Rosetta 2
 (`arch -x86_64`) and compares every prediction bit for bit with the reference.
 Rosetta executes the code but its timing says nothing about an x86 CPU; no x86
 performance has been measured.
@@ -127,20 +132,18 @@ random feature reuse and globally distinct thresholds.
 | 100 trees, 100 features | hot median ns | cold p50 ns |
 |---|---:|---:|
 | scheduled scalar kernel before this work | 121 | 791 |
-| tree-major, 8 trees per chunk, 2 sums | 87 | 792 (measured at 4 per chunk) |
+| previous model-order kernel | 87 | 792 (measured at 4 per chunk) |
+| current shared-feature kernel | 85 | — |
 
 | 300 trees, 100 features | hot median ns |
 |---|---:|
 | scheduled scalar kernel before this work | ~345 |
-| tree-major, 8 trees per chunk, 2 sums | 237 |
+| previous model-order kernel | 237 |
+| current shared-feature kernel | 228 |
 
-Static, 100 trees, four trees per chunk: ARM64 2253 instructions (22.5 per tree,
-no continuation stack traffic); x86-64 2332 (SSE2) or 1486 with `avx2`. Eight per
-chunk is the largest spill-free size and the default; the static counts were
-recorded at four. Rosetta 2 runs the SSE2 kernel at
-106 ns and the scalar kernel it replaced at 168 ns, the same ordering as native
-ARM64. Details, the study that led here, and the review record are in
-`plans/perf-study-2026-09-28/`.
+The current kernel's recorded hot medians are 85.3 / 228.2 ns at 100 / 300
+trees. Measurements and rejected experiments are in
+[RESULTS.md](plans/perf-study-2026-09-28/RESULTS.md).
 
 Commands:
 
@@ -150,7 +153,15 @@ cargo run --offline --release --example cold_bench -- 100x100 --samples 5000
 cargo run --offline --release --example inspect_code -- /tmp/tigerboost-code 100x100
 ```
 
-Workloads are `<trees>x<features>` (`100x100`, `300x100`, `500x100`, `500x1000`)
-plus the historical `mixed`, `reuse-heavy`, `disjoint`, and `wide` fixtures.
-Inspection requires a fresh output directory and emits separate ARM64/x86-64
-assembly and plan dumps, not MCJIT's executable bytes.
+Every example accepts `<trees>x<features>` (for example `100x100`, `300x100`,
+`500x100`, `500x1000`), `special`, `depths`, or `depths2`. Generic workloads
+have depth 6 and allow 1–10,922 trees with a positive feature count. `special`
+covers NaN modes and special values; `depths` and `depths2` cover depths 1–10.
+`scalar_bench` times the reference, the kernel, and its AVX2 twin on x86 hosts
+with AVX2 support, plus the driver floor. `cold_bench` accepts `--samples` and
+`--out`; its CSV columns are `condition,ns`.
+
+Inspection requires a fresh output directory. It uses `emit_assembly` for the
+default ARM64/x86-64 assembly and `emit_assembly_with` for the x86 AVX2 twin,
+with plan dumps alongside each file. These are separate target emissions,
+not MCJIT's executable bytes.

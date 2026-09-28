@@ -1,257 +1,25 @@
 mod support;
 
 use inkwell::context::Context;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::{
-    collections::HashSet,
     error::Error,
     fs::{self, File},
     io::{BufWriter, Write},
-    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
-use support::{ROWS, Workload};
+use support::{ROWS, Workload, workload};
+#[cfg(test)]
+use support::{assert_distinct_rows, depths_workload, distinct_leaf_counts, special_workload};
 use tigerboost::jit::{EmitOptions, compile, emit_assembly_with};
-use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
-use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
+#[cfg(test)]
+use tigerboost::parsed_tree::NanMode;
+use tigerboost::parsed_tree::Trees;
+use tigerboost::sort_policy::plan;
 
 const USAGE: &str =
-    "usage: x86_check <special|depths|depths2|standard-workload> <fresh-output-dir> [--avx2]";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkloadChoice {
-    Standard(Workload),
-    Special,
-    Depths,
-    Depths2,
-}
-
-fn parse_workload(name: &str) -> Result<WorkloadChoice, &'static str> {
-    if name == "special" {
-        return Ok(WorkloadChoice::Special);
-    }
-    if name == "depths" {
-        return Ok(WorkloadChoice::Depths);
-    }
-    if name == "depths2" {
-        return Ok(WorkloadChoice::Depths2);
-    }
-    if let Ok(workload) = Workload::parse(name) {
-        return Ok(WorkloadChoice::Standard(workload));
-    }
-    let (trees, features) = name.split_once('x').ok_or(USAGE)?;
-    let trees = trees.parse::<usize>().map_err(|_| USAGE)?;
-    let features = features.parse::<usize>().map_err(|_| USAGE)?;
-    if trees == 0 || features == 0 || trees > 10_922 {
-        return Err(USAGE);
-    }
-    Ok(WorkloadChoice::Standard(Workload::Distinct(
-        trees, features,
-    )))
-}
-
-fn next_random(state: &mut u64, limit: usize) -> usize {
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    (state.wrapping_mul(0x2545_f491_4f6c_dd1d) % limit as u64) as usize
-}
-
-fn encoded_leafs(depth: usize, prior_depth: &mut usize) -> Vec<f64> {
-    let next_depth = prior_depth.checked_add(depth).unwrap();
-    assert!(next_depth <= 53, "leaf fields must fit in 53 bits");
-    let leafs = (0..1usize << depth)
-        .map(|index| ((index as u64) << *prior_depth) as f64)
-        .collect();
-    *prior_depth = next_depth;
-    leafs
-}
-
-fn assert_distinct_rows(rows: &[Vec<f64>]) {
-    let distinct: HashSet<Vec<u64>> = rows
-        .iter()
-        .map(|row| row.iter().map(|value| value.to_bits()).collect())
-        .collect();
-    assert_eq!(distinct.len(), rows.len(), "workload rows must be distinct");
-}
-
-fn distinct_leaf_counts(model: &Trees, rows: &[Vec<f64>]) -> Vec<usize> {
-    let mut leaves = vec![HashSet::new(); model.trees().len()];
-    for row in rows {
-        for (tree, leaf) in model.leaf_indices(row).unwrap().into_iter().enumerate() {
-            leaves[tree].insert(leaf);
-        }
-    }
-    leaves.into_iter().map(|indices| indices.len()).collect()
-}
-
-fn special_workload() -> (Trees, Vec<Vec<f64>>) {
-    const DEPTHS: [usize; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
-    const DEEP_THRESHOLDS: [f64; 8] = [-1.0, -0.0, 0.0, 1.0, -0.42, f64::from_bits(1), 1.37, -1.37];
-    const VALUES: [f64; 11] = [
-        f64::NAN,
-        f64::NEG_INFINITY,
-        -1.0,
-        -0.0,
-        0.0,
-        1.0,
-        f64::INFINITY,
-        1.37,
-        -0.42,
-        f64::from_bits(1),
-        f64::from_bits((1u64 << 63) | 1),
-    ];
-
-    let mut prior_depth = 0;
-    let trees = DEPTHS
-        .into_iter()
-        .enumerate()
-        .map(|(tree, depth)| {
-            let selections = (0..depth)
-                .map(|level| {
-                    let feature = if tree == 2 { 0 } else { (tree + level) % 6 };
-                    let threshold = match tree {
-                        1 => f64::NAN,
-                        2 => [f64::INFINITY, f64::NEG_INFINITY][level],
-                        3 => [-0.0, 0.0, 1.37][level],
-                        _ => DEEP_THRESHOLDS[level],
-                    };
-                    Discriminator {
-                        feature_idx: FeatureIndex(feature),
-                        threshold,
-                    }
-                })
-                .collect();
-            let leafs = encoded_leafs(depth, &mut prior_depth);
-            SingleTree { leafs, selections }
-        })
-        .collect();
-    let feature_modes = vec![
-        NanMode::AsIs,
-        NanMode::AsFalse,
-        NanMode::AsTrue,
-        NanMode::AsIs,
-        NanMode::AsFalse,
-        NanMode::AsTrue,
-    ];
-    let model = Trees::new(trees, feature_modes, 1.0, 0.0)
-        .expect("the special x86-check model must be valid");
-    let mut random = 0x5350_4543_4941_4c31;
-    let rows: Vec<Vec<f64>> = (0..ROWS)
-        .map(|_| {
-            (0..6)
-                .map(|_| VALUES[next_random(&mut random, VALUES.len())])
-                .collect()
-        })
-        .collect();
-    assert_distinct_rows(&rows);
-    for (tree, (&depth, count)) in DEPTHS
-        .iter()
-        .zip(distinct_leaf_counts(&model, &rows))
-        .enumerate()
-    {
-        let minimum = (1usize << depth).div_ceil(4);
-        assert!(
-            count >= minimum,
-            "special tree {tree} depth {depth} reached {count} leaves, expected at least {minimum}"
-        );
-    }
-    (model, rows)
-}
-
-fn depth_threshold(index: usize) -> f64 {
-    index as f64 / 4.0 - 7.0
-}
-
-fn depths_workload(depths: &[usize], first_threshold: usize) -> (Trees, Vec<Vec<f64>>) {
-    const FEATURES: usize = 12;
-
-    let mut prior_depth = 0;
-    let mut threshold_index = first_threshold;
-    let trees: Vec<_> = depths
-        .iter()
-        .copied()
-        .map(|depth| {
-            let selections = (0..depth)
-                .map(|level| {
-                    let feature = if depth == 9 && level == 8 {
-                        0
-                    } else {
-                        level % FEATURES
-                    };
-                    let split = Discriminator {
-                        feature_idx: FeatureIndex(feature),
-                        threshold: depth_threshold(threshold_index),
-                    };
-                    threshold_index += 1;
-                    split
-                })
-                .collect();
-            let leafs = encoded_leafs(depth, &mut prior_depth);
-            SingleTree { leafs, selections }
-        })
-        .collect();
-    let model = Trees::new(trees, vec![NanMode::AsIs; FEATURES], 1.0, 0.0)
-        .expect("the depths x86-check model must be valid");
-
-    let thresholds_by_feature: Vec<Vec<f64>> = (0..FEATURES)
-        .map(|feature| {
-            model
-                .trees()
-                .iter()
-                .flat_map(|tree| &tree.selections)
-                .filter(|split| split.feature_idx == FeatureIndex(feature))
-                .map(|split| split.threshold)
-                .collect()
-        })
-        .collect();
-    let mut random = 0x4445_5054_4853_3031;
-    let mut rows = vec![vec![0.0; FEATURES]; ROWS];
-    for feature in 0..FEATURES {
-        let mut values = thresholds_by_feature[feature].clone();
-        values.extend([-16.0, -1.0, -0.0, 0.0, 1.0, 16.0]);
-        for row in &mut rows {
-            row[feature] = values[next_random(&mut random, values.len())];
-        }
-        for (row, threshold) in thresholds_by_feature[feature].iter().enumerate() {
-            rows[row][feature] = *threshold;
-        }
-    }
-    assert_distinct_rows(&rows);
-    (model, rows)
-}
-
-fn workload(choice: WorkloadChoice) -> (Trees, Vec<Vec<f64>>) {
-    match choice {
-        WorkloadChoice::Standard(choice) => support::workload(choice),
-        WorkloadChoice::Special => special_workload(),
-        WorkloadChoice::Depths => depths_workload(&[1, 2, 3, 4, 5, 6, 7], 0),
-        WorkloadChoice::Depths2 => depths_workload(&[8, 9, 10], 28),
-    }
-}
-
-fn variants() -> [(&'static str, SortOptions); 4] {
-    [
-        ("tree-major-4-2sums", 4, 2, TreeOrdering::Model),
-        ("tree-major-8-2sums", 8, 2, TreeOrdering::Model),
-        ("tree-major-8-1sum", 8, 1, TreeOrdering::Model),
-        (
-            "tree-major-8-2sums-shared",
-            8,
-            2,
-            TreeOrdering::SharedFeatures,
-        ),
-    ]
-    .map(|(name, chunk_trees, accumulators, order)| {
-        (
-            name,
-            SortOptions {
-                chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                accumulators: NonZeroUsize::new(accumulators).unwrap(),
-                order,
-            },
-        )
-    })
-}
+    "usage: x86_check <special|depths|depths2|<trees>x<features>> <fresh-output-dir> [--avx2]";
 
 fn reference_scores(model: &Trees, rows: &[Vec<f64>]) -> Result<Vec<f64>, Box<dyn Error>> {
     rows.iter()
@@ -259,20 +27,19 @@ fn reference_scores(model: &Trees, rows: &[Vec<f64>]) -> Result<Vec<f64>, Box<dy
         .collect()
 }
 
-#[cfg(test)]
-fn check_variants_natively(model: &Trees, rows: &[Vec<f64>]) -> Result<(), Box<dyn Error>> {
-    let expected = reference_scores(model, rows)?;
+fn check_natively(
+    model: &Trees,
+    rows: &[Vec<f64>],
+    expected: &[f64],
+) -> Result<(), Box<dyn Error>> {
     let context = Context::create();
-    for (name, options) in variants() {
-        let plan = plan(model, options);
-        let compiled = compile(&context, &plan)?;
-        for (row, (&expected, features)) in expected.iter().zip(rows).enumerate() {
-            assert_eq!(
-                compiled.predict(features)?,
-                expected,
-                "native {name} mismatch at row {row}"
-            );
-        }
+    let compiled = compile(&context, &plan(model))?;
+    for (row, (&expected, features)) in expected.iter().zip(rows).enumerate() {
+        assert_eq!(
+            compiled.predict(features)?,
+            expected,
+            "native mismatch at row {row}"
+        );
     }
     Ok(())
 }
@@ -298,26 +65,17 @@ fn write_outputs(
     let context = Context::create();
 
     fs::create_dir(output)?;
-    for (name, options) in variants() {
-        let plan = plan(model, options);
-        let compiled = compile(&context, &plan)?;
-        for (row, (&expected, features)) in expected.iter().zip(rows).enumerate() {
-            assert_eq!(
-                compiled.predict(features)?,
-                expected,
-                "native {name} mismatch at row {row}"
-            );
-        }
-        let assembly = emit_assembly_with(&context, &plan, "x86_64-apple-darwin", emit_options)?;
-        let assembly = assembly.trim_end_matches('\0');
-        assert!(
-            !assembly.as_bytes().contains(&0),
-            "{name} assembly contains an interior NUL byte"
-        );
-        let path = output.join(format!("{name}.s"));
-        File::create_new(&path)?.write_all(assembly.as_bytes())?;
-        println!("{}", path.display());
-    }
+    check_natively(model, rows, &expected)?;
+    let plan = plan(model);
+    let name = if emit_options.avx2 {
+        "kernel-avx2"
+    } else {
+        "kernel"
+    };
+    let assembly = emit_assembly_with(&context, &plan, "x86_64-apple-darwin", emit_options)?;
+    let path = output.join(format!("{name}.s"));
+    File::create_new(&path)?.write_all(assembly.as_bytes())?;
+    println!("{}", path.display());
 
     let rows_path = output.join("rows.bin");
     write_f64s(&rows_path, rows.iter().flatten().copied())?;
@@ -330,16 +88,14 @@ fn write_outputs(
     writeln!(manifest, "features {feature_count}")?;
     writeln!(manifest, "rows {ROWS}")?;
     writeln!(manifest, "avx2 {}", u8::from(emit_options.avx2))?;
-    for (name, _) in variants() {
-        writeln!(manifest, "variant {name}")?;
-    }
+    writeln!(manifest, "variant {name}")?;
     println!("{}", manifest_path.display());
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
-    let choice = parse_workload(&arguments.next().ok_or(USAGE)?)?;
+    let choice = Workload::parse(&arguments.next().ok_or(USAGE)?)?;
     let output = PathBuf::from(arguments.next().ok_or(USAGE)?);
     let avx2 = match arguments.next().as_deref() {
         None => false,
@@ -471,8 +227,8 @@ mod tests {
 
     #[test]
     fn depths_models_cover_depths_threshold_hits_and_leaf_fields() {
-        assert_eq!(parse_workload("depths"), Ok(WorkloadChoice::Depths));
-        assert_eq!(parse_workload("depths2"), Ok(WorkloadChoice::Depths2));
+        assert_eq!(Workload::parse("depths"), Ok(Workload::Depths));
+        assert_eq!(Workload::parse("depths2"), Ok(Workload::Depths2));
         let (first, first_rows) = depths_workload(&[1, 2, 3, 4, 5, 6, 7], 0);
         let (second, second_rows) = depths_workload(&[8, 9, 10], 28);
         let depths: Vec<_> = first
@@ -587,18 +343,16 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("variant "))
                 .count(),
-            4
+            1
         );
-        for (name, _) in variants() {
-            let assembly = fs::read(directory.0.join(format!("{name}.s"))).unwrap();
-            assert!(!assembly.is_empty());
-            assert!(!assembly.contains(&0));
-            assert!(
-                assembly
-                    .windows("_predict".len())
-                    .any(|window| window == b"_predict")
-            );
-        }
+        let assembly = fs::read(directory.0.join("kernel.s")).unwrap();
+        assert!(!assembly.is_empty());
+        assert!(!assembly.contains(&0));
+        assert!(
+            assembly
+                .windows("_predict".len())
+                .any(|window| window == b"_predict")
+        );
     }
 
     #[test]
@@ -609,31 +363,30 @@ mod tests {
         let manifest = fs::read_to_string(directory.0.join("manifest.txt")).unwrap();
         assert_eq!(manifest.lines().filter(|line| *line == "avx2 1").count(), 1);
         let context = Context::create();
-        for (name, options) in variants() {
-            let assembly = fs::read_to_string(directory.0.join(format!("{name}.s"))).unwrap();
-            let plan = plan(&model, options);
-            let expected = emit_assembly_with(
-                &context,
-                &plan,
-                "x86_64-apple-darwin",
-                EmitOptions { avx2: true },
-            )
-            .unwrap();
-            assert_eq!(assembly, expected.trim_end_matches('\0'));
-            assert_eq!(assembly.matches("vcmpgt_oqpd").count(), 10);
-            assert_eq!(assembly.matches("vmovmskpd").count(), 10);
-        }
+        let assembly = fs::read_to_string(directory.0.join("kernel-avx2.s")).unwrap();
+        let plan = plan(&model);
+        let expected = emit_assembly_with(
+            &context,
+            &plan,
+            "x86_64-apple-darwin",
+            EmitOptions { avx2: true },
+        )
+        .unwrap();
+        assert_eq!(assembly, expected);
+        assert_eq!(assembly.matches("vcmpgt_oqpd").count(), 10);
+        assert_eq!(assembly.matches("vmovmskpd").count(), 10);
     }
 
     #[test]
-    fn every_variant_matches_the_reference_natively() {
-        let (special_model, special_rows) = special_workload();
-        check_variants_natively(&special_model, &special_rows).unwrap();
-        let (depths_model, depths_rows) = depths_workload(&[1, 2, 3, 4, 5, 6, 7], 0);
-        check_variants_natively(&depths_model, &depths_rows).unwrap();
-        let (depths2_model, depths2_rows) = depths_workload(&[8, 9, 10], 28);
-        check_variants_natively(&depths2_model, &depths2_rows).unwrap();
-        let (distinct_model, distinct_rows) = support::workload(Workload::Distinct(20, 30));
-        check_variants_natively(&distinct_model, &distinct_rows).unwrap();
+    fn kernel_matches_the_reference_natively() {
+        for kind in [
+            Workload::Special,
+            Workload::Depths,
+            Workload::Depths2,
+            Workload::Distinct(20, 30),
+        ] {
+            let (model, rows) = workload(kind);
+            check_natively(&model, &rows, &reference_scores(&model, &rows).unwrap()).unwrap();
+        }
     }
 }

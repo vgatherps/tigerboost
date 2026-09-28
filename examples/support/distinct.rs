@@ -1,16 +1,9 @@
-use super::ROWS;
+use super::{ROWS, random};
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
 
 const DEPTH: usize = 6;
 const GRID: usize = 65536;
-
-fn random(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9e3779b97f4a7c15);
-    let mut value = *state;
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
-    value ^ (value >> 31)
-}
+pub(super) const MAX_TREES: usize = GRID / DEPTH;
 
 fn dyadic(index: usize) -> f64 {
     (index as f64) / ((GRID / 8) as f64) - 4.0

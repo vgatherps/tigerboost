@@ -1,5 +1,5 @@
 use crate::parsed_tree::{FeatureIndex, NanMode, RowLengthError, SingleTree};
-use crate::sort_policy::{Action, Plan};
+use crate::sort_policy::{Action, Plan, PredicateId};
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::context::Context;
 use inkwell::execution_engine::JitFunction;
@@ -85,6 +85,9 @@ pub fn compile_with<'ctx>(
     plan: &Plan<'_>,
     options: EmitOptions,
 ) -> CompileResult<CompiledModel<'ctx>> {
+    if options.avx2 && !EmitOptions::from_host().avx2 {
+        return Err("AVX2 is not supported by this host".into());
+    }
     Target::initialize_native(&InitializationConfig::default())?;
     let triple = TargetMachine::get_default_triple();
     let (module, _) = prepare_module(context, plan, &triple, options)?;
@@ -117,7 +120,10 @@ pub fn emit_assembly_with(
     let triple = TargetTriple::create(target_triple);
     let (module, machine) = prepare_module(context, plan, &triple, options)?;
     let buffer = machine.write_to_memory_buffer(&module, FileType::Assembly)?;
-    Ok(String::from_utf8(buffer.as_slice().to_vec())?)
+    let bytes = buffer.as_slice();
+    Ok(String::from_utf8(
+        bytes.strip_suffix(&[0]).unwrap_or(bytes).to_vec(),
+    )?)
 }
 
 fn prepare_module<'ctx>(
@@ -169,29 +175,6 @@ fn emit_plan<'ctx>(
     let f64_type = context.f64_type();
     let index_type = context.i64_type();
     let zero = index_type.const_zero();
-    let mut predicate_slots = vec![None; plan.predicates().len()];
-    let mut evaluated_trees = vec![false; model.trees().len()];
-    let mut next_predicate_slot = 0;
-    for action in plan.actions() {
-        if let Action::EvaluateTree {
-            tree, predicates, ..
-        } = action
-        {
-            evaluated_trees[tree.0] = true;
-            for predicate in predicates {
-                let slot = &mut predicate_slots[predicate.0];
-                assert!(slot.is_none(), "tree-major predicate used twice");
-                *slot = Some(next_predicate_slot);
-                next_predicate_slot += 1;
-            }
-        }
-    }
-    assert_eq!(
-        next_predicate_slot,
-        plan.predicates().len(),
-        "predicate is never compared"
-    );
-    let predicate_slots: Vec<_> = predicate_slots.into_iter().map(Option::unwrap).collect();
     let leaf_start = plan
         .predicates()
         .len()
@@ -199,13 +182,13 @@ fn emit_plan<'ctx>(
         .ok_or("constant block exceeds addressable entry count")?;
     let mut entry_count = leaf_start;
     let mut leaf_base = Vec::with_capacity(model.trees().len());
-    for (tree, &evaluated) in model.trees().iter().zip(&evaluated_trees) {
+    for tree in model.trees() {
         leaf_base.push(entry_count);
         let length = tree
             .leafs
             .len()
             .checked_mul(
-                if tree_path == TreePath::Lanes2 && evaluated && tree.selections.len() % 2 != 0 {
+                if tree_path == TreePath::Lanes2 && tree.selections.len() % 2 != 0 {
                     2
                 } else {
                     1
@@ -228,14 +211,15 @@ fn emit_plan<'ctx>(
     constants.set_linkage(Linkage::Private);
     constants.set_constant(true);
     constants.set_alignment(64);
-    let mut values = vec![f64_type.const_zero(); plan.predicates().len()];
-    for (predicate, &slot) in plan.predicates().iter().zip(&predicate_slots) {
-        values[slot] = f64_type.const_float(predicate.threshold);
-    }
+    let mut values: Vec<_> = plan
+        .predicates()
+        .iter()
+        .map(|predicate| f64_type.const_float(predicate.threshold))
+        .collect();
     values.resize(leaf_start, f64_type.const_zero());
     let mut leaf_bias = vec![0; model.trees().len()];
     for (id, tree) in model.trees().iter().enumerate() {
-        if tree_path == TreePath::Lanes2 && evaluated_trees[id] {
+        if tree_path == TreePath::Lanes2 && !tree.selections.is_empty() {
             let (bias, leaves) = permuted_leaves(tree);
             leaf_bias[id] = bias;
             values.extend(leaves.into_iter().map(|leaf| f64_type.const_float(leaf)));
@@ -251,14 +235,10 @@ fn emit_plan<'ctx>(
         .map(|chunk| {
             plan.actions()[chunk.actions.clone()]
                 .iter()
-                .filter_map(|action| match action {
-                    Action::EvaluateTree { predicates, .. } => predicates
-                        .iter()
-                        .map(|predicate| predicate_slots[predicate.0])
-                        .min(),
+                .find_map(|action| match action {
+                    Action::EvaluateTree { predicates, .. } => Some(predicates[0].0),
                     _ => None,
                 })
-                .min()
                 .unwrap_or(0)
         })
         .collect();
@@ -414,9 +394,40 @@ fn emit_plan<'ctx>(
                 }
             })
             .collect();
+        let add_leaf = |slot, sum| -> CompileResult<FloatValue<'ctx>> {
+            // SAFETY: each caller bounds slot to the selected tree's leaf block.
+            let address = unsafe {
+                builder.build_in_bounds_gep(constant_type, constants, &[zero, slot], "leaf_ptr")?
+            };
+            let leaf = builder.build_load(f64_type, address, "leaf")?;
+            leaf.as_instruction_value().unwrap().set_alignment(8)?;
+            reassociate(builder.build_float_add(sum, leaf.into_float_value(), "sum")?)
+        };
+        let feature_vector = |group: &[PredicateId], first_level: usize, depth: usize| {
+            let mut features = f64_type.vec_type(group.len() as u32).get_undef();
+            let mut first_value = None;
+            for (lane, predicate) in group.iter().enumerate() {
+                let value = if first_level + lane == depth {
+                    first_value.expect("padding follows a real level")
+                } else {
+                    let feature = plan.predicates()[predicate.0].feature_idx;
+                    let mode = model.feature_modes()[feature.0];
+                    load_feature(&builder, f64_type, index_type, row, feature, mode)?
+                };
+                if lane == 0 {
+                    first_value = Some(value);
+                }
+                features = builder.build_insert_element(
+                    features,
+                    value,
+                    context.i32_type().const_int(lane as u64, false),
+                    "features",
+                )?;
+            }
+            Ok::<_, Box<dyn Error>>(features)
+        };
         for action in &plan.actions()[chunk.actions.clone()] {
             match action {
-                Action::Admit(_) => {}
                 Action::EvaluateTree {
                     tree,
                     predicates,
@@ -428,13 +439,7 @@ fn emit_plan<'ctx>(
                         let lanes = group.len();
                         assert!(lanes == 2 || lanes == 4);
                         let first_level = group_number * 4;
-                        let slot = predicate_slots[group[0].0];
-                        for (lane, predicate) in group.iter().enumerate() {
-                            assert_eq!(
-                                predicate_slots[predicate.0],
-                                slot.checked_add(lane).unwrap()
-                            );
-                        }
+                        let slot = group[0].0;
                         // SAFETY: consecutive slots cover this group's thresholds in constants.
                         let address = unsafe {
                             builder.build_in_bounds_gep(
@@ -450,28 +455,11 @@ fn emit_plan<'ctx>(
                             .as_instruction_value()
                             .unwrap()
                             .set_alignment(8)?;
-                        let mut features = vector_type.get_undef();
-                        let mut first_value = None;
-                        for (lane, predicate) in group.iter().enumerate() {
-                            let value = if first_level + lane
-                                == model.trees()[tree.0].selections.len()
-                            {
-                                first_value.expect("padding follows a real level")
-                            } else {
-                                let feature = plan.predicates()[predicate.0].feature_idx;
-                                let mode = model.feature_modes()[feature.0];
-                                load_feature(&builder, f64_type, index_type, row, feature, mode)?
-                            };
-                            if lane == 0 {
-                                first_value = Some(value);
-                            }
-                            features = builder.build_insert_element(
-                                features,
-                                value,
-                                context.i32_type().const_int(lane as u64, false),
-                                "features",
-                            )?;
-                        }
+                        let features = feature_vector(
+                            group,
+                            first_level,
+                            model.trees()[tree.0].selections.len(),
+                        )?;
                         let (compare, movemask) = if lanes == 4 { wide } else { narrow };
                         let masks = builder
                             .build_call(
@@ -507,22 +495,7 @@ fn emit_plan<'ctx>(
                         index_type.const_int(leaf_base[tree.0] as u64, false),
                         "leaf_slot",
                     )?;
-                    // SAFETY: depth bits bound index to this tree's original leaf block.
-                    let address = unsafe {
-                        builder.build_in_bounds_gep(
-                            constant_type,
-                            constants,
-                            &[zero, slot],
-                            "leaf_ptr",
-                        )?
-                    };
-                    let leaf = builder.build_load(f64_type, address, "leaf")?;
-                    leaf.as_instruction_value().unwrap().set_alignment(8)?;
-                    sums[sum.0] = reassociate(builder.build_float_add(
-                        sums[sum.0],
-                        leaf.into_float_value(),
-                        "sum",
-                    )?)?;
+                    sums[sum.0] = add_leaf(slot, sums[sum.0])?;
                 }
                 Action::EvaluateTree {
                     tree,
@@ -532,8 +505,7 @@ fn emit_plan<'ctx>(
                     let pairs = predicates.len() / 2;
                     let mut accumulator: Option<inkwell::values::VectorValue<'ctx>> = None;
                     for (pair_number, pair) in predicates.chunks_exact(2).enumerate() {
-                        let slot = predicate_slots[pair[0].0];
-                        assert_eq!(predicate_slots[pair[1].0], slot.checked_add(1).unwrap());
+                        let slot = pair[0].0;
                         // SAFETY: adjacent slots cover both thresholds inside constants.
                         let address = unsafe {
                             if let Some(base) = chunk_base {
@@ -561,28 +533,11 @@ fn emit_plan<'ctx>(
                             .as_instruction_value()
                             .unwrap()
                             .set_alignment(8)?;
-                        let mut features = f64_type.vec_type(2).get_undef();
-                        let mut first_value = None;
-                        for (lane, predicate) in pair.iter().enumerate() {
-                            let value = if pair_number * 2 + lane
-                                == model.trees()[tree.0].selections.len()
-                            {
-                                first_value.expect("padding follows a real level")
-                            } else {
-                                let feature = plan.predicates()[predicate.0].feature_idx;
-                                let mode = model.feature_modes()[feature.0];
-                                load_feature(&builder, f64_type, index_type, row, feature, mode)?
-                            };
-                            if lane == 0 {
-                                first_value = Some(value);
-                            }
-                            features = builder.build_insert_element(
-                                features,
-                                value,
-                                context.i32_type().const_int(lane as u64, false),
-                                "features",
-                            )?;
-                        }
+                        let features = feature_vector(
+                            pair,
+                            pair_number * 2,
+                            model.trees()[tree.0].selections.len(),
+                        )?;
                         let masks = builder.build_float_compare(
                             FloatPredicate::OGT,
                             features,
@@ -656,46 +611,11 @@ fn emit_plan<'ctx>(
                         index_type.const_int(base as u64, false),
                         "leaf_slot",
                     )?;
-                    // SAFETY: the checked permutation bounds the slot to this tree's block.
-                    let address = unsafe {
-                        builder.build_in_bounds_gep(
-                            constant_type,
-                            constants,
-                            &[zero, slot],
-                            "leaf_ptr",
-                        )?
-                    };
-                    let leaf = builder.build_load(f64_type, address, "leaf")?;
-                    leaf.as_instruction_value().unwrap().set_alignment(8)?;
-                    sums[sum.0] = reassociate(builder.build_float_add(
-                        sums[sum.0],
-                        leaf.into_float_value(),
-                        "sum",
-                    )?)?;
+                    sums[sum.0] = add_leaf(slot, sums[sum.0])?;
                 }
-                Action::Retire { tree: tree_id, sum } => {
-                    let slot = builder.build_int_nuw_add(
-                        zero,
-                        index_type.const_int(leaf_base[tree_id.0] as u64, false),
-                        "leaf_slot",
-                    )?;
-                    // SAFETY: Retire only addresses the sole leaf of a constant tree.
-                    let address = unsafe {
-                        builder.build_in_bounds_gep(
-                            constant_type,
-                            constants,
-                            &[zero, slot],
-                            "leaf_ptr",
-                        )?
-                    };
-                    let leaf = builder.build_load(f64_type, address, "leaf")?;
-                    leaf.as_instruction_value().unwrap().set_alignment(8)?;
-                    let accumulator = &mut sums[sum.0];
-                    *accumulator = reassociate(builder.build_float_add(
-                        *accumulator,
-                        leaf.into_float_value(),
-                        "sum",
-                    )?)?;
+                Action::Constant { tree: tree_id, sum } => {
+                    let slot = index_type.const_int(leaf_base[tree_id.0] as u64, false);
+                    sums[sum.0] = add_leaf(slot, sums[sum.0])?;
                 }
                 Action::AddSums {
                     destination,
@@ -837,16 +757,8 @@ fn reassociate(value: FloatValue<'_>) -> CompileResult<FloatValue<'_>> {
 mod tests {
     use super::*;
     use crate::parsed_tree::{Discriminator, FeatureIndex, SingleTree, Trees};
-    use crate::sort_policy::{SortOptions, plan};
+    use crate::sort_policy::{plan, plan_with};
     use inkwell::values::{AnyValue, FunctionValue, InstructionOpcode};
-    use std::num::NonZeroUsize;
-
-    fn tree_major_options(chunk_trees: usize) -> SortOptions {
-        SortOptions {
-            chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-            ..SortOptions::default()
-        }
-    }
 
     fn tree_major_model(depths: &[usize]) -> Trees {
         Trees::new(
@@ -882,7 +794,7 @@ mod tests {
                 .collect();
             slots.sort_unstable();
             assert_eq!(slots, (0..leaves.len() as i64).collect::<Vec<_>>());
-            let plan = plan(&model, tree_major_options(2));
+            let plan = plan_with(&model, 2, 2);
             let compiled = compile(&context, &plan).unwrap();
             for pattern in 0..1u32 << (pairs * 2) {
                 let slot = (bias + raw_of(pattern, pairs)) as usize;
@@ -901,79 +813,10 @@ mod tests {
     }
 
     #[test]
-    fn tree_major_plan_shape() {
-        use crate::sort_policy::{PredicateId, SumId, TreeId};
-        let depths = [0, 1, 2, 3, 6];
-        let model = tree_major_model(&depths);
-        let plan = plan(&model, tree_major_options(2));
-        assert_eq!(plan.actions()[0], Action::Admit(TreeId(0)));
-        assert_eq!(
-            plan.actions()[1],
-            Action::Retire {
-                tree: TreeId(0),
-                sum: SumId(0)
-            }
-        );
-        let mut next_predicate = 0;
-        for (tree, &depth) in depths.iter().enumerate().skip(1) {
-            let Action::EvaluateTree {
-                tree: id,
-                predicates,
-                sum,
-            } = &plan.actions()[tree + 1]
-            else {
-                panic!("nonconstant tree must have one EvaluateTree action");
-            };
-            assert_eq!(*id, TreeId(tree));
-            assert_eq!(*sum, SumId(tree % 2));
-            assert_eq!(predicates.len(), depth.div_ceil(2) * 2);
-            for (level, predicate) in predicates.iter().enumerate() {
-                assert_eq!(*predicate, PredicateId(next_predicate));
-                next_predicate += 1;
-                let actual = &plan.predicates()[predicate.0];
-                let expected = if level == depth {
-                    Discriminator {
-                        feature_idx: model.trees()[tree].selections[0].feature_idx,
-                        threshold: f64::INFINITY,
-                    }
-                } else {
-                    model.trees()[tree].selections[level].clone()
-                };
-                assert_eq!(actual.feature_idx, expected.feature_idx);
-                assert_eq!(actual.threshold.to_bits(), expected.threshold.to_bits());
-            }
-        }
-        assert_eq!(plan.predicates().len(), next_predicate);
-        assert_eq!(plan.actions().len(), 8);
-        assert_eq!(
-            plan.actions()[6],
-            Action::AddSums {
-                destination: SumId(0),
-                source: SumId(1)
-            }
-        );
-        assert_eq!(plan.actions()[7], Action::ReturnScaled(SumId(0)));
-        assert_eq!(plan.chunks().len(), depths.len().div_ceil(2));
-        for (chunk, (range, tests)) in plan.chunks().iter().zip([(0..3, 2), (3..5, 6), (5..8, 6)]) {
-            assert_eq!(chunk.actions, range);
-            assert_eq!(chunk.tests, tests);
-            let actual: usize = plan.actions()[chunk.actions.clone()]
-                .iter()
-                .map(|action| match action {
-                    Action::EvaluateTree { predicates, .. } => predicates.len(),
-                    _ => 0,
-                })
-                .sum();
-            assert_eq!(chunk.tests, actual);
-        }
-    }
-
-    #[test]
     fn tree_major_emits_vector_compares_only() {
         let context = Context::create();
         let model = tree_major_model(&[6, 6]);
-        let plan = plan(&model, tree_major_options(1));
-        assert_eq!(plan.sum_count(), 2);
+        let plan = plan_with(&model, 1, 2);
         for (triple, pointer_count) in
             [("aarch64-apple-darwin", 3), ("x86_64-unknown-linux-gnu", 2)]
         {
@@ -1021,8 +864,7 @@ mod tests {
     fn avx2_off_is_byte_identical() {
         let context = Context::create();
         for model in [mixed_depth_model(), tree_major_model(&[0, 1, 3, 5, 6, 8])] {
-            for options in [SortOptions::default(), tree_major_options(1)] {
-                let plan = plan(&model, options);
+            for plan in [plan(&model), plan_with(&model, 1, 2)] {
                 for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
                     let original = emit_assembly(&context, &plan, triple).unwrap();
                     assert_eq!(
@@ -1049,7 +891,7 @@ mod tests {
         let triple = "x86_64-unknown-linux-gnu";
         for depth in [1usize, 3, 5, 6, 8] {
             let model = tree_major_model(&[depth]);
-            let plan = plan(&model, tree_major_options(1));
+            let plan = plan_with(&model, 1, 2);
             let (module, _) = prepare_module(
                 &context,
                 &plan,
@@ -1183,7 +1025,7 @@ mod tests {
         let context = Context::create();
         Target::initialize_all(&InitializationConfig::default());
         let model = tree_major_model(&[0, 1, 3, 5, 6, 8]);
-        let plan = plan(&model, tree_major_options(2));
+        let plan = plan_with(&model, 2, 2);
         for triple in ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"] {
             let (module, _) = prepare_module(
                 &context,
@@ -1192,40 +1034,80 @@ mod tests {
                 EmitOptions { avx2: true },
             )
             .unwrap();
-            let mut expected: Vec<_> = plan.predicates().iter().map(|p| p.threshold).collect();
-            expected.resize(expected.len().next_multiple_of(8), 0.0);
-            for tree in model.trees() {
-                if triple == "aarch64-apple-darwin" && !tree.selections.is_empty() {
-                    expected.extend(permuted_leaves(tree).1);
-                } else {
-                    expected.extend(&tree.leafs);
-                }
-            }
-            let expected: Vec<_> = expected
-                .into_iter()
-                .map(|value| context.f64_type().const_float(value))
-                .collect();
             let actual = module
                 .get_global("constants")
                 .unwrap()
                 .get_initializer()
                 .unwrap()
                 .into_array_value();
-            assert_eq!(actual.get_type().len() as usize, expected.len());
-            assert_eq!(actual, context.f64_type().const_array(&expected));
+            let mut thresholds: Vec<_> = plan.predicates().iter().map(|p| p.threshold).collect();
+            thresholds.resize(thresholds.len().next_multiple_of(8), 0.0);
+            if triple == "x86_64-unknown-linux-gnu" {
+                let expected: Vec<_> = thresholds
+                    .iter()
+                    .copied()
+                    .chain(
+                        model
+                            .trees()
+                            .iter()
+                            .flat_map(|tree| tree.leafs.iter().copied()),
+                    )
+                    .map(|value| context.f64_type().const_float(value))
+                    .collect();
+                assert_eq!(actual.get_type().len() as usize, expected.len());
+                assert_eq!(actual, context.f64_type().const_array(&expected));
+                continue;
+            }
+            let builder = context.create_builder();
+            let inspect = module.add_function(
+                "inspect_constants",
+                context.void_type().fn_type(&[], false),
+                None,
+            );
+            builder.position_at_end(context.append_basic_block(inspect, "entry"));
+            let entry = |index| {
+                builder
+                    .build_extract_value(actual, index as u32, "leaf")
+                    .unwrap()
+                    .into_float_value()
+                    .get_constant()
+                    .unwrap()
+                    .0
+                    .to_bits()
+            };
+            for (index, threshold) in thresholds.iter().enumerate() {
+                assert_eq!(entry(index), threshold.to_bits());
+            }
+            let mut slot = thresholds.len();
+            for tree in model.trees() {
+                let mut expected: Vec<_> = tree.leafs.iter().map(|leaf| leaf.to_bits()).collect();
+                let length = if tree.selections.len() % 2 != 0 {
+                    expected.len() * 2
+                } else {
+                    expected.len()
+                };
+                expected.resize(length, 0.0f64.to_bits());
+                let mut leaves: Vec<_> = (slot..slot + length).map(entry).collect();
+                leaves.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(leaves, expected);
+                slot += length;
+            }
+            assert_eq!(actual.get_type().len() as usize, slot);
         }
     }
 
     #[test]
-    fn emit_options_from_host_matches_llvm() {
-        assert_eq!(
-            EmitOptions::from_host().avx2,
-            TargetMachine::get_host_cpu_features()
-                .to_string()
-                .split(',')
-                .any(|f| f == "+avx2"),
-        );
-        assert!(!EmitOptions::default().avx2);
+    fn compile_checks_host_avx2_support() {
+        let context = Context::create();
+        let model = tree_major_model(&[3]);
+        let result = compile_with(&context, &plan(&model), EmitOptions { avx2: true });
+        if EmitOptions::from_host().avx2 {
+            assert_eq!(result.unwrap().predict(&[1.0; 8]), model.predict(&[1.0; 8]));
+        } else {
+            let error = result.err().expect("unsupported AVX2 must be rejected");
+            assert_eq!(error.to_string(), "AVX2 is not supported by this host");
+        }
     }
 
     fn mixed_depth_model() -> Trees {
@@ -1298,27 +1180,7 @@ mod tests {
     fn constants_block_layout_matches_plan() {
         let context = Context::create();
         let model = mixed_depth_model();
-        let plan = plan(&model, SortOptions::default());
-        assert_eq!(plan.predicates().len(), 6);
-        assert_eq!(
-            plan.predicates()
-                .iter()
-                .map(|p| p.threshold)
-                .collect::<Vec<_>>(),
-            [1.37, f64::INFINITY, 1.37, 2.61, -0.42, f64::INFINITY],
-        );
-        let first_use: Vec<_> = plan
-            .actions()
-            .iter()
-            .filter_map(|action| match action {
-                Action::EvaluateTree { predicates, .. } => Some(predicates),
-                _ => None,
-            })
-            .flatten()
-            .map(|predicate| predicate.0)
-            .collect();
-        assert_eq!(first_use.len(), plan.predicates().len());
-        assert_eq!(first_use, (0..plan.predicates().len()).collect::<Vec<_>>());
+        let plan = plan(&model);
         let module = emit_plan(
             &context,
             &plan,
@@ -1332,9 +1194,10 @@ mod tests {
         assert_eq!(constants.get_linkage(), Linkage::Private);
         assert!(constants.is_constant());
         assert_eq!(constants.get_alignment(), 64);
-        let mut expected: Vec<_> = first_use
+        let mut expected: Vec<_> = plan
+            .predicates()
             .iter()
-            .map(|&predicate| plan.predicates()[predicate].threshold)
+            .map(|predicate| predicate.threshold)
             .collect();
         expected.resize(8, 0.0);
         expected.extend([
@@ -1359,7 +1222,7 @@ mod tests {
     fn one_chunk_model_keeps_wrapper_and_opaque_loads() {
         let context = Context::create();
         let model = mixed_depth_model();
-        let plan = plan(&model, SortOptions::default());
+        let plan = plan(&model);
         assert_eq!(plan.chunks().len(), 1);
         Target::initialize_all(&InitializationConfig::default());
         for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
@@ -1413,8 +1276,7 @@ mod tests {
             0.0,
         )
         .unwrap();
-        let plan = plan(&model, SortOptions::default());
-        assert_eq!(plan.chunks().len(), 2);
+        let plan = plan(&model);
         for (triple, pointer_count) in
             [("x86_64-unknown-linux-gnu", 2), ("aarch64-apple-darwin", 3)]
         {
@@ -1499,7 +1361,7 @@ mod tests {
                                 .starts_with(b"threshold")
                     })
                     .collect();
-                assert_eq!(thresholds.len() * 2, plan.chunks()[number].tests);
+                assert_eq!(thresholds.len(), if number == 0 { 16 } else { 2 });
                 for (offset, load) in thresholds.iter().enumerate() {
                     let gep = load
                         .get_operand(0)
@@ -1616,13 +1478,7 @@ mod tests {
         let expected = rows.map(|row| model.predict(&row).unwrap());
         let mut kernels = Vec::new();
         for chunk_trees in [4, 8] {
-            let plan = plan(
-                &model,
-                SortOptions {
-                    chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                    ..SortOptions::default()
-                },
-            );
+            let plan = plan_with(&model, chunk_trees, 2);
             kernels.push(compile(&context, &plan).unwrap());
             drop(plan);
         }
@@ -1652,7 +1508,7 @@ mod tests {
                 3.0,
             )
             .unwrap();
-            let plan = plan(&model, SortOptions::default());
+            let plan = plan(&model);
             let module = emit_plan(
                 &context,
                 &plan,
@@ -1698,9 +1554,10 @@ mod tests {
         )
         .unwrap();
         for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
-            let assembly =
-                emit_assembly(&context, &plan(&model, SortOptions::default()), triple).unwrap();
+            let assembly = emit_assembly(&context, &plan(&model), triple).unwrap();
             assert!(assembly.contains("predict"), "{triple}: {assembly}");
+            assert!(!assembly.contains('\0'));
+            assert!(assembly.ends_with('\n'));
         }
     }
 
@@ -1722,7 +1579,7 @@ mod tests {
         .unwrap();
         let module = emit_plan(
             &context,
-            &plan(&model, SortOptions::default()),
+            &plan(&model),
             &TargetMachine::get_default_triple(),
             TreePath::Lanes2,
         )
@@ -1767,15 +1624,7 @@ mod tests {
         let context = Context::create();
         let depths: Vec<_> = (0..30).map(|tree| tree % 9).collect();
         let model = tree_major_model(&depths);
-        let plan = plan(&model, tree_major_options(4));
-        assert_eq!(plan.chunks().len(), 8);
-        assert_eq!(
-            plan.chunks().iter().map(|chunk| chunk.tests).sum::<usize>(),
-            depths
-                .iter()
-                .map(|depth| depth.div_ceil(2) * 2)
-                .sum::<usize>()
-        );
+        let plan = plan_with(&model, 4, 2);
         for (triple, pointer_count, tree_path) in [
             ("aarch64-apple-darwin", 3, TreePath::Lanes2),
             ("x86_64-unknown-linux-gnu", 2, TreePath::Lanes2),
@@ -1792,12 +1641,17 @@ mod tests {
                 plan.chunks().len() + 1
             );
             let first = module.get_function("continuation0").unwrap();
-            for (number, (chunk, depths)) in plan.chunks().iter().zip(depths.chunks(4)).enumerate()
-            {
-                assert_eq!(
-                    chunk.tests,
-                    depths.iter().map(|depth| depth.div_ceil(2) * 2).sum()
-                );
+            for (number, chunk) in plan.chunks().iter().enumerate() {
+                let depths: Vec<_> = plan.actions()[chunk.actions.clone()]
+                    .iter()
+                    .filter_map(|action| match action {
+                        Action::Constant { tree, .. } | Action::EvaluateTree { tree, .. } => {
+                            Some(model.trees()[tree.0].selections.len())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let comparisons = depths.iter().map(|depth| depth.div_ceil(2)).sum::<usize>();
                 let function = module
                     .get_function(&format!("continuation{number}"))
                     .unwrap();
@@ -1834,8 +1688,8 @@ mod tests {
                     depths.iter().sum::<usize>() + depths.len()
                 );
                 if tree_path == TreePath::Lanes2 {
-                    assert_eq!(2 * ir.matches("fcmp ogt <2 x double>").count(), chunk.tests);
-                    assert_opaque_constants(function, chunk.tests / 2, depths.len());
+                    assert_eq!(ir.matches("fcmp ogt <2 x double>").count(), comparisons);
+                    assert_opaque_constants(function, comparisons, depths.len());
                 }
                 let mut lines = ir.lines();
                 if number + 1 < plan.chunks().len() {

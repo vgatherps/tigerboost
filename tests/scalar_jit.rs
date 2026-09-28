@@ -1,10 +1,9 @@
 use inkwell::context::Context;
-use std::num::NonZeroUsize;
-use tigerboost::jit::{EmitOptions, compile, compile_with};
+use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{
     Discriminator, FeatureIndex, NanMode, RowLengthError, SingleTree, Trees,
 };
-use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
+use tigerboost::sort_policy::plan;
 
 fn split(feature: usize, threshold: f64) -> Discriminator {
     Discriminator {
@@ -21,46 +20,6 @@ fn indexed_tree(selections: Vec<Discriminator>) -> SingleTree {
 }
 
 #[test]
-fn tree_major_host_options_match_default() {
-    let context = Context::create();
-    let model = Trees::new(
-        [0, 1, 3, 5, 6, 8]
-            .into_iter()
-            .map(|depth| {
-                indexed_tree(
-                    (0..depth)
-                        .map(|level| split(level % 3, level as f64 - 2.0))
-                        .collect(),
-                )
-            })
-            .collect(),
-        vec![NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue],
-        2.5,
-        -3.0,
-    )
-    .unwrap();
-    let plan = plan(
-        &model,
-        SortOptions {
-            chunk_trees: NonZeroUsize::new(2).unwrap(),
-            ..SortOptions::default()
-        },
-    );
-    let original = compile(&context, &plan).unwrap();
-    let from_host = compile_with(&context, &plan, EmitOptions::from_host()).unwrap();
-    for row in [
-        [f64::NAN; 3],
-        [f64::NEG_INFINITY; 3],
-        [f64::INFINITY; 3],
-        [-0.0, 0.0, 1.0],
-        [3.0, 2.0, -1.0],
-    ] {
-        assert_eq!(from_host.predict(&row), original.predict(&row));
-        assert_eq!(from_host.predict(&row), model.predict(&row));
-    }
-}
-
-#[test]
 fn tree_major_matches_reference_on_special_values() {
     let context = Context::create();
     let values = [
@@ -73,10 +32,6 @@ fn tree_major_matches_reference_on_special_values() {
         f64::INFINITY,
     ];
     let thresholds = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.5, 0.5];
-    let options = SortOptions {
-        chunk_trees: NonZeroUsize::new(4).unwrap(),
-        ..SortOptions::default()
-    };
     for mode in [NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue] {
         for depth in 1..=8 {
             for offset in 0..thresholds.len() {
@@ -93,7 +48,7 @@ fn tree_major_matches_reference_on_special_values() {
                     -3.0,
                 )
                 .unwrap();
-                let compiled = compile(&context, &plan(&model, options)).unwrap();
+                let compiled = compile(&context, &plan(&model)).unwrap();
                 for first in values {
                     for second in values {
                         for third in values {
@@ -119,7 +74,7 @@ fn tree_major_matches_reference_on_special_values() {
             0.0,
         )
         .unwrap();
-        let compiled = compile(&context, &plan(&model, options)).unwrap();
+        let compiled = compile(&context, &plan(&model)).unwrap();
         for first in values {
             for second in values {
                 let row = [first, second];
@@ -169,13 +124,7 @@ fn tree_major_dropped_model_and_odd_depth_last_tree() {
             .all(|(&index, tree)| index == tree.leafs.len() - 1)
     );
     let expected = rows.map(|row| model.predict(&row).unwrap());
-    let plan = plan(
-        &model,
-        SortOptions {
-            chunk_trees: NonZeroUsize::new(8).unwrap(),
-            ..SortOptions::default()
-        },
-    );
+    let plan = plan(&model);
     assert_eq!(plan.chunks().len(), 9);
     let compiled = compile(&context, &plan).unwrap();
     drop(plan);
@@ -183,20 +132,6 @@ fn tree_major_dropped_model_and_odd_depth_last_tree() {
     for (row, expected) in rows.iter().zip(expected) {
         assert_eq!(compiled.predict(row), Ok(expected));
     }
-}
-
-fn configurations() -> impl Iterator<Item = SortOptions> {
-    [TreeOrdering::Model, TreeOrdering::SharedFeatures]
-        .into_iter()
-        .flat_map(|order| {
-            [1, 3, 8].into_iter().flat_map(move |chunk_trees| {
-                [1, 2, 4].map(move |count| SortOptions {
-                    chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                    accumulators: NonZeroUsize::new(count).unwrap(),
-                    order,
-                })
-            })
-        })
 }
 
 #[test]
@@ -213,28 +148,26 @@ fn indexed_leaves_expose_original_level_bits_and_strict_comparisons() {
         0.0,
     )
     .unwrap();
-    for options in configurations() {
-        let compiled = compile(&context, &plan(&model, options)).unwrap();
-        for index in 0..8 {
-            let row = [
-                if index & 2 != 0 { 2.0 } else { 1.0 },
-                if index & 4 != 0 { 0.0 } else { -1.0 },
-                if index & 1 != 0 { 1.0 } else { -0.0 },
-            ];
-            assert_eq!(compiled.predict(&row).unwrap(), index as f64);
-        }
-        for row in [
-            [f64::NAN; 3],
-            [f64::NEG_INFINITY; 3],
-            [f64::INFINITY; 3],
-            [
-                f64::from_bits(1.0f64.to_bits() + 1),
-                -1.0,
-                f64::from_bits(1),
-            ],
-        ] {
-            assert_eq!(compiled.predict(&row), model.predict(&row));
-        }
+    let compiled = compile(&context, &plan(&model)).unwrap();
+    for index in 0..8 {
+        let row = [
+            if index & 2 != 0 { 2.0 } else { 1.0 },
+            if index & 4 != 0 { 0.0 } else { -1.0 },
+            if index & 1 != 0 { 1.0 } else { -0.0 },
+        ];
+        assert_eq!(compiled.predict(&row).unwrap(), index as f64);
+    }
+    for row in [
+        [f64::NAN; 3],
+        [f64::NEG_INFINITY; 3],
+        [f64::INFINITY; 3],
+        [
+            f64::from_bits(1.0f64.to_bits() + 1),
+            -1.0,
+            f64::from_bits(1),
+        ],
+    ] {
+        assert_eq!(compiled.predict(&row), model.predict(&row));
     }
 }
 
@@ -259,17 +192,15 @@ fn repeated_features_nan_modes_and_scale_bias_match_reference() {
         -3.0,
     )
     .unwrap();
-    for options in configurations() {
-        let compiled = compile(&context, &plan(&model, options)).unwrap();
-        for row in [
-            [f64::NAN; 3],
-            [-f64::NAN, 1.0, 2.0],
-            [f64::NEG_INFINITY, f64::INFINITY, 0.0],
-            [f64::INFINITY, -0.0, 1.0],
-            [1.0, -1.0, 3.0],
-        ] {
-            assert_eq!(compiled.predict(&row), model.predict(&row));
-        }
+    let compiled = compile(&context, &plan(&model)).unwrap();
+    for row in [
+        [f64::NAN; 3],
+        [-f64::NAN, 1.0, 2.0],
+        [f64::NEG_INFINITY, f64::INFINITY, 0.0],
+        [f64::INFINITY, -0.0, 1.0],
+        [1.0, -1.0, 3.0],
+    ] {
+        assert_eq!(compiled.predict(&row), model.predict(&row));
     }
 }
 
@@ -277,41 +208,39 @@ fn repeated_features_nan_modes_and_scale_bias_match_reference() {
 fn empty_and_constant_forests_need_no_row_loads() {
     let context = Context::create();
     let empty = Trees::new(vec![], vec![], f64::NAN, -0.0).unwrap();
-    for options in configurations() {
-        assert_eq!(
-            compile(&context, &plan(&empty, options))
-                .unwrap()
-                .predict(&[])
-                .unwrap()
-                .to_bits(),
-            (-0.0f64).to_bits()
-        );
-        for leaves in [
-            vec![1.5, -2.0],
-            vec![f64::INFINITY],
-            vec![f64::INFINITY, f64::NEG_INFINITY],
-            vec![f64::NAN],
-        ] {
-            let model = Trees::new(
-                leaves
-                    .into_iter()
-                    .map(|leaf| SingleTree {
-                        leafs: vec![leaf],
-                        selections: vec![],
-                    })
-                    .collect(),
-                vec![],
-                2.0,
-                3.0,
-            )
+    assert_eq!(
+        compile(&context, &plan(&empty))
+            .unwrap()
+            .predict(&[])
+            .unwrap()
+            .to_bits(),
+        (-0.0f64).to_bits()
+    );
+    for leaves in [
+        vec![1.5, -2.0],
+        vec![f64::INFINITY],
+        vec![f64::INFINITY, f64::NEG_INFINITY],
+        vec![f64::NAN],
+    ] {
+        let model = Trees::new(
+            leaves
+                .into_iter()
+                .map(|leaf| SingleTree {
+                    leafs: vec![leaf],
+                    selections: vec![],
+                })
+                .collect(),
+            vec![],
+            2.0,
+            3.0,
+        )
+        .unwrap();
+        let result = compile(&context, &plan(&model))
+            .unwrap()
+            .predict(&[])
             .unwrap();
-            let result = compile(&context, &plan(&model, options))
-                .unwrap()
-                .predict(&[])
-                .unwrap();
-            let expected = model.predict(&[]).unwrap();
-            assert!(result == expected || result.is_nan() && expected.is_nan());
-        }
+        let expected = model.predict(&[]).unwrap();
+        assert!(result == expected || result.is_nan() && expected.is_nan());
     }
 }
 
@@ -333,13 +262,11 @@ fn reordered_sums_allow_cancellation_error_scaled_by_absolute_leaves() {
     .unwrap();
     let tolerance =
         values.len() as f64 * f64::EPSILON * values.iter().map(|value| value.abs()).sum::<f64>();
-    for options in configurations() {
-        let compiled = compile(&context, &plan(&model, options)).unwrap();
-        for row in [[-1.0], [1.0]] {
-            assert!(
-                (compiled.predict(&row).unwrap() - model.predict(&row).unwrap()).abs() <= tolerance
-            );
-        }
+    let compiled = compile(&context, &plan(&model)).unwrap();
+    for row in [[-1.0], [1.0]] {
+        assert!(
+            (compiled.predict(&row).unwrap() - model.predict(&row).unwrap()).abs() <= tolerance
+        );
     }
 }
 
@@ -353,7 +280,7 @@ fn row_check_and_reused_row_allocation_are_respected() {
         0.0,
     )
     .unwrap();
-    let compiled = compile(&context, &plan(&model, SortOptions::default())).unwrap();
+    let compiled = compile(&context, &plan(&model)).unwrap();
     assert_eq!(
         compiled.predict(&[1.0]),
         Err(RowLengthError {
@@ -382,7 +309,7 @@ fn moved_model_owns_leaf_tables_after_source_and_other_kernel_drop() {
             0.0,
         )
         .unwrap();
-        compile(&context, &plan(&model, SortOptions::default())).unwrap()
+        compile(&context, &plan(&model)).unwrap()
     };
     let mut moved = vec![compiled];
     {
@@ -394,7 +321,7 @@ fn moved_model_owns_leaf_tables_after_source_and_other_kernel_drop() {
             0.0,
         )
         .unwrap();
-        let other = compile(&other_context, &plan(&other_model, SortOptions::default())).unwrap();
+        let other = compile(&other_context, &plan(&other_model)).unwrap();
         assert_eq!(other.predict(&[1.0]), Ok(1.0));
     }
     let compiled = moved.pop().unwrap();

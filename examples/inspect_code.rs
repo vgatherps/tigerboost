@@ -6,12 +6,11 @@ use std::{
     error::Error,
     fs::{self, File},
     io::Write,
-    num::NonZeroUsize,
     path::PathBuf,
 };
 use support::Workload;
-use tigerboost::jit::{EmitOptions, emit_assembly_with};
-use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
+use tigerboost::jit::{EmitOptions, emit_assembly, emit_assembly_with};
+use tigerboost::sort_policy::plan;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
@@ -22,7 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let choice = match arguments.next() {
         Some(name) => Workload::parse(name.to_str().ok_or("workload name must be UTF-8")?)?,
-        None => Workload::Mixed,
+        None => Workload::Distinct(100, 100),
     };
     if arguments.next().is_some() {
         return Err("usage: inspect_code <fresh-output-directory> [workload]".into());
@@ -30,44 +29,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir(&output)?;
     let (model, _) = support::workload(choice);
     let context = Context::create();
-    for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
-        for (name, chunk_trees, order) in [
-            ("tree-major-8-2sums", 8, TreeOrdering::Model),
-            ("tree-major-4-2sums", 4, TreeOrdering::Model),
-            ("tree-major-8-2sums-shared", 8, TreeOrdering::SharedFeatures),
-        ] {
-            let options = SortOptions {
-                chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                accumulators: NonZeroUsize::new(2).unwrap(),
-                order,
-            };
-            let plan = plan(&model, options);
-            let avx2_variant = (triple == "x86_64-unknown-linux-gnu")
-                .then_some((format!("{name}-avx2"), EmitOptions { avx2: true }));
-            for (name, emit_options) in
-                std::iter::once((name.to_owned(), EmitOptions::default())).chain(avx2_variant)
-            {
-                let assembly = emit_assembly_with(&context, &plan, triple, emit_options)?;
-                let path = output.join(format!("{triple}-{name}.s"));
-                File::create_new(&path)?.write_all(assembly.as_bytes())?;
-                println!("{}", path.display());
-                let path = path.with_extension("plan.txt");
-                let mut dump = File::create_new(&path)?;
-                writeln!(dump, "{options:?}\nsums={}\nchunks:", plan.sum_count())?;
-                for chunk in plan.chunks() {
-                    writeln!(dump, "{chunk:?}")?;
-                }
-                writeln!(dump, "predicates:")?;
-                for (id, predicate) in plan.predicates().iter().enumerate() {
-                    writeln!(dump, "{id}: {predicate:?}")?;
-                }
-                writeln!(dump, "commands:")?;
-                for (id, action) in plan.actions().iter().enumerate() {
-                    writeln!(dump, "{id}: {action:?}")?;
-                }
-                println!("{}", path.display());
-            }
+    let plan = plan(&model);
+    for (triple, name, avx2) in [
+        ("aarch64-apple-darwin", "kernel", false),
+        ("x86_64-unknown-linux-gnu", "kernel", false),
+        ("x86_64-unknown-linux-gnu", "kernel-avx2", true),
+    ] {
+        let assembly = if avx2 {
+            emit_assembly_with(&context, &plan, triple, EmitOptions { avx2: true })?
+        } else {
+            emit_assembly(&context, &plan, triple)?
+        };
+        let path = output.join(format!("{triple}-{name}.s"));
+        File::create_new(&path)?.write_all(assembly.as_bytes())?;
+        println!("{}", path.display());
+        let path = path.with_extension("plan.txt");
+        let mut dump = File::create_new(&path)?;
+        writeln!(dump, "sums={}\nchunks:", plan.sum_count())?;
+        for chunk in plan.chunks() {
+            writeln!(dump, "{chunk:?}")?;
         }
+        writeln!(dump, "predicates:")?;
+        for (id, predicate) in plan.predicates().iter().enumerate() {
+            writeln!(dump, "{id}: {predicate:?}")?;
+        }
+        writeln!(dump, "commands:")?;
+        for (id, action) in plan.actions().iter().enumerate() {
+            writeln!(dump, "{id}: {action:?}")?;
+        }
+        println!("{}", path.display());
     }
     Ok(())
 }

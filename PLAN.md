@@ -1,13 +1,11 @@
 # CatBoost JIT plan
 
-Status: the tree-major kernel is the only evaluation order. Constants come from one block through
-a pointer argument, each tree is evaluated with two-lane (NEON) or four-plus-two-lane (AVX2,
-opt-in) vector comparisons whose masks address a compile-time-permuted leaf table, and chunks of
-whole trees are chained with `musttail` continuations that carry only pointers and sums. Measured
-on the ARM64 host: 121 → 87 ns hot at 100 trees, ~345 → 237 at 300, cold neutral. x86-64 kernels
-run and match the reference under Rosetta 2; no x86 speed has been measured. The [README](README.md)
-documents the API and the numbers; `plans/perf-study-2026-09-28/` holds the study, the reviews and
-the results that led here.
+Status: one kernel, shared-feature tree order, eight trees per chunk, two sums. No planning
+options remain. Chunks use `musttail` continuations carrying only pointers and sums. The default
+emission compares two lanes; the x86 AVX2 twin compares four then two lanes. Recorded ARM64 hot
+medians are 85 / 228 ns at 100 / 300 trees. x86-64 kernels match the reference under Rosetta 2;
+no native x86 timing is recorded. The [README](README.md) documents the API;
+[RESULTS.md](plans/perf-study-2026-09-28/RESULTS.md) records the measurements and experiments.
 
 ## Goal and agreed constraints
 
@@ -25,13 +23,15 @@ row per call.
 
 ## Design as built
 
-Validated model → tree-major plan → chunked LLVM functions.
+Validated model → shared-feature tree order → eight-tree LLVM continuations.
 
-The plan is one `EvaluateTree` action per tree in tree order (constant trees keep an
-`Admit`/`Retire` pair), predicates padded with a constant-false `+inf` level on odd depths, leaves
-accumulated round-robin into a few sums, chunks of `chunk_trees` whole trees. Nothing is live across
-a chunk boundary except the row pointer, the constants pointer (plus a per-chunk threshold base on
-ARM64) and the sums; `preserve_nonecc` passes those in registers.
+The plan has one `EvaluateTree` action per tree with splits and one `Constant` action per
+constant tree. Each chunk starts with the highest feature-frequency score, then takes trees
+sharing the most features with the chunk; ties use model order. Constant trees come last.
+Odd depths get a constant-false `+inf` padding level. Leaves accumulate round-robin into two
+sums, clamped to the tree count (one sum for an empty forest). Eight whole trees form a chunk.
+Only the row pointer, constants pointer, per-chunk threshold base on ARM64, and sums cross
+chunk boundaries; `preserve_nonecc` passes them in registers.
 
 The emitter builds one private constant block: thresholds one slot per predicate in first-use
 order, then each tree's leaf block. A tree's thresholds are consecutive, so each lane pair or
@@ -59,10 +59,13 @@ threshold vector folds into `vcmpgt_oqpd`, and the leaf block keeps its original
   distinct features.
 - Chunks of 16 trees: a few percent faster than 8 but the first stack spills appear; 32 and 64
   spill heavily and lose the gain. Eight is the largest spill-free size.
+- Cross-boundary feature reuse through fences, volatile residency, scheduler changes, carried
+  vectors, and scalar feature arguments: fewer row loads paid back in spills, register moves,
+  lost threshold pairing, or packing. Scalar carry was neutral in model order and slower in
+  shared-feature order. Rejected; see [RESULTS.md](plans/perf-study-2026-09-28/RESULTS.md).
 
 ## Open
 
-- Four sums, only once a kernel is fast enough for the addition chain to show.
 - Native x86-64 timing of the SSE2 and AVX2 kernels; Rosetta cannot provide it.
 - A representative user model: real depth range, NaN modes, feature counts, and whether inputs
   arrive hot or cold decide what the deployment number is.
