@@ -8,23 +8,35 @@ use inkwell::context::Context;
 use std::{error::Error, hint::black_box, num::NonZeroUsize, time::Instant};
 use support::{ROWS, Workload, workload};
 use tigerboost::jit::compile;
-use tigerboost::sort_policy::{SortOptions, plan};
+use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
 
 const CALLS: usize = 50_000;
 const ROUNDS: usize = 5;
 
 fn tree_major_variants() -> impl Iterator<Item = (String, SortOptions)> {
-    [4, 8, 16].into_iter().flat_map(|chunk_trees| {
+    let model = [4, 8, 16].into_iter().flat_map(|chunk_trees| {
         [1, 2, 4].map(move |count| {
             (
                 format!("Tree-major, {chunk_trees} trees/chunk, sums {count}"),
                 SortOptions {
                     chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
                     accumulators: NonZeroUsize::new(count).unwrap(),
+                    order: TreeOrdering::Model,
                 },
             )
         })
-    })
+    });
+    let shared = [8, 16].into_iter().map(|chunk_trees| {
+        (
+            format!("Tree-major, {chunk_trees} trees/chunk, sums 2, shared features"),
+            SortOptions {
+                chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
+                accumulators: NonZeroUsize::new(2).unwrap(),
+                order: TreeOrdering::SharedFeatures,
+            },
+        )
+    });
+    model.chain(shared)
 }
 
 fn measure(predict: impl Fn(usize) -> f64, calls: usize) -> f64 {
@@ -174,15 +186,28 @@ mod tests {
             }
             let expected = [4, 8, 16]
                 .into_iter()
-                .flat_map(|chunk_trees| [1, 2, 4].map(move |sums| (chunk_trees, sums)));
-            assert_eq!(tree_major_variants().count(), 9);
-            for ((label, options), (chunk_trees, sums)) in tree_major_variants().zip(expected) {
+                .flat_map(|chunk_trees| {
+                    [1, 2, 4].map(move |sums| (chunk_trees, sums, TreeOrdering::Model))
+                })
+                .chain([8, 16].map(|chunk_trees| (chunk_trees, 2, TreeOrdering::SharedFeatures)));
+            assert_eq!(tree_major_variants().count(), 11);
+            for ((label, options), (chunk_trees, sums, order)) in
+                tree_major_variants().zip(expected)
+            {
                 assert_eq!(
                     label,
-                    format!("Tree-major, {chunk_trees} trees/chunk, sums {sums}")
+                    format!(
+                        "Tree-major, {chunk_trees} trees/chunk, sums {sums}{}",
+                        if order == TreeOrdering::SharedFeatures {
+                            ", shared features"
+                        } else {
+                            ""
+                        }
+                    )
                 );
                 assert_eq!(options.chunk_trees.get(), chunk_trees);
                 assert_eq!(options.accumulators.get(), sums);
+                assert_eq!(options.order, order);
                 let compiled = compile(&context, &plan(&model, options)).unwrap();
                 let (_, distinct) = verify(&model, &compiled, &rows, CALLS);
                 assert!(distinct > 1, "{kind:?} {label}");

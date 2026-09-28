@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{fmt, num::NonZeroUsize};
 
 use crate::parsed_tree::{Discriminator, Trees};
 
@@ -14,10 +14,17 @@ pub struct PredicateId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SumId(pub usize);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeOrdering {
+    Model,
+    SharedFeatures,
+}
+
+#[derive(Clone, Copy)]
 pub struct SortOptions {
     pub chunk_trees: NonZeroUsize,
     pub accumulators: NonZeroUsize,
+    pub order: TreeOrdering,
 }
 
 impl Default for SortOptions {
@@ -25,7 +32,21 @@ impl Default for SortOptions {
         Self {
             chunk_trees: NonZeroUsize::new(8).unwrap(),
             accumulators: NonZeroUsize::new(2).unwrap(),
+            order: TreeOrdering::Model,
         }
+    }
+}
+
+impl fmt::Debug for SortOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("SortOptions");
+        debug
+            .field("chunk_trees", &self.chunk_trees)
+            .field("accumulators", &self.accumulators);
+        if self.order != TreeOrdering::Model {
+            debug.field("order", &self.order);
+        }
+        debug.finish()
     }
 }
 
@@ -81,7 +102,11 @@ impl Plan<'_> {
 
 pub fn plan(model: &Trees, options: SortOptions) -> Plan<'_> {
     let sum_count = options.accumulators.get().min(model.trees().len().max(1));
-    let mut plan = tree_major(model, sum_count);
+    let visit_order = match options.order {
+        TreeOrdering::Model => (0..model.trees().len()).map(TreeId).collect(),
+        TreeOrdering::SharedFeatures => shared_feature_order(model, options.chunk_trees),
+    };
+    let mut plan = tree_major(model, sum_count, &visit_order);
     for source in 1..sum_count {
         plan.actions.push(Action::AddSums {
             destination: SumId(0),
@@ -97,7 +122,11 @@ pub fn plan(model: &Trees, options: SortOptions) -> Plan<'_> {
     plan
 }
 
-fn tree_major(trees: &Trees, sum_count: usize) -> Plan<'_> {
+fn tree_major<'model>(
+    trees: &'model Trees,
+    sum_count: usize,
+    visit_order: &[TreeId],
+) -> Plan<'model> {
     let mut plan = Plan {
         model: trees,
         predicates: Vec::new(),
@@ -105,9 +134,9 @@ fn tree_major(trees: &Trees, sum_count: usize) -> Plan<'_> {
         sum_count,
         chunks: Vec::new(),
     };
-    for (tree, description) in trees.trees().iter().enumerate() {
-        let tree = TreeId(tree);
-        let sum = SumId(tree.0 % sum_count);
+    for (visit_position, &tree) in visit_order.iter().enumerate() {
+        let description = &trees.trees()[tree.0];
+        let sum = SumId(visit_position % sum_count);
         if description.selections.is_empty() {
             plan.actions.push(Action::Admit(tree));
             plan.actions.push(Action::Retire { tree, sum });
@@ -115,7 +144,7 @@ fn tree_major(trees: &Trees, sum_count: usize) -> Plan<'_> {
             let start = plan.predicates.len();
             plan.predicates
                 .extend(description.selections.iter().cloned());
-            if description.selections.len() % 2 != 0 {
+            if !description.selections.len().is_multiple_of(2) {
                 plan.predicates.push(Discriminator {
                     feature_idx: description.selections[0].feature_idx,
                     threshold: f64::INFINITY,
@@ -129,6 +158,83 @@ fn tree_major(trees: &Trees, sum_count: usize) -> Plan<'_> {
         }
     }
     plan
+}
+
+fn shared_feature_order(trees: &Trees, chunk_trees: NonZeroUsize) -> Vec<TreeId> {
+    let mut frequencies = vec![0usize; trees.feature_modes().len()];
+    for split in trees.trees().iter().flat_map(|tree| tree.selections.iter()) {
+        frequencies[split.feature_idx.0] = frequencies[split.feature_idx.0]
+            .checked_add(1)
+            .expect("feature frequency overflow");
+    }
+
+    let mut scores = Vec::with_capacity(trees.trees().len());
+    let mut features = Vec::with_capacity(trees.trees().len());
+    let mut remaining = Vec::new();
+    let mut constants = Vec::new();
+    for (tree, description) in trees.trees().iter().enumerate() {
+        let score = description
+            .selections
+            .iter()
+            .map(|split| frequencies[split.feature_idx.0])
+            .try_fold(0usize, usize::checked_add)
+            .expect("tree feature score overflow");
+        scores.push(score);
+        let mut distinct: Vec<_> = description
+            .selections
+            .iter()
+            .map(|split| split.feature_idx.0)
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        features.push(distinct);
+        if description.selections.is_empty() {
+            constants.push(TreeId(tree));
+        } else {
+            remaining.push(TreeId(tree));
+        }
+    }
+
+    let mut order = Vec::with_capacity(trees.trees().len());
+    let mut chunk_features = vec![false; trees.feature_modes().len()];
+    while !remaining.is_empty() {
+        chunk_features.fill(false);
+        let seed = remaining
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, tree)| (scores[tree.0], std::cmp::Reverse(tree.0)))
+            .map(|(position, _)| position)
+            .unwrap();
+        let seed = remaining.remove(seed);
+        for &feature in &features[seed.0] {
+            chunk_features[feature] = true;
+        }
+        order.push(seed);
+
+        let mut chunk_len = 1;
+        while chunk_len < chunk_trees.get() && !remaining.is_empty() {
+            let next = remaining
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, tree)| {
+                    let overlap = features[tree.0]
+                        .iter()
+                        .filter(|&&feature| chunk_features[feature])
+                        .count();
+                    (overlap, std::cmp::Reverse(tree.0))
+                })
+                .map(|(position, _)| position)
+                .unwrap();
+            let next = remaining.remove(next);
+            for &feature in &features[next.0] {
+                chunk_features[feature] = true;
+            }
+            order.push(next);
+            chunk_len += 1;
+        }
+    }
+    order.extend(constants);
+    order
 }
 
 #[cfg(test)]

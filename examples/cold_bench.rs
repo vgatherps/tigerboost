@@ -16,11 +16,12 @@ use std::{
 };
 use support::{ROWS, Workload, workload};
 use tigerboost::jit::{CompiledModel, compile};
-use tigerboost::sort_policy::{SortOptions, plan};
+use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
 
 const DEFAULT_SAMPLES: usize = 10_000;
 const VERIFY_CALLS: usize = 50_000;
-const USAGE: &str = "usage: cold_bench <workload> [--samples N] [--out PATH] [--chunk-trees N]";
+const USAGE: &str =
+    "usage: cold_bench <workload> [--samples N] [--out PATH] [--chunk-trees N] [--shared-features]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Arguments {
@@ -29,6 +30,7 @@ struct Arguments {
     samples: usize,
     out: Option<PathBuf>,
     chunk_trees: NonZeroUsize,
+    order: TreeOrdering,
 }
 
 fn parse_workload(name: &str) -> Result<Workload, &'static str> {
@@ -51,6 +53,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
     let mut samples = None;
     let mut out = None;
     let mut chunk_trees = None;
+    let mut shared_features = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--samples" if samples.is_none() => {
@@ -67,6 +70,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
             "--chunk-trees" if chunk_trees.is_none() => {
                 chunk_trees = Some(arguments.next().ok_or(USAGE)?.parse().map_err(|_| USAGE)?);
             }
+            "--shared-features" if !shared_features => shared_features = true,
             _ => return Err(USAGE),
         }
     }
@@ -76,6 +80,11 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
         samples: samples.unwrap_or(DEFAULT_SAMPLES),
         out,
         chunk_trees: chunk_trees.unwrap_or(SortOptions::default().chunk_trees),
+        order: if shared_features {
+            TreeOrdering::SharedFeatures
+        } else {
+            TreeOrdering::Model
+        },
     })
 }
 
@@ -261,6 +270,7 @@ struct Measurement {
 struct Report {
     workload_name: String,
     chunk_trees: NonZeroUsize,
+    order: TreeOrdering,
     tree_count: usize,
     feature_count: usize,
     timer_resolution_ns: f64,
@@ -395,6 +405,7 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
     let context = Context::create();
     let options = SortOptions {
         chunk_trees: arguments.chunk_trees,
+        order: arguments.order,
         ..SortOptions::default()
     };
     let compiled = compile(&context, &plan(&model, options))?;
@@ -437,6 +448,7 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
     Ok(Report {
         workload_name: arguments.workload_name.clone(),
         chunk_trees: arguments.chunk_trees,
+        order: arguments.order,
         tree_count,
         feature_count,
         timer_resolution_ns,
@@ -448,8 +460,12 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
 
 fn print_report(report: &Report) {
     println!(
-        "Workload {}: {} trees, depth 6, {} features, {ROWS} rows; tree-major, {} trees/chunk",
-        report.workload_name, report.tree_count, report.feature_count, report.chunk_trees
+        "Workload {}: {} trees, depth 6, {} features, {ROWS} rows; tree-major, {} trees/chunk, {:?}",
+        report.workload_name,
+        report.tree_count,
+        report.feature_count,
+        report.chunk_trees,
+        report.order
     );
     println!(
         "timer resolution about {:.1} ns",
@@ -547,7 +563,13 @@ mod tests {
 
     #[test]
     fn cli_parses_named_and_generic_workloads() {
-        assert_eq!(arguments(&["100x100"]).unwrap().chunk_trees.get(), 8);
+        let defaults = arguments(&["100x100"]).unwrap();
+        assert_eq!(defaults.chunk_trees.get(), 8);
+        assert_eq!(defaults.order, TreeOrdering::Model);
+        assert_eq!(
+            arguments(&["100x100", "--shared-features"]).unwrap().order,
+            TreeOrdering::SharedFeatures
+        );
         for (value, expected) in [("1", 1), ("4", 4), ("16", 16)] {
             assert_eq!(
                 arguments(&["100x100", "--chunk-trees", value])
@@ -563,6 +585,7 @@ mod tests {
             vec!["100x100", "--chunk-trees", "0"],
             vec!["100x100", "--chunk-trees", "-1"],
             vec!["100x100", "--chunk-trees", "4", "--chunk-trees", "8"],
+            vec!["100x100", "--shared-features", "--shared-features"],
         ] {
             assert_eq!(arguments(&values), Err(USAGE));
         }
@@ -608,16 +631,19 @@ mod tests {
     fn verified_kernel_matches_reference_before_timing() {
         let (model, rows) = workload(Workload::Distinct(20, 30));
         let context = Context::create();
-        for chunk_trees in [4, 8] {
-            let options = SortOptions {
-                chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                ..SortOptions::default()
-            };
-            let compiled = compile(&context, &plan(&model, options)).unwrap();
-            let (scores, _) = verify(&model, &compiled, &rows, VERIFY_CALLS);
-            assert_eq!(scores.len(), ROWS);
-            for (row, score) in rows.iter().zip(scores) {
-                assert_eq!(score, model.predict(row).unwrap());
+        for order in [TreeOrdering::Model, TreeOrdering::SharedFeatures] {
+            for chunk_trees in [4, 8] {
+                let options = SortOptions {
+                    chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
+                    order,
+                    ..SortOptions::default()
+                };
+                let compiled = compile(&context, &plan(&model, options)).unwrap();
+                let (scores, _) = verify(&model, &compiled, &rows, VERIFY_CALLS);
+                assert_eq!(scores.len(), ROWS);
+                for (row, score) in rows.iter().zip(scores) {
+                    assert_eq!(score, model.predict(row).unwrap());
+                }
             }
         }
     }
@@ -652,6 +678,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(report.chunk_trees.to_string(), chunk_trees);
+            assert_eq!(report.order, TreeOrdering::Model);
             assert_eq!(report.measurements.len(), Condition::ALL.len() * 2);
             for sequence in [RowSequence::Shuffled, RowSequence::Dependent] {
                 for condition in Condition::ALL {

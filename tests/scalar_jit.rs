@@ -4,7 +4,7 @@ use tigerboost::jit::{EmitOptions, compile, compile_with};
 use tigerboost::parsed_tree::{
     Discriminator, FeatureIndex, NanMode, RowLengthError, SingleTree, Trees,
 };
-use tigerboost::sort_policy::{SortOptions, plan};
+use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
 
 fn split(feature: usize, threshold: f64) -> Discriminator {
     Discriminator {
@@ -186,12 +186,17 @@ fn tree_major_dropped_model_and_odd_depth_last_tree() {
 }
 
 fn configurations() -> impl Iterator<Item = SortOptions> {
-    [1, 3, 8].into_iter().flat_map(|chunk_trees| {
-        [1, 2, 4].map(move |count| SortOptions {
-            chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-            accumulators: NonZeroUsize::new(count).unwrap(),
+    [TreeOrdering::Model, TreeOrdering::SharedFeatures]
+        .into_iter()
+        .flat_map(|order| {
+            [1, 3, 8].into_iter().flat_map(move |chunk_trees| {
+                [1, 2, 4].map(move |count| SortOptions {
+                    chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
+                    accumulators: NonZeroUsize::new(count).unwrap(),
+                    order,
+                })
+            })
         })
-    })
 }
 
 #[test]

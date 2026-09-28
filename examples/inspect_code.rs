@@ -11,7 +11,7 @@ use std::{
 };
 use support::Workload;
 use tigerboost::jit::{EmitOptions, emit_assembly_with};
-use tigerboost::sort_policy::{SortOptions, plan};
+use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
@@ -31,10 +31,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (model, _) = support::workload(choice);
     let context = Context::create();
     for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
-        for (name, chunk_trees) in [("tree-major-8-2sums", 8), ("tree-major-4-2sums", 4)] {
+        for (name, chunk_trees, order) in [
+            ("tree-major-8-2sums", 8, TreeOrdering::Model),
+            ("tree-major-4-2sums", 4, TreeOrdering::Model),
+            ("tree-major-8-2sums-shared", 8, TreeOrdering::SharedFeatures),
+        ] {
             let options = SortOptions {
                 chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
                 accumulators: NonZeroUsize::new(2).unwrap(),
+                order,
             };
             let plan = plan(&model, options);
             let avx2_variant = (triple == "x86_64-unknown-linux-gnu")

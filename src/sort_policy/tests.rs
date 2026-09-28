@@ -6,6 +6,7 @@ fn default_uses_eight_trees_per_chunk_and_two_sums() {
     let options = SortOptions::default();
     assert_eq!(options.chunk_trees.get(), 8);
     assert_eq!(options.accumulators.get(), 2);
+    assert_eq!(options.order, TreeOrdering::Model);
 }
 
 fn tree(splits: &[(usize, f64)]) -> SingleTree {
@@ -146,6 +147,27 @@ fn tree_major_replay_matches_reference() {
 }
 
 #[test]
+fn shared_features_replay_matches_reference() {
+    let trees = forest(vec![
+        tree(&[(0, 0.0), (1, 1.0)]),
+        tree(&[]),
+        tree(&[(2, 0.0), (0, 1.0), (2, -1.0)]),
+        tree(&[(0, -2.0), (1, 2.0)]),
+    ]);
+    let plan = plan(
+        &trees,
+        SortOptions {
+            chunk_trees: NonZeroUsize::new(2).unwrap(),
+            order: TreeOrdering::SharedFeatures,
+            ..SortOptions::default()
+        },
+    );
+    for row in [[0.0; 4], [2.0; 4], [f64::NAN; 4], [f64::NEG_INFINITY; 4]] {
+        assert_eq!(replay(&plan, &row), trees.predict(&row).unwrap());
+    }
+}
+
+#[test]
 fn empty_and_constant_trees_need_no_feature_loads() {
     let empty = forest(vec![]);
     assert_eq!(check(&empty, &[0.0; 4]).actions, [Action::ReturnBias]);
@@ -235,6 +257,242 @@ fn empty_plan_returns_bias_without_scaling_or_reduction() {
     assert_eq!(replay(&plan, &[]).to_bits(), (-0.0f64).to_bits());
 }
 
+fn visit_order(plan: &Plan<'_>) -> Vec<TreeId> {
+    plan.actions()
+        .iter()
+        .filter_map(|action| match action {
+            Action::Admit(tree) | Action::EvaluateTree { tree, .. } => Some(*tree),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn shared_features_order_is_a_permutation_and_deterministic() {
+    let trees = forest(vec![
+        tree(&[(0, 0.0), (1, 0.0)]),
+        tree(&[]),
+        tree(&[(2, 0.0), (2, 1.0)]),
+        tree(&[(2, 1.0), (3, 0.0)]),
+        tree(&[]),
+        tree(&[(0, 1.0), (3, 1.0)]),
+    ]);
+    let options = SortOptions {
+        chunk_trees: NonZeroUsize::new(2).unwrap(),
+        order: TreeOrdering::SharedFeatures,
+        ..SortOptions::default()
+    };
+    let first = plan(&trees, options);
+    let second = plan(&trees, options);
+    assert_eq!(first.actions(), second.actions());
+    assert_eq!(first.chunks(), second.chunks());
+    let order = visit_order(&first);
+    assert_eq!(order.len(), trees.trees().len());
+    let mut sorted = order.clone();
+    sorted.sort_by_key(|tree| tree.0);
+    assert_eq!(
+        sorted,
+        (0..trees.trees().len()).map(TreeId).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        order,
+        [
+            TreeId(2),
+            TreeId(3),
+            TreeId(5),
+            TreeId(0),
+            TreeId(1),
+            TreeId(4)
+        ]
+    );
+    let sums: Vec<_> = first
+        .actions()
+        .iter()
+        .filter_map(|action| match action {
+            Action::Retire { sum, .. } | Action::EvaluateTree { sum, .. } => Some(*sum),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sums,
+        [SumId(0), SumId(1), SumId(0), SumId(1), SumId(0), SumId(1)]
+    );
+}
+
+fn feature_reuse(plan: &Plan<'_>) -> usize {
+    plan.chunks()
+        .iter()
+        .map(|chunk| {
+            let mut lane_fills = 0;
+            let mut features = vec![false; plan.model().feature_modes().len()];
+            for action in &plan.actions()[chunk.actions.clone()] {
+                if let Action::EvaluateTree { tree, .. } = action {
+                    let selections = &plan.model().trees()[tree.0].selections;
+                    lane_fills += selections.len();
+                    for split in selections {
+                        features[split.feature_idx.0] = true;
+                    }
+                }
+            }
+            lane_fills - features.into_iter().filter(|present| *present).count()
+        })
+        .sum()
+}
+
+#[test]
+fn shared_features_chunks_share_more_features_than_model_order() {
+    let trees = forest(vec![
+        tree(&[(0, 0.0), (1, 0.0), (0, 1.0), (1, 1.0)]),
+        tree(&[(2, 0.0), (3, 0.0), (2, 1.0), (3, 1.0)]),
+        tree(&[(0, 2.0), (1, 2.0), (0, 3.0), (1, 3.0)]),
+        tree(&[(2, 2.0), (3, 2.0), (2, 3.0), (3, 3.0)]),
+    ]);
+    let options = SortOptions {
+        chunk_trees: NonZeroUsize::new(2).unwrap(),
+        ..SortOptions::default()
+    };
+    let model = plan(&trees, options);
+    let shared = plan(
+        &trees,
+        SortOptions {
+            order: TreeOrdering::SharedFeatures,
+            ..options
+        },
+    );
+    assert!(feature_reuse(&shared) > feature_reuse(&model));
+}
+
+#[test]
+fn partition_trees_counts_visit_order() {
+    let trees = forest(vec![
+        tree(&[(0, 0.0), (1, 0.0)]),
+        tree(&[]),
+        tree(&[(2, 0.0), (3, 0.0)]),
+        tree(&[(0, 1.0), (1, 1.0)]),
+    ]);
+    let predicates = trees
+        .trees()
+        .iter()
+        .flat_map(|tree| tree.selections.iter().cloned())
+        .collect();
+    let plan = Plan {
+        model: &trees,
+        predicates,
+        actions: vec![
+            Action::EvaluateTree {
+                tree: TreeId(3),
+                predicates: vec![PredicateId(0), PredicateId(1)],
+                sum: SumId(0),
+            },
+            Action::Admit(TreeId(1)),
+            Action::Retire {
+                tree: TreeId(1),
+                sum: SumId(1),
+            },
+            Action::EvaluateTree {
+                tree: TreeId(0),
+                predicates: vec![PredicateId(2), PredicateId(3)],
+                sum: SumId(0),
+            },
+            Action::EvaluateTree {
+                tree: TreeId(2),
+                predicates: vec![PredicateId(4), PredicateId(5)],
+                sum: SumId(1),
+            },
+            Action::AddSums {
+                destination: SumId(0),
+                source: SumId(1),
+            },
+            Action::ReturnScaled(SumId(0)),
+        ],
+        sum_count: 2,
+        chunks: Vec::new(),
+    };
+    assert_eq!(
+        continuation::partition_trees(&plan, NonZeroUsize::new(2).unwrap()),
+        [
+            Chunk {
+                actions: 0..3,
+                tests: 2,
+            },
+            Chunk {
+                actions: 3..7,
+                tests: 4,
+            },
+        ]
+    );
+}
+
+#[test]
+fn model_order_plan_is_unchanged() {
+    let trees = forest(vec![
+        tree(&[(0, 0.0)]),
+        tree(&[]),
+        tree(&[(1, 0.0), (2, 0.0)]),
+        tree(&[(3, 0.0), (2, 1.0), (1, 2.0)]),
+    ]);
+    let actual = plan(
+        &trees,
+        SortOptions {
+            chunk_trees: NonZeroUsize::new(2).unwrap(),
+            order: TreeOrdering::Model,
+            ..SortOptions::default()
+        },
+    );
+    assert_eq!(
+        visit_order(&actual),
+        [TreeId(0), TreeId(1), TreeId(2), TreeId(3)]
+    );
+    assert_eq!(
+        actual.actions(),
+        [
+            Action::EvaluateTree {
+                tree: TreeId(0),
+                predicates: vec![PredicateId(0), PredicateId(1)],
+                sum: SumId(0),
+            },
+            Action::Admit(TreeId(1)),
+            Action::Retire {
+                tree: TreeId(1),
+                sum: SumId(1),
+            },
+            Action::EvaluateTree {
+                tree: TreeId(2),
+                predicates: vec![PredicateId(2), PredicateId(3)],
+                sum: SumId(0),
+            },
+            Action::EvaluateTree {
+                tree: TreeId(3),
+                predicates: vec![
+                    PredicateId(4),
+                    PredicateId(5),
+                    PredicateId(6),
+                    PredicateId(7),
+                ],
+                sum: SumId(1),
+            },
+            Action::AddSums {
+                destination: SumId(0),
+                source: SumId(1),
+            },
+            Action::ReturnScaled(SumId(0)),
+        ]
+    );
+    assert_eq!(
+        actual.chunks(),
+        [
+            Chunk {
+                actions: 0..3,
+                tests: 2,
+            },
+            Chunk {
+                actions: 3..7,
+                tests: 6,
+            },
+        ]
+    );
+}
+
 #[test]
 fn plan_is_deterministic_and_chunks_whole_trees() {
     let mut random = 0x4d59_5df4_d0f3_3173u64;
@@ -259,6 +517,7 @@ fn plan_is_deterministic_and_chunks_whole_trees() {
         let options = SortOptions {
             chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
             accumulators: NonZeroUsize::new([1, 2, 4][case / 3 % 3]).unwrap(),
+            order: TreeOrdering::Model,
         };
         let first = plan(&trees, options);
         let second = plan(&trees, options);

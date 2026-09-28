@@ -11,7 +11,7 @@ use std::{
 use support::{ROWS, Workload};
 use tigerboost::jit::{EmitOptions, compile, emit_assembly_with};
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
-use tigerboost::sort_policy::{SortOptions, plan};
+use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
 
 const USAGE: &str = "usage: x86_check <workload> <fresh-output-dir> [--avx2]";
 
@@ -114,18 +114,25 @@ fn workload(choice: WorkloadChoice) -> (Trees, Vec<Vec<f64>>) {
     }
 }
 
-fn variants() -> [(&'static str, SortOptions); 3] {
+fn variants() -> [(&'static str, SortOptions); 4] {
     [
-        ("tree-major-4-2sums", 4, 2),
-        ("tree-major-8-2sums", 8, 2),
-        ("tree-major-8-1sum", 8, 1),
+        ("tree-major-4-2sums", 4, 2, TreeOrdering::Model),
+        ("tree-major-8-2sums", 8, 2, TreeOrdering::Model),
+        ("tree-major-8-1sum", 8, 1, TreeOrdering::Model),
+        (
+            "tree-major-8-2sums-shared",
+            8,
+            2,
+            TreeOrdering::SharedFeatures,
+        ),
     ]
-    .map(|(name, chunk_trees, accumulators)| {
+    .map(|(name, chunk_trees, accumulators, order)| {
         (
             name,
             SortOptions {
                 chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
                 accumulators: NonZeroUsize::new(accumulators).unwrap(),
+                order,
             },
         )
     })
@@ -316,7 +323,7 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("variant "))
                 .count(),
-            3
+            4
         );
         for (name, _) in variants() {
             let assembly = fs::read(directory.0.join(format!("{name}.s"))).unwrap();

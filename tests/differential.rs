@@ -2,7 +2,7 @@ use inkwell::context::Context;
 use std::num::NonZeroUsize;
 use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
-use tigerboost::sort_policy::{SortOptions, plan};
+use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
 
 fn next(state: &mut u64, limit: usize) -> usize {
     *state ^= *state >> 12;
@@ -69,13 +69,16 @@ fn seeded_forests_preserve_every_trees_leaf_index() {
         let context = Context::create();
         let expected: Vec<_> = rows.iter().map(|row| model.predict(row).unwrap()).collect();
         let mut kernels = Vec::new();
-        for chunk_trees in [1, 3, 8] {
-            let options = SortOptions {
-                chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
-                accumulators,
-            };
-            let plan = plan(&model, options);
-            kernels.push((options, compile(&context, &plan).unwrap()));
+        for order in [TreeOrdering::Model, TreeOrdering::SharedFeatures] {
+            for chunk_trees in [1, 3, 8] {
+                let options = SortOptions {
+                    chunk_trees: NonZeroUsize::new(chunk_trees).unwrap(),
+                    accumulators,
+                    order,
+                };
+                let plan = plan(&model, options);
+                kernels.push((options, compile(&context, &plan).unwrap()));
+            }
         }
         drop(model);
         for (options, compiled) in kernels {

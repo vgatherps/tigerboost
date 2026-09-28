@@ -15,28 +15,28 @@ pub(super) fn partition_trees(plan: &Plan<'_>, limit: NonZeroUsize) -> Vec<Chunk
         actions: 0..0,
         tests: 0,
     }];
+    let mut trees = 0usize;
     for (cursor, action) in plan.actions().iter().enumerate() {
-        let (tree, tests) = match action {
-            Action::Admit(tree) => (Some(*tree), 0),
-            Action::EvaluateTree {
-                tree, predicates, ..
-            } => (Some(*tree), predicates.len()),
-            _ => (None, 0),
+        let tests = match action {
+            Action::Admit(_) => Some(0),
+            Action::EvaluateTree { predicates, .. } => Some(predicates.len()),
+            _ => None,
         };
-        if let Some(tree) = tree
-            && tree.0 != 0
-            && tree.0 % limit.get() == 0
-        {
-            chunks.push(Chunk {
-                actions: cursor..cursor,
-                tests: 0,
-            });
+        if let Some(tests) = tests {
+            if trees != 0 && trees.is_multiple_of(limit.get()) {
+                chunks.push(Chunk {
+                    actions: cursor..cursor,
+                    tests: 0,
+                });
+            }
+            trees = trees.checked_add(1).expect("tree count overflow");
+            let chunk = chunks.last_mut().unwrap();
+            chunk.tests = chunk
+                .tests
+                .checked_add(tests)
+                .expect("chunk test count overflow");
         }
         let chunk = chunks.last_mut().unwrap();
-        chunk.tests = chunk
-            .tests
-            .checked_add(tests)
-            .expect("chunk test count overflow");
         chunk.actions.end = cursor + 1;
     }
     chunks
