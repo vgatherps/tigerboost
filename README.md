@@ -59,7 +59,8 @@ with the reference are not promised. Comparisons retain NaN/infinity semantics.
 ## How a prediction runs
 
 `sort_policy::plan(&model, SortOptions { chunk_trees, accumulators })` produces
-a plan without LLVM: one action per tree, in tree order, grouped into chunks of
+a plan without LLVM: one action per tree with splits (a constant tree keeps an
+`Admit`/`Retire` pair), in tree order, grouped into chunks of
 `chunk_trees` whole trees, with leaves accumulated round-robin into
 `accumulators` independent sums that are added at the end. The default is eight
 trees per chunk and two sums.
@@ -77,7 +78,8 @@ defined by simulating that lane arithmetic for every bit pattern, and checked to
 be a bijection when the model is compiled.
 
 Each chunk is a separate `noinline preserve_nonecc` function that transfers only
-the row pointer, the constants pointer, and the running sums to the next chunk
+the row pointer, the constants pointer (on ARM64 also a per-chunk threshold
+base so paired loads stay within `ldp` range), and the running sums to the next chunk
 with a `musttail` call; a C `predict` wrapper calls the first one. The split
 exists to stop LLVM from hoisting loads across many trees and spilling; eight
 trees per chunk is the largest spill-free size measured on ARM64.
@@ -125,15 +127,17 @@ random feature reuse and globally distinct thresholds.
 | 100 trees, 100 features | hot median ns | cold p50 ns |
 |---|---:|---:|
 | scheduled scalar kernel before this work | 121 | 791 |
-| tree-major, 8 trees per chunk, 2 sums | 87 | 792 |
+| tree-major, 8 trees per chunk, 2 sums | 87 | 792 (measured at 4 per chunk) |
 
 | 300 trees, 100 features | hot median ns |
 |---|---:|
 | scheduled scalar kernel before this work | ~345 |
 | tree-major, 8 trees per chunk, 2 sums | 237 |
 
-Static, 100 trees: ARM64 2253 instructions (22.5 per tree, no continuation stack
-traffic); x86-64 2332 (SSE2) or 1486 with `avx2`. Rosetta 2 runs the SSE2 kernel at
+Static, 100 trees, four trees per chunk: ARM64 2253 instructions (22.5 per tree,
+no continuation stack traffic); x86-64 2332 (SSE2) or 1486 with `avx2`. Eight per
+chunk is the largest spill-free size and the default; the static counts were
+recorded at four. Rosetta 2 runs the SSE2 kernel at
 106 ns and the scalar kernel it replaced at 168 ns, the same ordering as native
 ARM64. Details, the study that led here, and the review record are in
 `plans/perf-study-2026-09-28/`.

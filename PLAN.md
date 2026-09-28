@@ -53,7 +53,8 @@ threshold vector folds into `vcmpgt_oqpd`, and the leaf block keeps its original
 - Binarize-then-byte-compare: only wins with shared thresholds, which real models lack.
 - Small code model for MCJIT, backend `Default`, extra IR passes, host CPU strings: no gain or
   unsafe with the default memory manager.
-- Chunks of 16 or more trees: faster by a few percent but spills reappear.
+- Chunks of 16 trees: a few percent faster than 8 but the first stack spills appear; 32 and 64
+  spill heavily and lose the gain. Eight is the largest spill-free size.
 
 ## Open
 
