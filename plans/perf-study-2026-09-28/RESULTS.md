@@ -106,11 +106,33 @@ which says nothing about a real x86 core and is why no AVX2 speed claim exists.
 No native x86 timing exists. The llvm-mca estimate from the study (about 3x over scalar on Alder
 Lake, 1.7x on Zen 3) is the only performance indication for this path.
 
+## Step 4: tree-major only (commit 04475f8) and the two emission-order experiments (branch `impl/emission-experiments`, not merged)
+
+The scheduler, register budgets, two-lane threshold pairing, feature Load/Release actions,
+comparison-count partitioner and carried slots were deleted (net about 2200 lines); tree-major
+emission stayed byte-identical on both targets with and without AVX2.
+
+Two opt-in emission-order changes were then built and measured on the simplified emitter:
+issuing a chunk's leaf loads after all its compares (`batched_leaves`), and reusing a feature
+already loaded inside the chunk instead of loading it again (`reuse_features`). Result: with
+`reuse_features` the final assembly is byte-identical to the default on ARM64, generic x86 and
+AVX2, because `early-cse` already merges duplicate loads within a function; the plan-level reuse
+is 132 of 600 lane fills (22%) and LLVM was already taking it. With `batched_leaves` the
+assembly differs by two to four instructions because the machine scheduler already reorders the
+independent leaf loads. Neither option is merged.
+
+Hot medians in that run (ns, 100 / 300 trees): tree-major 8 per chunk 90.7 / 240.1; batched
+89.7 / 238.9; reuse 91.6 / 242.4; both 89.0 / 245.4; 16 per chunk 88.2 / 232.6. Cold p50 after
+64 MiB for the four identical-or-nearly-identical kernels: 791, 750, 875, 833 ns. That spread on
+identical code is the noise band of `cold_bench` on this host: cold differences under about
+150 ns at p50 carry no information.
+
+Remaining load counts, 100 trees, 8 per chunk: ARM64 316 `ldr d` + 172 `ld1.d` feature loads,
+186 `ldp` (threshold pairs), 26 `ldr q`; x86 SSE2 292 `movsd` + 174 `movhpd`; AVX2 274 `vmovsd`
++ 161 `vmovhpd`. These are distinct features per chunk; no further reuse exists within a chunk.
+
 ## Open
 
 - Default order: stay scalar, or tree-major 8 (spill-free) / 16 (fastest)? Maintainer decision.
 - Native x86 timing of the AVX2 path (needs real hardware).
-- Within-chunk feature reuse for lane fills (the study bounds it at 13-20% fewer load slots on
-  NEON; on x86 it also matters: `vmovhpd m64` is a load-port uop plus a shuffle, `vunpcklpd` from a
-  register is the shuffle alone, so instruction counts tie but load-port pressure drops).
 - x86 execution evidence (Rosetta for correctness; a real host for timing).

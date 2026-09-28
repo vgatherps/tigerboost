@@ -53,14 +53,15 @@ threshold vector folds into `vcmpgt_oqpd`, and the leaf block keeps its original
 - Binarize-then-byte-compare: only wins with shared thresholds, which real models lack.
 - Small code model for MCJIT, backend `Default`, extra IR passes, host CPU strings: no gain or
   unsafe with the default memory manager.
+- Emission-order changes inside a chunk (leaf loads issued after all compares; reuse of a feature
+  already loaded in the chunk): the emitted assembly is identical or within four instructions,
+  because `early-cse` and the machine scheduler already do both. The remaining row loads are
+  distinct features.
 - Chunks of 16 trees: a few percent faster than 8 but the first stack spills appear; 32 and 64
   spill heavily and lose the gain. Eight is the largest spill-free size.
 
 ## Open
 
-- Emission-order experiments: issue a chunk's leaf loads after all its compares; reuse features
-  already loaded within a chunk (bounded at 10 to 20% fewer loads on NEON, and it relieves load
-  ports on x86).
 - Four sums, only once a kernel is fast enough for the addition chain to show.
 - Native x86-64 timing of the SSE2 and AVX2 kernels; Rosetta cannot provide it.
 - A representative user model: real depth range, NaN modes, feature counts, and whether inputs
