@@ -110,5 +110,7 @@ Lake, 1.7x on Zen 3) is the only performance indication for this path.
 
 - Default order: stay scalar, or tree-major 8 (spill-free) / 16 (fastest)? Maintainer decision.
 - Native x86 timing of the AVX2 path (needs real hardware).
-- Within-chunk feature reuse for lane fills (the study bounds it at 13-20% fewer load slots).
+- Within-chunk feature reuse for lane fills (the study bounds it at 13-20% fewer load slots on
+  NEON; on x86 it also matters: `vmovhpd m64` is a load-port uop plus a shuffle, `vunpcklpd` from a
+  register is the shuffle alone, so instruction counts tie but load-port pressure drops).
 - x86 execution evidence (Rosetta for correctness; a real host for timing).
