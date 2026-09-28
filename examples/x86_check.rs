@@ -2,6 +2,7 @@ mod support;
 
 use inkwell::context::Context;
 use std::{
+    collections::HashSet,
     error::Error,
     fs::{self, File},
     io::{BufWriter, Write},
@@ -13,17 +14,26 @@ use tigerboost::jit::{EmitOptions, compile, emit_assembly_with};
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
 use tigerboost::sort_policy::{SortOptions, TreeOrdering, plan};
 
-const USAGE: &str = "usage: x86_check <workload> <fresh-output-dir> [--avx2]";
+const USAGE: &str =
+    "usage: x86_check <special|depths|depths2|standard-workload> <fresh-output-dir> [--avx2]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkloadChoice {
     Standard(Workload),
     Special,
+    Depths,
+    Depths2,
 }
 
 fn parse_workload(name: &str) -> Result<WorkloadChoice, &'static str> {
     if name == "special" {
         return Ok(WorkloadChoice::Special);
+    }
+    if name == "depths" {
+        return Ok(WorkloadChoice::Depths);
+    }
+    if name == "depths2" {
+        return Ok(WorkloadChoice::Depths2);
     }
     if let Ok(workload) = Workload::parse(name) {
         return Ok(WorkloadChoice::Standard(workload));
@@ -39,18 +49,45 @@ fn parse_workload(name: &str) -> Result<WorkloadChoice, &'static str> {
     )))
 }
 
+fn next_random(state: &mut u64, limit: usize) -> usize {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    (state.wrapping_mul(0x2545_f491_4f6c_dd1d) % limit as u64) as usize
+}
+
+fn encoded_leafs(depth: usize, prior_depth: &mut usize) -> Vec<f64> {
+    let next_depth = prior_depth.checked_add(depth).unwrap();
+    assert!(next_depth <= 53, "leaf fields must fit in 53 bits");
+    let leafs = (0..1usize << depth)
+        .map(|index| ((index as u64) << *prior_depth) as f64)
+        .collect();
+    *prior_depth = next_depth;
+    leafs
+}
+
+fn assert_distinct_rows(rows: &[Vec<f64>]) {
+    let distinct: HashSet<Vec<u64>> = rows
+        .iter()
+        .map(|row| row.iter().map(|value| value.to_bits()).collect())
+        .collect();
+    assert_eq!(distinct.len(), rows.len(), "workload rows must be distinct");
+}
+
+fn distinct_leaf_counts(model: &Trees, rows: &[Vec<f64>]) -> Vec<usize> {
+    let mut leaves = vec![HashSet::new(); model.trees().len()];
+    for row in rows {
+        for (tree, leaf) in model.leaf_indices(row).unwrap().into_iter().enumerate() {
+            leaves[tree].insert(leaf);
+        }
+    }
+    leaves.into_iter().map(|indices| indices.len()).collect()
+}
+
 fn special_workload() -> (Trees, Vec<Vec<f64>>) {
-    const DEPTHS: [usize; 7] = [0, 1, 2, 3, 5, 6, 8];
-    const THRESHOLDS: [f64; 7] = [
-        f64::NAN,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        -0.0,
-        0.0,
-        1.37,
-        -0.42,
-    ];
-    const VALUES: [f64; 9] = [
+    const DEPTHS: [usize; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+    const DEEP_THRESHOLDS: [f64; 8] = [-1.0, -0.0, 0.0, 1.0, -0.42, f64::from_bits(1), 1.37, -1.37];
+    const VALUES: [f64; 11] = [
         f64::NAN,
         f64::NEG_INFINITY,
         -1.0,
@@ -60,10 +97,11 @@ fn special_workload() -> (Trees, Vec<Vec<f64>>) {
         f64::INFINITY,
         1.37,
         -0.42,
+        f64::from_bits(1),
+        f64::from_bits((1u64 << 63) | 1),
     ];
 
-    let mut threshold = 0;
-    let mut next_leaf = 1;
+    let mut prior_depth = 0;
     let trees = DEPTHS
         .into_iter()
         .enumerate()
@@ -71,19 +109,19 @@ fn special_workload() -> (Trees, Vec<Vec<f64>>) {
             let selections = (0..depth)
                 .map(|level| {
                     let feature = if tree == 2 { 0 } else { (tree + level) % 6 };
-                    let selection = Discriminator {
-                        feature_idx: FeatureIndex(feature),
-                        threshold: THRESHOLDS[threshold % THRESHOLDS.len()],
+                    let threshold = match tree {
+                        1 => f64::NAN,
+                        2 => [f64::INFINITY, f64::NEG_INFINITY][level],
+                        3 => [-0.0, 0.0, 1.37][level],
+                        _ => DEEP_THRESHOLDS[level],
                     };
-                    threshold += 1;
-                    selection
+                    Discriminator {
+                        feature_idx: FeatureIndex(feature),
+                        threshold,
+                    }
                 })
                 .collect();
-            let leaf_count = 1usize << depth;
-            let leafs = (next_leaf..next_leaf + leaf_count)
-                .map(|leaf| leaf as f64)
-                .collect();
-            next_leaf += leaf_count;
+            let leafs = encoded_leafs(depth, &mut prior_depth);
             SingleTree { leafs, selections }
         })
         .collect();
@@ -97,13 +135,88 @@ fn special_workload() -> (Trees, Vec<Vec<f64>>) {
     ];
     let model = Trees::new(trees, feature_modes, 1.0, 0.0)
         .expect("the special x86-check model must be valid");
-    let rows = (0..ROWS)
-        .map(|row| {
+    let mut random = 0x5350_4543_4941_4c31;
+    let rows: Vec<Vec<f64>> = (0..ROWS)
+        .map(|_| {
             (0..6)
-                .map(|feature| VALUES[(row + feature) % VALUES.len()])
+                .map(|_| VALUES[next_random(&mut random, VALUES.len())])
                 .collect()
         })
         .collect();
+    assert_distinct_rows(&rows);
+    for (tree, (&depth, count)) in DEPTHS
+        .iter()
+        .zip(distinct_leaf_counts(&model, &rows))
+        .enumerate()
+    {
+        let minimum = (1usize << depth).div_ceil(4);
+        assert!(
+            count >= minimum,
+            "special tree {tree} depth {depth} reached {count} leaves, expected at least {minimum}"
+        );
+    }
+    (model, rows)
+}
+
+fn depth_threshold(index: usize) -> f64 {
+    index as f64 / 4.0 - 7.0
+}
+
+fn depths_workload(depths: &[usize], first_threshold: usize) -> (Trees, Vec<Vec<f64>>) {
+    const FEATURES: usize = 12;
+
+    let mut prior_depth = 0;
+    let mut threshold_index = first_threshold;
+    let trees: Vec<_> = depths
+        .iter()
+        .copied()
+        .map(|depth| {
+            let selections = (0..depth)
+                .map(|level| {
+                    let feature = if depth == 9 && level == 8 {
+                        0
+                    } else {
+                        level % FEATURES
+                    };
+                    let split = Discriminator {
+                        feature_idx: FeatureIndex(feature),
+                        threshold: depth_threshold(threshold_index),
+                    };
+                    threshold_index += 1;
+                    split
+                })
+                .collect();
+            let leafs = encoded_leafs(depth, &mut prior_depth);
+            SingleTree { leafs, selections }
+        })
+        .collect();
+    let model = Trees::new(trees, vec![NanMode::AsIs; FEATURES], 1.0, 0.0)
+        .expect("the depths x86-check model must be valid");
+
+    let thresholds_by_feature: Vec<Vec<f64>> = (0..FEATURES)
+        .map(|feature| {
+            model
+                .trees()
+                .iter()
+                .flat_map(|tree| &tree.selections)
+                .filter(|split| split.feature_idx == FeatureIndex(feature))
+                .map(|split| split.threshold)
+                .collect()
+        })
+        .collect();
+    let mut random = 0x4445_5054_4853_3031;
+    let mut rows = vec![vec![0.0; FEATURES]; ROWS];
+    for feature in 0..FEATURES {
+        let mut values = thresholds_by_feature[feature].clone();
+        values.extend([-16.0, -1.0, -0.0, 0.0, 1.0, 16.0]);
+        for row in &mut rows {
+            row[feature] = values[next_random(&mut random, values.len())];
+        }
+        for (row, threshold) in thresholds_by_feature[feature].iter().enumerate() {
+            rows[row][feature] = *threshold;
+        }
+    }
+    assert_distinct_rows(&rows);
     (model, rows)
 }
 
@@ -111,6 +224,8 @@ fn workload(choice: WorkloadChoice) -> (Trees, Vec<Vec<f64>>) {
     match choice {
         WorkloadChoice::Standard(choice) => support::workload(choice),
         WorkloadChoice::Special => special_workload(),
+        WorkloadChoice::Depths => depths_workload(&[1, 2, 3, 4, 5, 6, 7], 0),
+        WorkloadChoice::Depths2 => depths_workload(&[8, 9, 10], 28),
     }
 }
 
@@ -267,10 +382,45 @@ mod tests {
         }
     }
 
+    fn assert_leaf_fields_decode(model: &Trees, rows: &[Vec<f64>]) {
+        for row in rows {
+            let indices = model.leaf_indices(row).unwrap();
+            let mut prior_depth = 0;
+            let mut encoded = 0u64;
+            for (tree, index) in model.trees().iter().zip(indices) {
+                encoded |= (index as u64) << prior_depth;
+                prior_depth += tree.selections.len();
+            }
+            assert!(prior_depth <= 53);
+            assert_eq!(model.predict(row), Ok(encoded as f64));
+        }
+    }
+
+    fn mutated_leaf_model(model: &Trees, tree: usize, leaf: usize) -> Trees {
+        let mut trees = model.trees().to_vec();
+        trees[tree].leafs[leaf] += 1000.0;
+        Trees::new(
+            trees,
+            model.feature_modes().to_vec(),
+            model.scale(),
+            model.bias(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn special_model_is_valid_and_covers_every_mode_and_threshold_kind() {
         let (model, rows) = special_workload();
         assert_eq!(rows.len(), ROWS);
+        assert_eq!(
+            model
+                .trees()
+                .iter()
+                .map(|tree| tree.selections.len())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_distinct_rows(&rows);
         for mode in [NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue] {
             assert!(model.feature_modes().contains(&mode));
         }
@@ -292,13 +442,127 @@ mod tests {
                 .iter()
                 .any(|threshold| threshold.to_bits() == 0.0f64.to_bits())
         );
-        assert!(model.trees().iter().any(|tree| {
-            tree.selections.iter().enumerate().any(|(index, split)| {
-                tree.selections[index + 1..]
+        assert!(
+            rows.iter()
+                .flatten()
+                .any(|value| value.to_bits() == f64::from_bits(1).to_bits())
+        );
+        assert!(
+            rows.iter()
+                .flatten()
+                .any(|value| { value.to_bits() == f64::from_bits((1u64 << 63) | 1).to_bits() })
+        );
+        assert_eq!(model.trees()[2].selections.len(), 2);
+        assert_eq!(
+            model.trees()[2].selections[0].feature_idx,
+            model.trees()[2].selections[1].feature_idx
+        );
+        let counts = distinct_leaf_counts(&model, &rows);
+        assert_eq!(counts.len(), model.trees().len());
+        for (&count, tree) in counts.iter().zip(model.trees()) {
+            assert!(count >= (1usize << tree.selections.len()).div_ceil(4));
+        }
+        assert_leaf_fields_decode(&model, &rows);
+        println!(
+            "special distinct rows: {}; leaf counts: {counts:?}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn depths_models_cover_depths_threshold_hits_and_leaf_fields() {
+        assert_eq!(parse_workload("depths"), Ok(WorkloadChoice::Depths));
+        assert_eq!(parse_workload("depths2"), Ok(WorkloadChoice::Depths2));
+        let (first, first_rows) = depths_workload(&[1, 2, 3, 4, 5, 6, 7], 0);
+        let (second, second_rows) = depths_workload(&[8, 9, 10], 28);
+        let depths: Vec<_> = first
+            .trees()
+            .iter()
+            .chain(second.trees())
+            .map(|tree| tree.selections.len())
+            .collect();
+        assert_eq!(depths, (1..=10).collect::<Vec<_>>());
+        assert_eq!(first.feature_modes().len(), 12);
+        assert_eq!(second.feature_modes().len(), 12);
+
+        let splits: Vec<_> = first
+            .trees()
+            .iter()
+            .chain(second.trees())
+            .flat_map(|tree| &tree.selections)
+            .collect();
+        assert!(splits.iter().all(|split| split.threshold.is_finite()));
+        assert_eq!(
+            splits
+                .iter()
+                .map(|split| split.threshold.to_bits())
+                .collect::<HashSet<_>>()
+                .len(),
+            splits.len()
+        );
+        let depth_nine = second
+            .trees()
+            .iter()
+            .find(|tree| tree.selections.len() == 9)
+            .unwrap();
+        assert!(
+            depth_nine
+                .selections
+                .iter()
+                .enumerate()
+                .any(|(index, split)| {
+                    depth_nine.selections[index + 1..]
+                        .iter()
+                        .any(|other| other.feature_idx == split.feature_idx)
+                })
+        );
+
+        for (model, rows) in [(&first, &first_rows), (&second, &second_rows)] {
+            assert_distinct_rows(rows);
+            for split in model.trees().iter().flat_map(|tree| &tree.selections) {
+                assert!(rows.iter().any(|row| {
+                    row[split.feature_idx.0].to_bits() == split.threshold.to_bits()
+                }));
+            }
+            assert_leaf_fields_decode(model, rows);
+        }
+        println!(
+            "depths distinct rows: {}, leaf counts: {:?}; depths2 distinct rows: {}, leaf counts: {:?}",
+            first_rows.len(),
+            distinct_leaf_counts(&first, &first_rows),
+            second_rows.len(),
+            distinct_leaf_counts(&second, &second_rows)
+        );
+    }
+
+    #[test]
+    fn exported_rows_detect_deep_leaf_mutants() {
+        for (model, rows, depth) in [
+            {
+                let (model, rows) = special_workload();
+                (model, rows, 8)
+            },
+            {
+                let (model, rows) = depths_workload(&[1, 2, 3, 4, 5, 6, 7], 0);
+                (model, rows, 7)
+            },
+        ] {
+            let tree = model
+                .trees()
+                .iter()
+                .position(|tree| tree.selections.len() == depth)
+                .unwrap();
+            let leaf = model.leaf_indices(&rows[0]).unwrap()[tree];
+            let mutant = mutated_leaf_model(&model, tree, leaf);
+            let expected = reference_scores(&model, &rows).unwrap();
+            let actual = reference_scores(&mutant, &rows).unwrap();
+            assert!(
+                expected
                     .iter()
-                    .any(|other| other.feature_idx == split.feature_idx)
-            })
-        }));
+                    .zip(actual)
+                    .any(|(expected, actual)| expected != &actual)
+            );
+        }
     }
 
     #[test]
@@ -365,6 +629,10 @@ mod tests {
     fn every_variant_matches_the_reference_natively() {
         let (special_model, special_rows) = special_workload();
         check_variants_natively(&special_model, &special_rows).unwrap();
+        let (depths_model, depths_rows) = depths_workload(&[1, 2, 3, 4, 5, 6, 7], 0);
+        check_variants_natively(&depths_model, &depths_rows).unwrap();
+        let (depths2_model, depths2_rows) = depths_workload(&[8, 9, 10], 28);
+        check_variants_natively(&depths2_model, &depths2_rows).unwrap();
         let (distinct_model, distinct_rows) = support::workload(Workload::Distinct(20, 30));
         check_variants_natively(&distinct_model, &distinct_rows).unwrap();
     }
