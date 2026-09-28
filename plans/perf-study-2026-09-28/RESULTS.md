@@ -155,6 +155,53 @@ measured speed on ARM64; they keep the kernel spill-free and smaller, which matt
 case and for x86, where the unchunked AVX2 kernel grows 29% with 733 stack accesses and cannot be
 timed here. Keep chunking; 16 per chunk is the better default candidate.
 
+## Fenced single-function kernel with JIT-managed feature lifetimes (branch `impl/fenced-single-function`, not merged)
+
+One function, a compiler fence (`asm sideeffect` with `~{memory}`, row and constants pointers
+threaded through as tied operands) at every chunk boundary, no `early-cse`, and an explicit reuse
+window W in trees: a loaded, normalized feature value is reused for any lane within the next W
+trees of visit order, across fences. 100 trees, 100 features, 8 trees per chunk. Full tables in
+`VERDICT_fenced_astra.md`.
+
+| ARM64 | instructions | row loads | threshold loads | stack accesses in kernel | frame bytes |
+|---|---:|---:|---:|---:|---:|
+| continuation kernel (today) | 2143 | 429 | 163 | 0 | 160 |
+| fenced W1 (fence only, no reuse) | 2278 | 430 | 273 | 66 | 304 |
+| fenced W8 | 2280 | 389 | 275 | 76 | 320 |
+| fenced W16 | 2432 | 298 | 275 | 265 | 672 |
+| fenced W32 | 2575 | 204 | 276 | 448 | 1232 |
+| fenced W16, shared-feature order | 2299 | 260 | 273 | 169 | 448 |
+| fenced W16, one chunk, no fence | 2445 | 74 | 270 | 421 | 1744 |
+
+| x86 AVX2 | instructions | row loads | stack accesses |
+|---|---:|---:|---:|
+| continuation kernel | 1451 | 470 | 0 |
+| fenced W1 | 1434 | 470 | 0 |
+| fenced W8 | 1425 | 428 | 0 |
+| fenced W16 | 1597 | 326 | 220 |
+| fenced W32 | 1708 | 229 | 399 |
+
+Hot medians, ARM64, indicative (ns, 100 / 300 trees): continuation 89.7 / 241.9; fenced W8
+92.4 / 244.9; W16 90.7 / 253.7; W32 91.8 / 252.4; W16 shared order 92.4 / 236.0; W16 one chunk
+89.9 / 236.4. Cold p50 unchanged within the harness noise band.
+
+What it says:
+- The fence works: no load merged across a boundary in IR or assembly on any target.
+- Removing the continuation transfers changes nothing measurable: W1 is the continuation kernel
+  minus the transfers, and it is not faster.
+- Explicit reuse beyond about eight trees does not save loads, it converts them into spills: every
+  row load removed past W8 reappears as a store plus a reload of the feature value (W16 spills 58
+  feature values and 80 hoisted leaf values on ARM64). The register allocator, not the emitter,
+  decides what stays in a register, and the resident working set it can hold is roughly what one
+  chunk already reuses. Within-chunk reuse was already there through `early-cse`.
+- The ARM64 fenced kernels lost `ldp q` threshold pairing (163 → 273 threshold loads) because the
+  per-chunk base is no longer an opaque argument; an implementation artifact, fixable, but it does
+  not change the ranking.
+- AVX2 fenced W8 is 26 instructions smaller than the continuation kernel with no spills; untimed.
+
+Decision pending: keep continuations (recommended: they are the ABI-enforced residency bound and
+cost nothing measurable), or adopt fenced W8 on x86 only.
+
 ## Open
 
 - Default order: stay scalar, or tree-major 8 (spill-free) / 16 (fastest)? Maintainer decision.
