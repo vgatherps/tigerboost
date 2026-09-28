@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running `target/release/examples/d_probe 300x100`
+workload 300x100: 300 trees; ns/call includes driver; (min, median) of 7 rounds; host under load
+driver floor dependent           4.30    5.57
+sums 1: dependent  339.50  349.43 | independent  332.27  335.51
+sums 2: dependent  338.42  348.29 | independent  332.84  334.62
+sums 4: dependent  346.35  350.91 | independent  336.65  338.01
+sums 8: dependent  353.27  358.57 | independent  342.86  346.07
+empty model (predict + indirect call + ret) dependent    1.40    1.42
+one-tree model dependent   13.72   13.92
+per-call Instant samples (timer resolution about 41.7 ns on this host):
+timer only, no call                mean    13.9  p50     0.0  p90    42.0  p99    42.0
+hot, no pollution                  mean   351.6  p50   334.0  p90   375.0  p99   458.0
+read pollution 256 KiB             mean   361.9  p50   375.0  p90   375.0  p99   458.0
+read pollution 4096 KiB            mean   364.0  p50   375.0  p90   375.0  p99   458.0
+read pollution 16384 KiB           mean   726.3  p50   667.0  p90   917.0  p99  1292.0
+read pollution 32768 KiB           mean  1577.3  p50  1500.0  p90  1833.0  p99  2375.0
+read pollution 65536 KiB           mean  2135.2  p50  2000.0  p90  2167.0  p99  9416.0
+read pollution 64 MiB, timer only  mean    14.2  p50     0.0  p90    42.0  p99    42.0
+64 MiB then warm call on other row mean  1845.9  p50  1833.0  p90  2000.0  p99  2458.0
+other 2000-tree model call         mean   934.8  p50   917.0  p90  1000.0  p99  1125.0

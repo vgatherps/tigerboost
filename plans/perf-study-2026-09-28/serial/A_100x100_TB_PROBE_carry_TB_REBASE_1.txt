@@ -1,0 +1,27 @@
+    Finished `release` profile [optimized] target(s) in 0.09s
+     Running `target/release/examples/scalar_bench 100x100`
+Synthetic Distinct(100, 100): 100 trees, depth 6, 100 features, 256 rows; generic target
+Dependent chain visits 35 distinct rows
+5 rounds x 50000 calls; ns/prediction includes driver (floor not subtracted)
+Variant                    median      min      max   compile ms
+Reference                  285.73   274.96   288.09            -
+Tree order, sums 1          90.94    89.07    91.29       56.121
+Tree order, sums 2          90.11    89.00    91.50       25.779
+Tree order, sums 4          90.33    87.77    91.85       27.178
+Scheduled RegisterBudget { general: 4, floating: 9 }, sums 1   86.69    82.30    87.61       35.601
+Scheduled RegisterBudget { general: 4, floating: 9 }, sums 2   86.80    84.78    87.62       31.742
+Scheduled RegisterBudget { general: 4, floating: 9 }, sums 4   88.80    87.58    90.41       31.337
+Scheduled RegisterBudget { general: 6, floating: 9 }, sums 1   87.64    86.65    88.44       36.876
+Scheduled RegisterBudget { general: 6, floating: 9 }, sums 2   87.93    86.61    88.46       35.892
+Scheduled RegisterBudget { general: 6, floating: 9 }, sums 4   89.33    88.61    89.54       36.097
+Scheduled RegisterBudget { general: 12, floating: 9 }, sums 1   88.55    87.89    89.03       46.649
+Scheduled RegisterBudget { general: 12, floating: 9 }, sums 2   87.75    87.23    88.12       45.927
+Scheduled RegisterBudget { general: 12, floating: 9 }, sums 4   88.85    88.58    89.48       45.747
+Scheduled RegisterBudget { general: 20, floating: 9 }, sums 1   90.60    90.25    91.68       52.197
+Scheduled RegisterBudget { general: 20, floating: 9 }, sums 2   87.96    87.45    88.05       50.742
+Scheduled RegisterBudget { general: 20, floating: 9 }, sums 4   89.11    88.93    90.53       50.168
+SIMD2 scheduled GP 4/FP 9, sums 2   88.04    87.02    88.74       32.617
+SIMD2 scheduled GP 6/FP 9, sums 2  118.41   117.39   122.17       52.837
+SIMD2 scheduled GP 12/FP 9, sums 2  121.03   118.23   122.08       46.682
+SIMD2 scheduled GP 20/FP 9, sums 2  125.83   123.70   126.01       53.503
+Driver floor                 5.43     5.07     5.66            -
