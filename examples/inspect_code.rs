@@ -73,6 +73,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                     comparisons: ComparisonMode::Simd2,
                 },
             ),
+            (
+                "tree-major-4-2sums",
+                SortOptions {
+                    order: Order::TreeMajor {
+                        chunk_trees: NonZeroUsize::new(4).unwrap(),
+                    },
+                    accumulators: NonZeroUsize::new(2).unwrap(),
+                    comparisons: ComparisonMode::Scalar,
+                },
+            ),
         ] {
             let plan = plan(&model, options)?;
             let assembly = emit_assembly(&context, &plan, triple)?;

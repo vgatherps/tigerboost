@@ -13,6 +13,21 @@ use tigerboost::sort_policy::{ComparisonMode, Order, RegisterBudget, SortOptions
 const CALLS: usize = 50_000;
 const ROUNDS: usize = 5;
 
+fn tree_major_variants() -> impl Iterator<Item = (String, SortOptions)> {
+    [2, 4, 8].into_iter().map(|count| {
+        (
+            format!("Tree-major, {count} trees/chunk, sums 2"),
+            SortOptions {
+                order: Order::TreeMajor {
+                    chunk_trees: NonZeroUsize::new(count).unwrap(),
+                },
+                accumulators: NonZeroUsize::new(2).unwrap(),
+                comparisons: ComparisonMode::Scalar,
+            },
+        )
+    })
+}
+
 fn measure(predict: impl Fn(usize) -> f64, calls: usize) -> f64 {
     let mut index = 0;
     let start = Instant::now();
@@ -51,6 +66,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let label = match order {
                 Order::TreeOrder => format!("Tree order, sums {count}"),
                 Order::Scheduled(budget) => format!("Scheduled {:?}, sums {count}", budget),
+                Order::TreeMajor { chunk_trees } => {
+                    format!("Tree-major, {chunk_trees} trees/chunk, sums {count}")
+                }
             };
             kernels.push((label, compiled, compile_ms));
         }
@@ -72,6 +90,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             compiled,
             compile_ms,
         ));
+    }
+    for (label, options) in tree_major_variants() {
+        let start = Instant::now();
+        let compiled = compile(&context, &plan(&model, options)?)?;
+        let compile_ms = start.elapsed().as_secs_f64() * 1e3;
+        kernels.push((label, compiled, compile_ms));
     }
     let (scores, distinct) = verify(&model, &kernels[0].1, &rows, CALLS);
     for (_, compiled, _) in &kernels[1..] {
@@ -211,6 +235,16 @@ mod tests {
             .unwrap();
             let (_, distinct) = verify(&model, &compiled, &rows, CALLS);
             assert!(distinct > 1, "{kind:?}");
+            for ((label, options), count) in tree_major_variants().zip([2, 4, 8]) {
+                assert_eq!(label, format!("Tree-major, {count} trees/chunk, sums 2"));
+                assert!(
+                    matches!(options.order, Order::TreeMajor { chunk_trees } if chunk_trees.get() == count)
+                );
+                assert_eq!(options.accumulators.get(), 2);
+                let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
+                let (_, distinct) = verify(&model, &compiled, &rows, CALLS);
+                assert!(distinct > 1, "{kind:?} {label}");
+            }
         }
     }
 
@@ -219,6 +253,7 @@ mod tests {
         let context = Context::create();
         for (name, trees, features) in [
             ("100x100", 100, 100),
+            ("300x100", 300, 100),
             ("500x100", 500, 100),
             ("500x1000", 500, 1000),
         ] {

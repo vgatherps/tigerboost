@@ -21,10 +21,11 @@ impl Workload {
             "disjoint" => Ok(Self::Disjoint),
             "wide" => Ok(Self::Wide),
             "100x100" => Ok(Self::Distinct(100, 100)),
+            "300x100" => Ok(Self::Distinct(300, 100)),
             "500x100" => Ok(Self::Distinct(500, 100)),
             "500x1000" => Ok(Self::Distinct(500, 1000)),
             _ => Err(
-                "workload must be mixed, reuse-heavy, disjoint, wide, 100x100, 500x100, or 500x1000",
+                "workload must be mixed, reuse-heavy, disjoint, wide, 100x100, 300x100, 500x100, or 500x1000",
             ),
         }
     }

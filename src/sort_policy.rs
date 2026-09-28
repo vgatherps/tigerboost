@@ -33,6 +33,10 @@ pub enum ComparisonMode {
 pub enum Order {
     TreeOrder,
     Scheduled(RegisterBudget),
+    /// Ignores SortOptions.comparisons.
+    TreeMajor {
+        chunk_trees: NonZeroUsize,
+    },
 }
 
 /// Logical working registers, not a guarantee about LLVM's physical allocation.
@@ -102,6 +106,11 @@ pub enum Action {
         tree: TreeId,
         sum: SumId,
     },
+    EvaluateTree {
+        tree: TreeId,
+        predicates: Vec<PredicateId>,
+        sum: SumId,
+    },
     AddSums {
         destination: SumId,
         source: SumId,
@@ -144,6 +153,7 @@ pub fn plan(model: &Trees, options: SortOptions) -> Result<Plan<'_>, Insufficien
     let sum_count = options.accumulators.get().min(model.trees().len().max(1));
     let mut plan = match options.order {
         Order::TreeOrder => tree_order(model, sum_count),
+        Order::TreeMajor { .. } => tree_major(model, sum_count),
         Order::Scheduled(budget) => {
             if !model.trees().is_empty() {
                 let has_splits = model.trees().iter().any(|tree| !tree.selections.is_empty());
@@ -169,8 +179,45 @@ pub fn plan(model: &Trees, options: SortOptions) -> Result<Plan<'_>, Insufficien
     } else {
         Action::ReturnScaled(SumId(0))
     });
-    plan.chunks = continuation::partition(&plan, 16);
+    plan.chunks = match options.order {
+        Order::TreeMajor { chunk_trees } => continuation::partition_trees(&plan, chunk_trees),
+        _ => continuation::partition(&plan, 16),
+    };
     Ok(plan)
+}
+
+fn tree_major(trees: &Trees, sum_count: usize) -> Plan<'_> {
+    let mut plan = Plan {
+        model: trees,
+        predicates: Vec::new(),
+        actions: Vec::new(),
+        sum_count,
+        chunks: Vec::new(),
+    };
+    for (tree, description) in trees.trees().iter().enumerate() {
+        let tree = TreeId(tree);
+        let sum = SumId(tree.0 % sum_count);
+        if description.selections.is_empty() {
+            plan.actions.push(Action::Admit(tree));
+            plan.actions.push(Action::Retire { tree, sum });
+        } else {
+            let start = plan.predicates.len();
+            plan.predicates
+                .extend(description.selections.iter().cloned());
+            if description.selections.len() % 2 != 0 {
+                plan.predicates.push(Discriminator {
+                    feature_idx: description.selections[0].feature_idx,
+                    threshold: f64::INFINITY,
+                });
+            }
+            plan.actions.push(Action::EvaluateTree {
+                tree,
+                predicates: (start..plan.predicates.len()).map(PredicateId).collect(),
+                sum,
+            });
+        }
+    }
+    plan
 }
 
 fn tree_order(trees: &Trees, sum_count: usize) -> Plan<'_> {

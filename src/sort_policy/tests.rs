@@ -203,6 +203,41 @@ fn replay(plan: &Plan<'_>, budget: Option<RegisterBudget>, row: &[f64]) -> f64 {
                 active -= usize::from(!trees.trees()[*tree].selections.is_empty());
                 sums[sum.0] += trees.trees()[*tree].leafs[indices[*tree]];
             }
+            Action::EvaluateTree {
+                tree: TreeId(tree),
+                predicates,
+                sum,
+            } => {
+                assert_eq!(state[*tree], 0, "tree evaluated twice");
+                let description = &trees.trees()[*tree];
+                assert_eq!(
+                    predicates.len(),
+                    description.selections.len().div_ceil(2) * 2
+                );
+                for (level, predicate) in predicates
+                    .iter()
+                    .take(description.selections.len())
+                    .enumerate()
+                {
+                    let predicate = &plan.predicates()[predicate.0];
+                    let original = &description.selections[level];
+                    assert_eq!(predicate.feature_idx, original.feature_idx);
+                    assert_eq!(predicate.threshold.to_bits(), original.threshold.to_bits());
+                    let value = row[predicate.feature_idx.0];
+                    let value = match (
+                        value.is_nan(),
+                        trees.feature_modes()[predicate.feature_idx.0],
+                    ) {
+                        (true, NanMode::AsFalse) => f64::NEG_INFINITY,
+                        (true, NanMode::AsTrue) => f64::INFINITY,
+                        _ => value,
+                    };
+                    indices[*tree] |= usize::from(value > predicate.threshold) << level;
+                    seen[*tree] |= 1 << level;
+                }
+                state[*tree] = 2;
+                sums[sum.0] += description.leafs[indices[*tree]];
+            }
             Action::AddSums {
                 destination,
                 source,
@@ -230,6 +265,28 @@ fn replay(plan: &Plan<'_>, budget: Option<RegisterBudget>, row: &[f64]) -> f64 {
     let prediction = prediction.expect("plan must return a prediction");
     assert_eq!(prediction, trees.predict(row).unwrap());
     prediction
+}
+
+#[test]
+fn tree_major_replay_matches_reference() {
+    let trees = forest(vec![
+        tree(&[]),
+        tree(&[(1, 0.0)]),
+        tree(&[(2, 0.0), (0, 1.0), (2, -1.0)]),
+    ]);
+    let plan = plan(
+        &trees,
+        SortOptions {
+            order: Order::TreeMajor {
+                chunk_trees: NonZeroUsize::new(2).unwrap(),
+            },
+            ..SortOptions::default()
+        },
+    )
+    .unwrap();
+    for row in [[0.0; 4], [2.0; 4], [f64::NAN; 4], [f64::NEG_INFINITY; 4]] {
+        assert_eq!(replay(&plan, None, &row), trees.predict(&row).unwrap());
+    }
 }
 
 #[test]

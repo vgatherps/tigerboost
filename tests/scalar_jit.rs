@@ -20,6 +20,136 @@ fn indexed_tree(selections: Vec<Discriminator>) -> SingleTree {
     }
 }
 
+#[test]
+fn tree_major_matches_reference_on_special_values() {
+    let context = Context::create();
+    let values = [
+        f64::NAN,
+        f64::NEG_INFINITY,
+        -1.0,
+        -0.0,
+        0.0,
+        1.0,
+        f64::INFINITY,
+    ];
+    let thresholds = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.5, 0.5];
+    let options = SortOptions {
+        order: Order::TreeMajor {
+            chunk_trees: NonZeroUsize::new(4).unwrap(),
+        },
+        ..SortOptions::default()
+    };
+    for mode in [NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue] {
+        for depth in 1..=8 {
+            for offset in 0..thresholds.len() {
+                let model = Trees::new(
+                    vec![indexed_tree(
+                        (0..depth)
+                            .map(|level| {
+                                split(level % 3, thresholds[(level + offset) % thresholds.len()])
+                            })
+                            .collect(),
+                    )],
+                    vec![mode; 3],
+                    2.5,
+                    -3.0,
+                )
+                .unwrap();
+                let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
+                for first in values {
+                    for second in values {
+                        for third in values {
+                            let row = [first, second, third];
+                            assert_eq!(
+                                compiled.predict(&row),
+                                model.predict(&row),
+                                "depth={depth} mode={mode:?} offset={offset} row={row:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let model = Trees::new(
+            vec![indexed_tree(vec![
+                split(0, 0.0),
+                split(1, -0.5),
+                split(0, 0.0),
+            ])],
+            vec![mode; 2],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let compiled = compile(&context, &plan(&model, options).unwrap()).unwrap();
+        for first in values {
+            for second in values {
+                let row = [first, second];
+                assert_eq!(compiled.predict(&row), model.predict(&row));
+            }
+        }
+    }
+}
+
+#[test]
+fn tree_major_dropped_model_and_odd_depth_last_tree() {
+    let context = Context::create();
+    let model = Trees::new(
+        (0..70)
+            .map(|tree| {
+                let depth = tree % 7 + 1;
+                SingleTree {
+                    selections: (0..depth)
+                        .map(|level| split((tree + level) % 9, 0.0))
+                        .collect(),
+                    leafs: (0..1usize << depth)
+                        .map(|leaf| (tree * 128 + leaf) as f64)
+                        .collect(),
+                }
+            })
+            .collect(),
+        vec![NanMode::AsIs; 9],
+        2.0,
+        3.0,
+    )
+    .unwrap();
+    assert_eq!(model.trees()[69].selections.len(), 7);
+    let rows = [[-1.0; 9], [1.0; 9]];
+    assert!(
+        model
+            .leaf_indices(&rows[0])
+            .unwrap()
+            .iter()
+            .all(|&index| index == 0)
+    );
+    assert!(
+        model
+            .leaf_indices(&rows[1])
+            .unwrap()
+            .iter()
+            .zip(model.trees())
+            .all(|(&index, tree)| index == tree.leafs.len() - 1)
+    );
+    let expected = rows.map(|row| model.predict(&row).unwrap());
+    let plan = plan(
+        &model,
+        SortOptions {
+            order: Order::TreeMajor {
+                chunk_trees: NonZeroUsize::new(8).unwrap(),
+            },
+            ..SortOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.chunks().len(), 9);
+    let compiled = compile(&context, &plan).unwrap();
+    drop(plan);
+    drop(model);
+    for (row, expected) in rows.iter().zip(expected) {
+        assert_eq!(compiled.predict(row), Ok(expected));
+    }
+}
+
 fn configurations() -> impl Iterator<Item = SortOptions> {
     std::iter::once(Order::TreeOrder)
         .chain([4, 6, 12, 20].map(|general| {

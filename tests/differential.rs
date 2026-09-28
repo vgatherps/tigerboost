@@ -91,7 +91,15 @@ fn seeded_forests_preserve_every_trees_leaf_index() {
                 accumulators,
                 comparisons: ComparisonMode::Simd2,
             },
-        ] {
+        ]
+        .into_iter()
+        .chain([1, 3, 8].map(|count| SortOptions {
+            order: Order::TreeMajor {
+                chunk_trees: NonZeroUsize::new(count).unwrap(),
+            },
+            accumulators: NonZeroUsize::new(2).unwrap(),
+            comparisons: ComparisonMode::Scalar,
+        })) {
             let plan = plan(&model, options).unwrap();
             for chunk in plan.chunks() {
                 carried_indices |= chunk.incoming.indices.iter().any(Option::is_some);
