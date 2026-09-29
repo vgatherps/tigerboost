@@ -296,6 +296,31 @@ were 89.3 / 232.4 ns for `91951d5`, against 89.6–91.5 / 229.6–234.0 ns for t
 at `131c251`. These are the layout run's measurements, separate from the earlier 85.3 / 228.2 ns
 scalar-carry study based on `6cae781`. No native x86 timing was collected.
 
+## Add-based mask merge
+
+The SSE2 add-based merge reduced continuation instructions from 2267 → 2134 at 100 trees
+and 6859 → 6454 at 300 trees. Constant-pool loads fell from 13 → 0 and 38 → 0;
+continuation stack operations fell from 6 → 2 and 42 → 10.
+
+After the `Target` descriptor and single chunk-base parameter changes, separately emitted
+100x100 and 300x100 kernels have these static counts. Directives and alignment padding are
+excluded; stack operations include push/pop.
+
+| Target | Trees | Continuation instructions | Wrapper instructions | Continuation stack operations | Wrapper stack operations |
+|---|---:|---:|---:|---:|---:|
+| ARM64 | 100 | 1974 | 25 | 0 | 20 |
+| ARM64 | 300 | 5877 | 25 | 0 | 20 |
+| SSE2 | 100 | 2134 | 15 | 2 | 10 |
+| SSE2 | 300 | 6454 | 15 | 10 | 10 |
+| AVX2 | 100 | 1334 | 15 | 0 | 10 |
+| AVX2 | 300 | 3978 | 15 | 0 | 10 |
+
+Both x86 paths remain byte-identical for both workloads. ARM64 drops the wrapper's base copy
+and one continuation general register; its 300-tree continuations gain one instruction, leaving
+the total unchanged. Vector-register counts and stack operations are unchanged. Two-tree AVX2
+forests at depths 0, 1, and 2 lose the explicit `vzeroupper` and its spill/reload: continuation
+instructions fall from 8 → 5, 13 → 10, and 13 → 10, with stack operations 2 → 0 in each case.
+
 ## Open
 
 - Native x86 timing of the SSE2 and AVX2 kernels.

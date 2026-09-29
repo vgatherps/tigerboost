@@ -37,8 +37,8 @@ fn check_natively(
     let compiled = compile(&context, model)?;
     for (row, (&expected, features)) in expected.iter().zip(rows).enumerate() {
         assert_eq!(
-            compiled.predict(features)?,
-            expected,
+            compiled.predict(features)?.to_bits(),
+            expected.to_bits(),
             "native mismatch at row {row}"
         );
     }
@@ -420,6 +420,134 @@ mod tests {
         ] {
             let (model, rows) = workload(kind);
             check_natively(&model, &rows, &reference_scores(&model, &rows).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn encoded_mixed_forest_keeps_swapped_leaf_fields_on_both_paths() {
+        use tigerboost::jit::ordered_predicates;
+        use tigerboost::parsed_tree::{Discriminator, FeatureIndex, SingleTree};
+        use tigerboost::sort_policy::Action;
+
+        let mut fields = Vec::new();
+        let mut shift = 0;
+        let trees = [
+            vec![0, 1, 2, 3, 4],
+            vec![1, 3],
+            vec![5],
+            vec![6, 7],
+            vec![5, 6, 5],
+            vec![7],
+            vec![1, 3],
+            vec![5],
+            vec![],
+            vec![6],
+        ]
+        .into_iter()
+        .map(|features| {
+            let depth = features.len();
+            let width = depth.max(1);
+            fields.push((shift, width));
+            let leafs = (0..1usize << depth)
+                .map(|leaf| ((if depth == 0 { 1 } else { leaf }) << shift) as f64)
+                .collect();
+            shift += width;
+            let selections = features
+                .into_iter()
+                .map(|feature| Discriminator {
+                    feature_idx: FeatureIndex(feature),
+                    threshold: 0.0,
+                })
+                .collect();
+            SingleTree { leafs, selections }
+        })
+        .collect();
+        assert!(shift <= 53);
+        let model = Trees::new(trees, vec![NanMode::AsIs; 8], 1.0, 0.0).unwrap();
+        let plan = plan(&model);
+        assert_eq!(plan.chunks().len(), 2);
+        let range = plan
+            .actions()
+            .iter()
+            .find_map(|action| match action {
+                Action::EvaluateTree {
+                    tree, predicates, ..
+                } if tree.0 == 0 => Some(predicates.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let ordered = ordered_predicates(&plan, "x86_64-apple-darwin");
+        assert_eq!(
+            ordered[range]
+                .iter()
+                .map(|split| split.feature_idx.0)
+                .collect::<Vec<_>>(),
+            [1, 0, 3, 2, 4, 0],
+        );
+        let rows: Vec<Vec<f64>> = (0..ROWS)
+            .map(|pattern| {
+                (0..8)
+                    .map(|feature| f64::from(pattern & (1 << feature) != 0))
+                    .collect()
+            })
+            .collect();
+        for row in &rows {
+            let score = model.predict(row).unwrap() as u64;
+            for ((tree, leaf), &(shift, width)) in model
+                .trees()
+                .iter()
+                .zip(model.leaf_indices(row).unwrap())
+                .zip(&fields)
+            {
+                assert_eq!(
+                    (score >> shift) & ((1 << width) - 1),
+                    if tree.selections.is_empty() {
+                        1
+                    } else {
+                        leaf as u64
+                    },
+                );
+            }
+        }
+        for avx2 in [false, true] {
+            let directory = TempDirectory::new();
+            let name = write_outputs(&directory.0, &model, &rows, EmitOptions { avx2 }).unwrap();
+            check_kernel(&directory.0, name).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn empty_forest_preserves_bias_bits_on_both_paths() {
+        let rows = vec![vec![0.0; 2]; ROWS];
+        for bits in [
+            0,
+            (-0.0f64).to_bits(),
+            7.0f64.to_bits(),
+            1,
+            0x7ff8_1234_5678_9abc,
+            0xfff0_0000_0000_0001,
+        ] {
+            let model = Trees::new(
+                vec![],
+                vec![NanMode::AsIs; 2],
+                f64::NAN,
+                f64::from_bits(bits),
+            )
+            .unwrap();
+            assert!(
+                reference_scores(&model, &rows)
+                    .unwrap()
+                    .iter()
+                    .all(|value| value.to_bits() == bits)
+            );
+            for avx2 in [false, true] {
+                let directory = TempDirectory::new();
+                let name =
+                    write_outputs(&directory.0, &model, &rows, EmitOptions { avx2 }).unwrap();
+                check_kernel(&directory.0, name).unwrap();
+            }
         }
     }
 

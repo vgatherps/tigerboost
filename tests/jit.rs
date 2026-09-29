@@ -434,3 +434,36 @@ fn avx2_clears_upper_halves_once_before_the_final_return() {
         }
     }
 }
+
+#[test]
+fn avx2_narrow_and_constant_forests_leave_upper_halves_untouched() {
+    use tigerboost::jit::{EmitOptions, emit_assembly_with};
+
+    let context = Context::create();
+    for depth in 0..=2 {
+        for count in [2, 9, 17] {
+            let model = Trees::new(
+                (0..count)
+                    .map(|_| indexed_tree((0..depth).map(|feature| split(feature, 0.0)).collect()))
+                    .collect(),
+                vec![NanMode::AsIs; 2],
+                1.0,
+                0.0,
+            )
+            .unwrap();
+            for triple in ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"] {
+                let assembly =
+                    emit_assembly_with(&context, &plan(&model), triple, EmitOptions { avx2: true })
+                        .unwrap();
+                assert!(
+                    !assembly.contains("%ymm"),
+                    "{triple} depth={depth} count={count}"
+                );
+                assert!(
+                    !assembly.contains("vzeroupper"),
+                    "{triple} depth={depth} count={count}"
+                );
+            }
+        }
+    }
+}
