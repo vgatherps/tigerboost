@@ -32,14 +32,14 @@ sharing the most features with the chunk; ties use model order. Constant trees c
 Odd depths get a constant-false `+inf` padding level. Leaves accumulate round-robin into two
 sums, clamped to the tree count (one sum for an empty forest). Eight whole trees form a chunk.
 The emitter performs the final reduction and scale/bias.
-Only the row pointer, constants pointer, chunk base on ARM64, and sums cross
-chunk boundaries; `preserve_nonecc` passes them in registers.
+Only the row pointer, the chunk base, and the sums cross chunk boundaries; `preserve_nonecc` passes them in registers.
 
 The emitter builds one private constant block per model. Each chunk has thresholds in swapped
 lane order, zero padding to a multiple of eight threshold entries, then its leaf blocks in tree
-visit order. The ARM64 chunk base addresses both thresholds and leaves. A tree's thresholds are consecutive, so each lane pair or
-lane quad is one vector load. Lane masks are packed with shift-left-insert on ARM64 (generic
-shift/add elsewhere) into two signed lane values; the leaf block for that tree is permuted at
+visit order. The chunk base addresses both thresholds and leaves; each transfer advances it
+to the next chunk. A tree's thresholds are consecutive, so each lane pair or
+lane quad is one vector load. Lane masks are packed with shift-left-insert on ARM64, shift/add on
+SSE2, and movemask on AVX2 into two signed lane values; the leaf block for that tree is permuted at
 compile time over reachable patterns with the padding bit false. Each block has the original
 leaf count, and the permutation is asserted to be a bijection.
 Exactly one shared feature in a complete pair goes to lane 1 on ARM64 and lane 0 on x86;

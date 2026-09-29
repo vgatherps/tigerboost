@@ -56,17 +56,16 @@ struct Target {
     cpu: &'static str,
     packing: MaskPacking,
     shared_lane: usize,
-    move_chunk_origin: bool,
     clear_upper_halves: bool,
 }
 
 impl Target {
     fn resolve(triple: &str, options: EmitOptions) -> Self {
         let architecture = triple.split('-').next().unwrap();
-        let (packing, shared_lane, move_chunk_origin) = match architecture {
-            "aarch64" | "arm64" => (MaskPacking::Insert, 1, true),
-            "x86_64" | "x86_64h" if options.avx2 => (MaskPacking::Movemask, 0, false),
-            _ => (MaskPacking::Add, 0, false),
+        let (packing, shared_lane) = match architecture {
+            "aarch64" | "arm64" => (MaskPacking::Insert, 1),
+            "x86_64" | "x86_64h" if options.avx2 => (MaskPacking::Movemask, 0),
+            _ => (MaskPacking::Add, 0),
         };
         Self {
             cpu: if packing == MaskPacking::Movemask {
@@ -76,7 +75,6 @@ impl Target {
             },
             packing,
             shared_lane,
-            move_chunk_origin,
             clear_upper_halves: packing == MaskPacking::Movemask,
         }
     }
@@ -229,7 +227,7 @@ fn emit_plan<'ctx>(
     let mut entry_count = 0usize;
     for chunk in chunks {
         let first = entry_count;
-        origins.push(if target.move_chunk_origin { first } else { 0 });
+        origins.push(first);
         let actions = &plan.actions()[chunk.actions.clone()];
         for action in actions {
             if let Action::EvaluateTree {
@@ -1288,16 +1286,15 @@ mod tests {
         LlvmTarget::initialize_all(&InitializationConfig::default());
         let model = mixed_depth_model();
         let plan = plan(&model);
-        for (canonical, alias, shared_lane, move_chunk_origin) in [
-            ("aarch64-apple-darwin", "arm64-apple-darwin", 1, true),
-            ("x86_64-apple-darwin", "x86_64h-apple-darwin", 0, false),
+        for (canonical, alias, shared_lane, x86) in [
+            ("aarch64-apple-darwin", "arm64-apple-darwin", 1, false),
+            ("x86_64-apple-darwin", "x86_64h-apple-darwin", 0, true),
         ] {
             for avx2 in [false, true] {
                 let options = EmitOptions { avx2 };
                 let target = Target::resolve(alias, options);
                 assert_eq!(target.shared_lane, shared_lane);
-                assert_eq!(target.move_chunk_origin, move_chunk_origin);
-                assert_eq!(target.clear_upper_halves, avx2 && !move_chunk_origin);
+                assert_eq!(target.clear_upper_halves, avx2 && x86);
                 let (module, _) =
                     prepare_module(&context, &plan, &TargetTriple::create(alias), options).unwrap();
                 assert_eq!(
@@ -1309,11 +1306,7 @@ mod tests {
                         .get_string_value()
                         .to_str()
                         .unwrap(),
-                    if avx2 && !move_chunk_origin {
-                        "x86-64-v3"
-                    } else {
-                        "generic"
-                    },
+                    if avx2 && x86 { "x86-64-v3" } else { "generic" },
                 );
                 assert_eq!(
                     emit_assembly_with(&context, &plan, alias, options).unwrap(),
@@ -1331,15 +1324,12 @@ mod tests {
     }
 
     #[test]
-    fn moving_origins_keep_movemask_leaf_slots_chunk_relative() {
+    fn movemask_leaf_slots_are_chunk_relative() {
         let context = Context::create();
         let model = indexed_model(&[3, 3, 0]);
         let plan = plan_with(&model, 1, 2);
         let triple = "x86_64-unknown-linux-gnu";
-        let target = Target {
-            move_chunk_origin: true,
-            ..Target::resolve(triple, EmitOptions { avx2: true })
-        };
+        let target = Target::resolve(triple, EmitOptions { avx2: true });
         let module = emit_plan(&context, &plan, &TargetTriple::create(triple), target).unwrap();
         module.verify().unwrap();
         for (number, remaining_bytes) in [264, 136, 8].into_iter().enumerate() {
@@ -1762,10 +1752,8 @@ mod tests {
         )
         .unwrap();
         let plan = plan(&model);
-        for (triple, origins) in [
-            ("x86_64-unknown-linux-gnu", [0, 0]),
-            ("aarch64-apple-darwin", [0, 96]),
-        ] {
+        let origins = [0, 96];
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"] {
             let module = emit_test_plan(
                 &context,
                 &plan,
@@ -1898,7 +1886,7 @@ mod tests {
                 }
             }
             let assembly = emit_assembly(&context, &plan, triple).unwrap();
-            if origins[1] == 0 {
+            if triple.starts_with("x86_64") {
                 assert!(
                     assembly.lines().any(|line| { line.contains("cmpltpd") }),
                     "{assembly}"
