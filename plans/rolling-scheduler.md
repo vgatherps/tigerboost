@@ -1,3 +1,4 @@
+Superseded: see PLAN.md and plans/perf-study-2026-09-28/RESULTS.md
 # Rolling admission, feature reuse, and bounded live state
 
 Depends on the scalar JIT baseline. Scheduling is entirely compile-time.

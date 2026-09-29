@@ -1,3 +1,4 @@
+Superseded: see PLAN.md and plans/perf-study-2026-09-28/RESULTS.md
 # Cranelift behavior: establish the facts
 
 Historical subplan. User switched to LLVM; no further Cranelift work is required. Completed evidence is in [the experiment report](cranelift-results.md).

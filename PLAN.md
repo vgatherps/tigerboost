@@ -25,11 +25,13 @@ row per call.
 
 Validated model → shared-feature tree order → eight-tree LLVM continuations.
 
+`compile(&context, &trees)` plans internally; `plan` remains public for inspection.
 The plan has one `EvaluateTree` action per tree with splits and one `Constant` action per
 constant tree. Each chunk starts with the highest feature-frequency score, then takes trees
 sharing the most features with the chunk; ties use model order. Constant trees come last.
 Odd depths get a constant-false `+inf` padding level. Leaves accumulate round-robin into two
 sums, clamped to the tree count (one sum for an empty forest). Eight whole trees form a chunk.
+The emitter performs the final reduction and scale/bias.
 Only the row pointer, constants pointer, per-chunk threshold base on ARM64, and sums cross
 chunk boundaries; `preserve_nonecc` passes them in registers.
 
@@ -37,9 +39,12 @@ The emitter builds one private constant block: thresholds one slot per predicate
 order, then each tree's leaf block. A tree's thresholds are consecutive, so each lane pair or
 lane quad is one vector load. Lane masks are packed with shift-left-insert on ARM64 (generic
 shift/or elsewhere) into two signed lane values; the leaf block for that tree is permuted at
-compile time by simulating the same arithmetic, and the permutation is asserted to be a bijection.
+compile time over reachable patterns with the padding bit false. Each block has the original
+leaf count, and the permutation is asserted to be a bijection.
 Under `EmitOptions { avx2 }` on x86-64, lanes map to level bits directly through `vmovmskpd`, the
-threshold vector folds into `vcmpgt_oqpd`, and the leaf block keeps its original order.
+threshold vector folds into `vcmpgt_oqpd`, and the leaf block keeps its original order. Only the
+last continuation clears the upper halves. Host execution requires all seven LLVM feature flags
+listed in the README.
 
 ## What was tried and rejected
 
@@ -66,6 +71,7 @@ threshold vector folds into `vcmpgt_oqpd`, and the leaf block keeps its original
 
 ## Open
 
+- ARM64 leaf-offset layout study.
 - Native x86-64 timing of the SSE2 and AVX2 kernels; Rosetta cannot provide it.
 - A representative user model: real depth range, NaN modes, feature counts, and whether inputs
   arrive hot or cold decide what the deployment number is.

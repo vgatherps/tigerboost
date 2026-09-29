@@ -167,7 +167,7 @@ impl Trees {
         self.bias
     }
 
-    /// Tree-order reference, independent of scheduling and code generation.
+    /// Tree-order reference, independent of planning and code generation.
     pub fn predict(&self, row: &[f64]) -> Result<f64, RowLengthError> {
         self.check_row(row)?;
         if self.trees.is_empty() {

@@ -1,3 +1,4 @@
+Superseded: see PLAN.md and plans/perf-study-2026-09-28/RESULTS.md
 # Model contract and independent reference
 
 ## Contract

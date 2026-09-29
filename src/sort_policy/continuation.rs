@@ -1,4 +1,4 @@
-use super::{Action, Plan};
+use super::Plan;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 
@@ -10,18 +10,11 @@ pub struct Chunk {
 
 pub(super) fn partition_trees(plan: &Plan<'_>, limit: NonZeroUsize) -> Vec<Chunk> {
     let mut chunks = vec![Chunk { actions: 0..0 }];
-    let mut trees = 0usize;
-    for (cursor, action) in plan.actions().iter().enumerate() {
-        if matches!(
-            action,
-            Action::Constant { .. } | Action::EvaluateTree { .. }
-        ) {
-            if trees != 0 && trees.is_multiple_of(limit.get()) {
-                chunks.push(Chunk {
-                    actions: cursor..cursor,
-                });
-            }
-            trees = trees.checked_add(1).expect("tree count overflow");
+    for cursor in 0..plan.actions().len() {
+        if cursor != 0 && cursor.is_multiple_of(limit.get()) {
+            chunks.push(Chunk {
+                actions: cursor..cursor,
+            });
         }
         let chunk = chunks.last_mut().unwrap();
         chunk.actions.end = cursor + 1;

@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for (id, predicate) in plan.predicates().iter().enumerate() {
             writeln!(dump, "{id}: {predicate:?}")?;
         }
-        writeln!(dump, "commands:")?;
+        writeln!(dump, "actions:")?;
         for (id, action) in plan.actions().iter().enumerate() {
             writeln!(dump, "{id}: {action:?}")?;
         }

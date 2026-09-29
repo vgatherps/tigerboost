@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, ops::Range};
 
 use crate::parsed_tree::{Discriminator, Trees};
 
@@ -7,9 +7,6 @@ pub use continuation::Chunk;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TreeId(pub usize);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PredicateId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SumId(pub usize);
@@ -25,15 +22,9 @@ pub enum Action {
     },
     EvaluateTree {
         tree: TreeId,
-        predicates: Vec<PredicateId>,
+        predicates: Range<usize>,
         sum: SumId,
     },
-    AddSums {
-        destination: SumId,
-        source: SumId,
-    },
-    ReturnScaled(SumId),
-    ReturnBias,
 }
 
 pub struct Plan<'model> {
@@ -79,23 +70,12 @@ pub(crate) fn plan_with(model: &Trees, chunk_trees: usize, sums: usize) -> Plan<
 fn build_plan(model: &Trees, chunk_trees: NonZeroUsize, sums: usize) -> Plan<'_> {
     let sum_count = sums.min(model.trees().len().max(1));
     let visit_order = shared_feature_order(model, chunk_trees);
-    let mut plan = tree_major(model, sum_count, &visit_order);
-    for source in 1..sum_count {
-        plan.actions.push(Action::AddSums {
-            destination: SumId(0),
-            source: SumId(source),
-        });
-    }
-    plan.actions.push(if model.trees().is_empty() {
-        Action::ReturnBias
-    } else {
-        Action::ReturnScaled(SumId(0))
-    });
+    let mut plan = tree_actions(model, sum_count, &visit_order);
     plan.chunks = continuation::partition_trees(&plan, chunk_trees);
     plan
 }
 
-fn tree_major<'model>(
+fn tree_actions<'model>(
     trees: &'model Trees,
     sum_count: usize,
     visit_order: &[TreeId],
@@ -124,7 +104,7 @@ fn tree_major<'model>(
             }
             plan.actions.push(Action::EvaluateTree {
                 tree,
-                predicates: (start..plan.predicates.len()).map(PredicateId).collect(),
+                predicates: start..plan.predicates.len(),
                 sum,
             });
         }

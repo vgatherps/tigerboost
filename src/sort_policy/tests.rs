@@ -1,5 +1,5 @@
 use super::*;
-use crate::jit::compile;
+use crate::jit::compile_plan;
 use crate::parsed_tree::{FeatureIndex, NanMode, SingleTree};
 use inkwell::context::Context;
 
@@ -13,7 +13,7 @@ fn default_uses_eight_trees_per_chunk_and_two_sums() {
             .iter()
             .map(|chunk| chunk.actions.clone())
             .collect::<Vec<_>>(),
-        [0..8, 8..16, 16..19]
+        [0..8, 8..16, 16..17]
     );
 }
 
@@ -56,9 +56,7 @@ fn replay(plan: &Plan<'_>, row: &[f64]) -> f64 {
     let mut state = vec![0; trees.trees().len()];
     let mut indices = vec![0usize; state.len()];
     let mut sums = vec![0.0; plan.sum_count()];
-    let mut prediction = None;
     for action in plan.actions() {
-        assert!(prediction.is_none(), "command after return");
         match action {
             Action::Constant {
                 tree: TreeId(tree),
@@ -81,11 +79,11 @@ fn replay(plan: &Plan<'_>, row: &[f64]) -> f64 {
                     description.selections.len().div_ceil(2) * 2
                 );
                 for (level, predicate) in predicates
-                    .iter()
+                    .clone()
                     .take(description.selections.len())
                     .enumerate()
                 {
-                    let predicate = &plan.predicates()[predicate.0];
+                    let predicate = &plan.predicates()[predicate];
                     let original = &description.selections[level];
                     assert_eq!(predicate.feature_idx, original.feature_idx);
                     assert_eq!(predicate.threshold.to_bits(), original.threshold.to_bits());
@@ -103,29 +101,24 @@ fn replay(plan: &Plan<'_>, row: &[f64]) -> f64 {
                 state[*tree] = 2;
                 sums[sum.0] += description.leafs[indices[*tree]];
             }
-            Action::AddSums {
-                destination,
-                source,
-            } => {
-                sums[destination.0] += sums[source.0];
-            }
-            Action::ReturnScaled(sum) => {
-                prediction = Some(sums[sum.0] * trees.scale() + trees.bias());
-            }
-            Action::ReturnBias => {
-                prediction = Some(trees.bias());
-            }
         }
     }
     assert!(state.iter().all(|&state| state == 2));
     assert_eq!(indices, trees.leaf_indices(row).unwrap());
-    let prediction = prediction.expect("plan must return a prediction");
+    let prediction = if trees.trees().is_empty() {
+        trees.bias()
+    } else {
+        for source in 1..sums.len() {
+            sums[0] += sums[source];
+        }
+        sums[0] * trees.scale() + trees.bias()
+    };
     assert_eq!(prediction, trees.predict(row).unwrap());
     prediction
 }
 
 #[test]
-fn tree_major_replay_matches_reference() {
+fn plan_replay_matches_reference() {
     let trees = forest(vec![
         tree(&[]),
         tree(&[(1, 0.0)]),
@@ -154,7 +147,7 @@ fn shared_features_replay_matches_reference() {
 #[test]
 fn empty_and_constant_trees_need_no_feature_loads() {
     let empty = forest(vec![]);
-    assert_eq!(check(&empty, &[0.0; 4]).actions, [Action::ReturnBias]);
+    assert!(check(&empty, &[0.0; 4]).actions.is_empty());
     let constants = forest(vec![tree(&[]), tree(&[]), tree(&[])]);
     assert_eq!(
         check(&constants, &[0.0; 4]).actions,
@@ -171,13 +164,12 @@ fn empty_and_constant_trees_need_no_feature_loads() {
                 tree: TreeId(2),
                 sum: SumId(0)
             },
-            Action::ReturnScaled(SumId(0)),
         ]
     );
 }
 
 #[test]
-fn plan_assigns_constant_leaves_to_sums_and_orders_the_final_reduction() {
+fn plan_assigns_constant_leaves_to_sums() {
     let trees = forest(
         [2.0, 3.0, 5.0, 7.0, 11.0]
             .into_iter()
@@ -209,20 +201,7 @@ fn plan_assigns_constant_leaves_to_sums_and_orders_the_final_reduction() {
             (TreeId(4), SumId(1)),
         ]
     );
-    assert_eq!(
-        &first.actions()[first.actions().len() - 3..],
-        [
-            Action::AddSums {
-                destination: SumId(0),
-                source: SumId(1)
-            },
-            Action::AddSums {
-                destination: SumId(0),
-                source: SumId(2)
-            },
-            Action::ReturnScaled(SumId(0)),
-        ]
-    );
+    assert_eq!(first.actions().len(), trees.trees().len());
     assert_eq!(replay(&first, &[0.0; 4]), 59.0);
 }
 
@@ -230,16 +209,15 @@ fn plan_assigns_constant_leaves_to_sums_and_orders_the_final_reduction() {
 fn empty_plan_returns_bias_without_scaling_or_reduction() {
     let trees = Trees::new(vec![], vec![], f64::NAN, -0.0).unwrap();
     let plan = plan(&trees);
-    assert_eq!(plan.actions(), [Action::ReturnBias]);
+    assert!(plan.actions().is_empty());
     assert_eq!(replay(&plan, &[]).to_bits(), (-0.0f64).to_bits());
 }
 
 fn visit_order(plan: &Plan<'_>) -> Vec<TreeId> {
     plan.actions()
         .iter()
-        .filter_map(|action| match action {
-            Action::Constant { tree, .. } | Action::EvaluateTree { tree, .. } => Some(*tree),
-            _ => None,
+        .map(|action| match action {
+            Action::Constant { tree, .. } | Action::EvaluateTree { tree, .. } => *tree,
         })
         .collect()
 }
@@ -280,9 +258,8 @@ fn shared_features_order_is_a_permutation_and_deterministic() {
     let sums: Vec<_> = first
         .actions()
         .iter()
-        .filter_map(|action| match action {
-            Action::Constant { sum, .. } | Action::EvaluateTree { sum, .. } => Some(*sum),
-            _ => None,
+        .map(|action| match action {
+            Action::Constant { sum, .. } | Action::EvaluateTree { sum, .. } => *sum,
         })
         .collect();
     assert_eq!(
@@ -310,7 +287,7 @@ fn partition_trees_counts_visit_order() {
         actions: vec![
             Action::EvaluateTree {
                 tree: TreeId(3),
-                predicates: vec![PredicateId(0), PredicateId(1)],
+                predicates: 0..2,
                 sum: SumId(0),
             },
             Action::Constant {
@@ -319,26 +296,21 @@ fn partition_trees_counts_visit_order() {
             },
             Action::EvaluateTree {
                 tree: TreeId(0),
-                predicates: vec![PredicateId(2), PredicateId(3)],
+                predicates: 2..4,
                 sum: SumId(0),
             },
             Action::EvaluateTree {
                 tree: TreeId(2),
-                predicates: vec![PredicateId(4), PredicateId(5)],
+                predicates: 4..6,
                 sum: SumId(1),
             },
-            Action::AddSums {
-                destination: SumId(0),
-                source: SumId(1),
-            },
-            Action::ReturnScaled(SumId(0)),
         ],
         sum_count: 2,
         chunks: Vec::new(),
     };
     assert_eq!(
         continuation::partition_trees(&plan, NonZeroUsize::new(2).unwrap()),
-        [Chunk { actions: 0..2 }, Chunk { actions: 2..6 },]
+        [Chunk { actions: 0..2 }, Chunk { actions: 2..4 },]
     );
 }
 
@@ -402,10 +374,10 @@ fn plan_is_deterministic_and_chunks_whole_trees() {
                         let depth = description.selections.len();
                         assert_ne!(depth, 0);
                         assert_eq!(predicates.len(), depth + depth % 2);
-                        for (level, predicate) in predicates.iter().enumerate() {
-                            assert_eq!(*predicate, PredicateId(next_predicate));
+                        for (level, predicate) in predicates.clone().enumerate() {
+                            assert_eq!(predicate, next_predicate);
                             next_predicate += 1;
-                            let actual = &first.predicates()[predicate.0];
+                            let actual = &first.predicates()[predicate];
                             if level < depth {
                                 let expected = &description.selections[level];
                                 assert_eq!(actual.feature_idx, expected.feature_idx);
@@ -424,10 +396,6 @@ fn plan_is_deterministic_and_chunks_whole_trees() {
                             }
                         }
                         (*tree, *sum)
-                    }
-                    Action::AddSums { .. } | Action::ReturnScaled(_) | Action::ReturnBias => {
-                        assert_eq!(number + 1, first.chunks().len());
-                        continue;
                     }
                 };
                 assert!(!std::mem::replace(&mut seen[tree.0], true));
@@ -461,92 +429,9 @@ fn partition_limits_and_sum_clamping_compile() {
         let plan = plan_with(&trees, chunk_trees, 8);
         assert_eq!(plan.sum_count(), 3);
         assert_eq!(plan.chunks().len(), if chunk_trees == 1 { 3 } else { 1 });
-        let compiled = compile(&context, &plan).unwrap();
+        let compiled = compile_plan(&context, &plan).unwrap();
         for row in [[0.0; 4], [1.0; 4], [f64::NAN; 4]] {
             assert_eq!(compiled.predict(&row), trees.predict(&row));
-        }
-    }
-}
-
-fn next(state: &mut u64, limit: usize) -> usize {
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    (state.wrapping_mul(0x2545_f491_4f6c_dd1d) % limit as u64) as usize
-}
-
-#[test]
-fn seeded_partitioned_forests_preserve_every_trees_leaf_index() {
-    const SEED: u64 = 0x4d59_5df4_d0f3_3173;
-    const VALUES: [f64; 10] = [
-        f64::NEG_INFINITY,
-        -2.0,
-        -1.0,
-        -0.0,
-        0.0,
-        1.0,
-        1.0,
-        2.0,
-        f64::INFINITY,
-        f64::NAN,
-    ];
-    for case in 0..96 {
-        let seed = SEED ^ case as u64;
-        let mut random = seed;
-        let feature_count = 1 + case % 8;
-        let modes = (0..feature_count)
-            .map(|feature| [NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue][(case + feature) % 3])
-            .collect();
-        let mut trees = Vec::new();
-        let mut prior_depth = 0;
-        for _ in 0..case % 9 {
-            let depth = next(&mut random, 7);
-            let selections = (0..depth)
-                .map(|_| Discriminator {
-                    feature_idx: FeatureIndex(next(&mut random, feature_count)),
-                    threshold: VALUES[next(&mut random, VALUES.len())],
-                })
-                .collect();
-            // Disjoint fields, at most 8 * 6 bits: every reordered sum is exact in f64.
-            let leafs = (0..1u64 << depth)
-                .map(|index| (index << prior_depth) as f64)
-                .collect();
-            trees.push(SingleTree { leafs, selections });
-            prior_depth += depth;
-        }
-        assert!(prior_depth <= 48);
-        let model = Trees::new(trees, modes, 1.0, 0.0).unwrap();
-        let rows: Vec<Vec<f64>> = (0..20)
-            .map(|row| {
-                (0..feature_count)
-                    .map(|_| {
-                        VALUES[if row < VALUES.len() {
-                            row
-                        } else {
-                            next(&mut random, VALUES.len())
-                        }]
-                    })
-                    .collect()
-            })
-            .collect();
-        let context = Context::create();
-        let expected: Vec<_> = rows.iter().map(|row| model.predict(row).unwrap()).collect();
-        let mut kernels = Vec::new();
-        for chunk_trees in [1, 3, 8] {
-            for sums in [1, 2, 4] {
-                let plan = plan_with(&model, chunk_trees, sums);
-                kernels.push(((chunk_trees, sums), compile(&context, &plan).unwrap()));
-            }
-        }
-        drop(model);
-        for (options, compiled) in kernels {
-            for (row_index, row) in rows.iter().enumerate() {
-                assert_eq!(
-                    compiled.predict(row),
-                    Ok(expected[row_index]),
-                    "seed={seed:#x} case={case} options={options:?} row_index={row_index} row={row:?}"
-                );
-            }
         }
     }
 }

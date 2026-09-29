@@ -20,7 +20,7 @@ fn indexed_tree(selections: Vec<Discriminator>) -> SingleTree {
 }
 
 #[test]
-fn tree_major_matches_reference_on_special_values() {
+fn matches_reference_on_special_values() {
     let context = Context::create();
     let values = [
         f64::NAN,
@@ -48,7 +48,7 @@ fn tree_major_matches_reference_on_special_values() {
                     -3.0,
                 )
                 .unwrap();
-                let compiled = compile(&context, &plan(&model)).unwrap();
+                let compiled = compile(&context, &model).unwrap();
                 for first in values {
                     for second in values {
                         for third in values {
@@ -74,7 +74,7 @@ fn tree_major_matches_reference_on_special_values() {
             0.0,
         )
         .unwrap();
-        let compiled = compile(&context, &plan(&model)).unwrap();
+        let compiled = compile(&context, &model).unwrap();
         for first in values {
             for second in values {
                 let row = [first, second];
@@ -85,7 +85,7 @@ fn tree_major_matches_reference_on_special_values() {
 }
 
 #[test]
-fn tree_major_dropped_model_and_odd_depth_last_tree() {
+fn dropped_model_and_odd_depth_last_tree() {
     let context = Context::create();
     let model = Trees::new(
         (0..70)
@@ -126,7 +126,7 @@ fn tree_major_dropped_model_and_odd_depth_last_tree() {
     let expected = rows.map(|row| model.predict(&row).unwrap());
     let plan = plan(&model);
     assert_eq!(plan.chunks().len(), 9);
-    let compiled = compile(&context, &plan).unwrap();
+    let compiled = compile(&context, &model).unwrap();
     drop(plan);
     drop(model);
     for (row, expected) in rows.iter().zip(expected) {
@@ -148,7 +148,7 @@ fn indexed_leaves_expose_original_level_bits_and_strict_comparisons() {
         0.0,
     )
     .unwrap();
-    let compiled = compile(&context, &plan(&model)).unwrap();
+    let compiled = compile(&context, &model).unwrap();
     for index in 0..8 {
         let row = [
             if index & 2 != 0 { 2.0 } else { 1.0 },
@@ -192,7 +192,7 @@ fn repeated_features_nan_modes_and_scale_bias_match_reference() {
         -3.0,
     )
     .unwrap();
-    let compiled = compile(&context, &plan(&model)).unwrap();
+    let compiled = compile(&context, &model).unwrap();
     for row in [
         [f64::NAN; 3],
         [-f64::NAN, 1.0, 2.0],
@@ -209,7 +209,7 @@ fn empty_and_constant_forests_need_no_row_loads() {
     let context = Context::create();
     let empty = Trees::new(vec![], vec![], f64::NAN, -0.0).unwrap();
     assert_eq!(
-        compile(&context, &plan(&empty))
+        compile(&context, &empty)
             .unwrap()
             .predict(&[])
             .unwrap()
@@ -235,10 +235,7 @@ fn empty_and_constant_forests_need_no_row_loads() {
             3.0,
         )
         .unwrap();
-        let result = compile(&context, &plan(&model))
-            .unwrap()
-            .predict(&[])
-            .unwrap();
+        let result = compile(&context, &model).unwrap().predict(&[]).unwrap();
         let expected = model.predict(&[]).unwrap();
         assert!(result == expected || result.is_nan() && expected.is_nan());
     }
@@ -262,7 +259,7 @@ fn reordered_sums_allow_cancellation_error_scaled_by_absolute_leaves() {
     .unwrap();
     let tolerance =
         values.len() as f64 * f64::EPSILON * values.iter().map(|value| value.abs()).sum::<f64>();
-    let compiled = compile(&context, &plan(&model)).unwrap();
+    let compiled = compile(&context, &model).unwrap();
     for row in [[-1.0], [1.0]] {
         assert!(
             (compiled.predict(&row).unwrap() - model.predict(&row).unwrap()).abs() <= tolerance
@@ -280,7 +277,7 @@ fn row_check_and_reused_row_allocation_are_respected() {
         0.0,
     )
     .unwrap();
-    let compiled = compile(&context, &plan(&model)).unwrap();
+    let compiled = compile(&context, &model).unwrap();
     assert_eq!(
         compiled.predict(&[1.0]),
         Err(RowLengthError {
@@ -309,7 +306,7 @@ fn moved_model_owns_leaf_tables_after_source_and_other_kernel_drop() {
             0.0,
         )
         .unwrap();
-        compile(&context, &plan(&model)).unwrap()
+        compile(&context, &model).unwrap()
     };
     let mut moved = vec![compiled];
     {
@@ -321,10 +318,57 @@ fn moved_model_owns_leaf_tables_after_source_and_other_kernel_drop() {
             0.0,
         )
         .unwrap();
-        let other = compile(&other_context, &plan(&other_model)).unwrap();
+        let other = compile(&other_context, &other_model).unwrap();
         assert_eq!(other.predict(&[1.0]), Ok(1.0));
     }
     let compiled = moved.pop().unwrap();
     assert_eq!(compiled.predict(&[-1.0]), Ok(10.0));
     assert_eq!(compiled.predict(&[1.0]), Ok(20.0));
+}
+
+#[path = "../examples/support/mod.rs"]
+mod support;
+
+#[test]
+fn avx2_clears_upper_halves_once_before_the_final_return() {
+    use tigerboost::jit::{EmitOptions, emit_assembly_with};
+    use tigerboost::sort_policy::Action;
+
+    let mut models = vec![support::workload(support::Workload::parse("100x100").unwrap()).0];
+    for tail in [vec![0], vec![1], vec![2], vec![0, 1, 2]] {
+        let trees = [6; 8]
+            .into_iter()
+            .chain(tail)
+            .map(|depth| indexed_tree((0..depth).map(|feature| split(feature, 0.0)).collect()))
+            .collect();
+        let model = Trees::new(trees, vec![NanMode::AsIs; 6], 1.0, 0.0).unwrap();
+        let plan = plan(&model);
+        assert_eq!(plan.chunks().len(), 2);
+        for action in &plan.actions()[plan.chunks()[1].actions.clone()] {
+            let (Action::Constant { tree, .. } | Action::EvaluateTree { tree, .. }) = action;
+            assert!(model.trees()[tree.0].selections.len() <= 2);
+        }
+        models.push(model);
+    }
+    let context = Context::create();
+    for model in models {
+        for triple in ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"] {
+            let assembly =
+                emit_assembly_with(&context, &plan(&model), triple, EmitOptions { avx2: true })
+                    .unwrap();
+            let lines: Vec<_> = assembly.lines().map(str::trim).collect();
+            let clears: Vec<_> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| **line == "vzeroupper")
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(clears.len(), 1, "{triple}, {} trees", model.trees().len());
+            let final_ret = lines.iter().rposition(|line| *line == "retq").unwrap();
+            assert!(clears[0] < final_ret);
+            assert!(lines[clears[0] + 1..final_ret].iter().all(|line| {
+                !line.contains("%ymm") && !line.starts_with("call") && !line.starts_with("jmp")
+            }));
+        }
+    }
 }

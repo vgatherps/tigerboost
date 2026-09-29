@@ -11,7 +11,6 @@ features, and probability transforms are not implemented.
 use inkwell::context::Context;
 use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
-use tigerboost::sort_policy::plan;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = Trees::new(
@@ -27,9 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         -1.0, // bias
     )?;
     let context = Context::create();
-    let plan = plan(&model);
-    let predictor = compile(&context, &plan)?;
-    drop(plan);
+    let predictor = compile(&context, &model)?;
     drop(model);
     assert_eq!(predictor.predict(&[1.0])?, 3.0);
     assert_eq!(predictor.predict(&[2.0])?, 9.0);
@@ -67,7 +64,8 @@ trees, with selected leaves accumulated round-robin into two sums (clamped to
 the tree count, with one sum for an empty forest). The sums are added at the end.
 There are no planning options.
 
-`jit::compile(&context, &plan)` emits that plan. All thresholds and all leaf
+`jit::compile(&context, &model)` plans internally and emits the kernel.
+`jit::compile_plan(&context, &plan)` compiles an inspected plan. Thresholds and leaf
 tables live in one private constant block that every function reaches through a
 pointer argument, so inside a function each threshold is one load and each leaf
 lookup is one indexed load (on x86-64 the leaf load folds into the add). A tree of
@@ -76,8 +74,9 @@ values are loaded into lane pairs, compared against the tree's thresholds (store
 consecutively), and the lane masks are packed with shift-left-insert into two
 signed lane values whose sum addresses a leaf table that was permuted at compile
 time to match. Odd depths get a constant-false padding level. The permutation is
-defined by simulating that lane arithmetic for every bit pattern, and checked to
-be a bijection when the model is compiled.
+defined by simulating that lane arithmetic for reachable bit patterns, with the
+padding bit always false, and checked to be a bijection onto the original leaf
+count when the model is compiled.
 
 Each chunk is a separate `noinline preserve_nonecc` function that transfers only
 the row pointer, the constants pointer (on ARM64 also a per-chunk threshold
@@ -86,12 +85,14 @@ with a `musttail` call; a C `predict` wrapper calls the first one. The split
 exists to stop LLVM from hoisting loads across many trees and spilling; eight
 trees per chunk is the largest spill-free size measured on ARM64.
 
-`jit::compile_with(&context, &plan, EmitOptions { avx2: true })` selects an
+`jit::compile_with(&context, &model, EmitOptions { avx2: true })` selects an
 x86-64 emission that compares four lanes then two per tree with the threshold
 vector as a memory operand and reads the level bits back with `vmovmskpd`. It
 sets `x86-64-v3` on the emitted functions. `compile_with` returns an error if
-AVX2 is requested on a host without it. `EmitOptions::from_host()` enables it
-when LLVM reports `+avx2`; `compile` uses the default two-lane emission.
+AVX2 is requested and the host lacks any required x86-64-v3 feature. `EmitOptions::from_host()` enables
+it when LLVM reports all of `+avx2`, `+bmi1`, `+bmi2`, `+fma`, `+lzcnt`, `+movbe`,
+and `+f16c`; `compile` uses the default two-lane emission. Internal continuations
+skip `vzeroupper`; the final continuation clears the upper halves before returning.
 
 ## Build and checks
 
@@ -105,16 +106,17 @@ cargo test --offline --all-targets
 cargo test --offline --release --all-targets
 RUSTDOCFLAGS="-C link-arg=/opt/homebrew/lib/libzstd.dylib" cargo test --offline --doc
 cargo clippy --offline --all-targets -- -D warnings
-tools/x86_check.sh special
-tools/x86_check.sh special --avx2
-tools/x86_check.sh depths --avx2
-tools/x86_check.sh depths2
+cargo run --offline --release --example x86_check -- special /tmp/tb-x86-special
+cargo run --offline --release --example x86_check -- special /tmp/tb-x86-special-avx2 --avx2
+cargo run --offline --release --example x86_check -- depths /tmp/tb-x86-depths --avx2
+cargo run --offline --release --example x86_check -- depths2 /tmp/tb-x86-depths2
 ```
 
 The macOS ARM64 Cargo configuration links `/opt/homebrew/lib` for zstd;
 rustdoc does not inherit that setting.
 
-`tools/x86_check.sh <workload> [--avx2]` emits the kernel (or its AVX2 twin) for
+`x86_check <workload> <fresh-output-dir> [--avx2]` refuses an existing directory
+and emits the kernel (or its AVX2 twin) for
 `x86_64-apple-darwin`, links it with a C driver, runs it under Rosetta 2
 (`arch -x86_64`) and compares every prediction bit for bit with the reference.
 Rosetta executes the code but its timing says nothing about an x86 CPU; no x86
@@ -158,8 +160,8 @@ Every example accepts `<trees>x<features>` (for example `100x100`, `300x100`,
 have depth 6 and allow 1–10,922 trees with a positive feature count. `special`
 covers NaN modes and special values; `depths` and `depths2` cover depths 1–10.
 `scalar_bench` times the reference, the kernel, and its AVX2 twin on x86 hosts
-with AVX2 support, plus the driver floor. `cold_bench` accepts `--samples` and
-`--out`; its CSV columns are `condition,ns`.
+with the required x86-64-v3 features, plus the driver floor. `cold_bench` accepts
+`--samples` and `--out`; its CSV columns are `condition,ns`.
 
 Inspection requires a fresh output directory. It uses `emit_assembly` for the
 default ARM64/x86-64 assembly and `emit_assembly_with` for the x86 AVX2 twin,

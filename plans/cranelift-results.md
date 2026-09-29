@@ -1,3 +1,4 @@
+Superseded: see PLAN.md and plans/perf-study-2026-09-28/RESULTS.md
 # Cranelift load/reuse experiment
 
 Historical evidence. User switched to LLVM before the dependent-call timing correction; this is not an active backend gate. The saved timing data measures independent-call cost only. The runs' `method.txt` files predate the fuller warmup description below, so they do not independently establish that protocol.

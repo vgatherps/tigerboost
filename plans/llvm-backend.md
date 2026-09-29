@@ -1,3 +1,4 @@
+Superseded: see PLAN.md and plans/perf-study-2026-09-28/RESULTS.md
 # LLVM integration
 
 User switched from Cranelift to LLVM, following `/Users/samschetterer/src/breadboard`. The model, rolling scheduler, explicit SIMD, and single-row latency goals are unchanged.

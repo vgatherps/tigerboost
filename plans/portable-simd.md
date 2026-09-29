@@ -1,3 +1,4 @@
+Superseded: see PLAN.md and plans/perf-study-2026-09-28/RESULTS.md
 # Explicit portable SIMD
 
 Depends on a correct scheduled scalar JIT. Keep the same admission policy and model semantics so the effect of vectorization is measurable.

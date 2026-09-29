@@ -1,3 +1,4 @@
+Superseded: see PLAN.md and plans/perf-study-2026-09-28/RESULTS.md
 # Validation, performance, and completion
 
 Apply this plan throughout implementation. It is not a final cleanup phase.

@@ -1,3 +1,4 @@
+Superseded: see PLAN.md and plans/perf-study-2026-09-28/RESULTS.md
 # Model-specialized scalar JIT
 
 Depends on the model/reference contract and [LLVM integration](llvm-backend.md). A real-model adapter may follow separately; validated in-memory models are sufficient for this slice.

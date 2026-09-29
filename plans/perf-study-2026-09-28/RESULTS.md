@@ -279,6 +279,6 @@ kernel is continuations + shared-feature order, 8 trees per chunk, 2 sums, with 
 
 ## Open
 
-- Default order: stay scalar, or tree-major 8 (spill-free) / 16 (fastest)? Maintainer decision.
-- Native x86 timing of the AVX2 path (needs real hardware).
-- x86 execution evidence (Rosetta for correctness; a real host for timing).
+- ARM64 leaf-offset layout study.
+- Native x86 timing of the SSE2 and AVX2 kernels.
+- A representative user model.

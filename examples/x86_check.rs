@@ -8,6 +8,7 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
+    process::Command,
 };
 use support::{ROWS, Workload, workload};
 #[cfg(test)]
@@ -33,7 +34,7 @@ fn check_natively(
     expected: &[f64],
 ) -> Result<(), Box<dyn Error>> {
     let context = Context::create();
-    let compiled = compile(&context, &plan(model))?;
+    let compiled = compile(&context, model)?;
     for (row, (&expected, features)) in expected.iter().zip(rows).enumerate() {
         assert_eq!(
             compiled.predict(features)?,
@@ -58,7 +59,7 @@ fn write_outputs(
     model: &Trees,
     rows: &[Vec<f64>],
     emit_options: EmitOptions,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<&'static str, Box<dyn Error>> {
     assert_eq!(rows.len(), ROWS);
     let expected = reference_scores(model, rows)?;
     let feature_count = model.feature_modes().len();
@@ -90,7 +91,36 @@ fn write_outputs(
     writeln!(manifest, "avx2 {}", u8::from(emit_options.avx2))?;
     writeln!(manifest, "variant {name}")?;
     println!("{}", manifest_path.display());
+    Ok(name)
+}
+
+fn run(command: &mut Command) -> Result<(), Box<dyn Error>> {
+    let status = command.status()?;
+    if !status.success() {
+        return Err(format!("{command:?} exited with {status}").into());
+    }
     Ok(())
+}
+
+fn check_kernel(output: &Path, name: &str) -> Result<(), Box<dyn Error>> {
+    let result = (|| {
+        let object = output.join(format!("{name}.o"));
+        let binary = output.join(format!("{name}.check"));
+        run(Command::new("clang")
+            .args(["-arch", "x86_64", "-c"])
+            .arg(output.join(format!("{name}.s")))
+            .arg("-o")
+            .arg(&object))?;
+        run(Command::new("clang")
+            .args(["-arch", "x86_64", "-O1", "-Wl,-no_pie"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/x86_check.c"))
+            .arg(&object)
+            .arg("-o")
+            .arg(&binary))?;
+        run(Command::new("arch").arg("-x86_64").arg(&binary).arg(output))
+    })();
+    println!("{} {name}", if result.is_ok() { "PASS" } else { "FAIL" });
+    result
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -106,7 +136,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(USAGE.into());
     }
     let (model, rows) = workload(choice);
-    write_outputs(&output, &model, &rows, EmitOptions { avx2 })
+    let name = write_outputs(&output, &model, &rows, EmitOptions { avx2 })?;
+    check_kernel(&output, name)
 }
 
 #[cfg(test)]
@@ -346,6 +377,8 @@ mod tests {
             1
         );
         let assembly = fs::read(directory.0.join("kernel.s")).unwrap();
+        assert!(write_outputs(&directory.0, &model, &rows, EmitOptions::default()).is_err());
+        assert_eq!(fs::read(directory.0.join("kernel.s")).unwrap(), assembly);
         assert!(!assembly.is_empty());
         assert!(!assembly.contains(&0));
         assert!(
@@ -388,5 +421,25 @@ mod tests {
             let (model, rows) = workload(kind);
             check_natively(&model, &rows, &reference_scores(&model, &rows).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn gate_executes_kernel_and_rejects_mismatches_and_invalid_assembly() {
+        let directory = TempDirectory::new();
+        let (model, rows) = workload(Workload::Distinct(5, 8));
+        let name = write_outputs(&directory.0, &model, &rows, EmitOptions::default()).unwrap();
+        check_kernel(&directory.0, name).unwrap();
+        let expected = directory.0.join("expected.bin");
+        let mut bytes = fs::read(&expected).unwrap();
+        bytes[..8].copy_from_slice(&(-1.0f64).to_le_bytes());
+        fs::write(expected, bytes).unwrap();
+        assert!(check_kernel(&directory.0, name).is_err());
+        fs::write(
+            directory.0.join(format!("{name}.s")),
+            "invalid instruction\n",
+        )
+        .unwrap();
+        assert!(check_kernel(&directory.0, name).is_err());
     }
 }

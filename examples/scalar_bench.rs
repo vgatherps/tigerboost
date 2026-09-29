@@ -8,7 +8,6 @@ use inkwell::context::Context;
 use std::{error::Error, hint::black_box, time::Instant};
 use support::{ROWS, Workload, workload};
 use tigerboost::jit::{EmitOptions, compile, compile_with};
-use tigerboost::sort_policy::plan;
 
 const CALLS: usize = 50_000;
 const ROUNDS: usize = 5;
@@ -32,12 +31,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (model, rows) = workload(choice);
     let context = Context::create();
     let start = Instant::now();
-    let plan = plan(&model);
-    let compiled = compile(&context, &plan)?;
+    let compiled = compile(&context, &model)?;
     let mut kernels = vec![("Kernel", compiled, start.elapsed().as_secs_f64() * 1e3)];
     if cfg!(target_arch = "x86_64") && EmitOptions::from_host().avx2 {
         let start = Instant::now();
-        let compiled = compile_with(&context, &plan, EmitOptions { avx2: true })?;
+        let compiled = compile_with(&context, &model, EmitOptions { avx2: true })?;
         kernels.push(("Kernel AVX2", compiled, start.elapsed().as_secs_f64() * 1e3));
     }
     let (scores, distinct) = verify(&model, &kernels[0].1, &rows, CALLS);
@@ -115,7 +113,7 @@ mod tests {
     fn workload_agrees_and_dependent_trace_visits_multiple_rows() {
         let (model, rows) = workload(Workload::Distinct(20, 30));
         let context = Context::create();
-        let compiled = compile(&context, &plan(&model)).unwrap();
+        let compiled = compile(&context, &model).unwrap();
         let (scores, distinct) = verify(&model, &compiled, &rows, CALLS);
         assert_eq!(scores.len(), ROWS);
         assert!(distinct > 1);
@@ -150,7 +148,7 @@ mod tests {
                 }
             }
             assert_eq!(borders.len(), trees * 6);
-            let compiled = compile(&context, &plan(&model)).unwrap();
+            let compiled = compile(&context, &model).unwrap();
             for row in &rows {
                 assert_eq!(compiled.predict(row), model.predict(row));
             }

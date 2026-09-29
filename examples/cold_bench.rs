@@ -15,7 +15,6 @@ use std::{
 };
 use support::{ROWS, Workload, random, workload};
 use tigerboost::jit::{CompiledModel, compile};
-use tigerboost::sort_policy::plan;
 
 const DEFAULT_SAMPLES: usize = 10_000;
 const VERIFY_CALLS: usize = 50_000;
@@ -364,7 +363,7 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
     let tree_count = model.trees().len();
     let feature_count = model.feature_modes().len();
     let context = Context::create();
-    let compiled = compile(&context, &plan(&model))?;
+    let compiled = compile(&context, &model)?;
     let (scores, distinct_rows) = verify(&model, &compiled, &rows, VERIFY_CALLS);
     let timer_resolution_ns = timer_resolution()?;
     for call in 0..config.warmup_calls {
@@ -379,7 +378,7 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
         config.other_trees,
         config.other_features,
     ));
-    let other = compile(&context, &plan(&other_model))?;
+    let other = compile(&context, &other_model)?;
     let mut pollution = std::array::from_fn(|index| {
         PollutionBuffer::new(config.data_bytes[index], 0x504f4c4c5554494f ^ index as u64)
     });
@@ -580,7 +579,7 @@ mod tests {
     fn verified_kernel_matches_reference_before_timing() {
         let (model, rows) = workload(Workload::Distinct(20, 30));
         let context = Context::create();
-        let compiled = compile(&context, &plan(&model)).unwrap();
+        let compiled = compile(&context, &model).unwrap();
         let (scores, _) = verify(&model, &compiled, &rows, VERIFY_CALLS);
         assert_eq!(scores.len(), ROWS);
         for (row, score) in rows.iter().zip(scores) {
