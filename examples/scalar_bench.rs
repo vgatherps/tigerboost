@@ -7,7 +7,8 @@ use bench::{next_row, verify};
 use inkwell::context::Context;
 use std::{error::Error, hint::black_box, time::Instant};
 use support::{ROWS, Workload, workload};
-use tigerboost::jit::{EmitOptions, compile, compile_with};
+use tigerboost::jit::{EmitOptions, compile_plan, compile_with};
+use tigerboost::sort_policy::plan;
 
 const CALLS: usize = 50_000;
 const ROUNDS: usize = 5;
@@ -31,7 +32,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (model, rows) = workload(choice);
     let context = Context::create();
     let start = Instant::now();
-    let compiled = compile(&context, &model)?;
+    let plan = plan(&model);
+    let sum_count = plan.sum_count();
+    let compiled = compile_plan(&context, &plan)?;
+    drop(plan);
     let mut kernels = vec![("Kernel", compiled, start.elapsed().as_secs_f64() * 1e3)];
     if cfg!(target_arch = "x86_64") && EmitOptions::from_host().avx2 {
         let start = Instant::now();
@@ -67,9 +71,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         order.reverse();
     }
     println!(
-        "Synthetic {choice:?}: {} trees, {} features, {ROWS} rows; shared-feature order, 8 trees/chunk, 2 sums",
+        "Synthetic {choice:?}: {} trees, {} features, {ROWS} rows; shared-feature order, 8 trees/chunk, {} sums",
         model.trees().len(),
-        model.feature_modes().len()
+        model.feature_modes().len(),
+        sum_count
     );
     println!("Dependent chain visits {distinct} distinct rows");
     println!(
@@ -97,6 +102,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tigerboost::jit::compile;
 
     #[test]
     fn dependent_driver_stays_in_range_and_cannot_choose_the_same_row() {

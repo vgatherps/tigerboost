@@ -14,7 +14,8 @@ use std::{
     time::Instant,
 };
 use support::{ROWS, Workload, random, workload};
-use tigerboost::jit::{CompiledModel, compile};
+use tigerboost::jit::{CompiledModel, compile, compile_plan};
+use tigerboost::sort_policy::plan;
 
 const DEFAULT_SAMPLES: usize = 10_000;
 const VERIFY_CALLS: usize = 50_000;
@@ -233,6 +234,7 @@ struct Report {
     workload_name: String,
     tree_count: usize,
     feature_count: usize,
+    sum_count: usize,
     timer_resolution_ns: f64,
     distinct_rows: usize,
     sample_count: usize,
@@ -363,7 +365,10 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
     let tree_count = model.trees().len();
     let feature_count = model.feature_modes().len();
     let context = Context::create();
-    let compiled = compile(&context, &model)?;
+    let plan = plan(&model);
+    let sum_count = plan.sum_count();
+    let compiled = compile_plan(&context, &plan)?;
+    drop(plan);
     let (scores, distinct_rows) = verify(&model, &compiled, &rows, VERIFY_CALLS);
     let timer_resolution_ns = timer_resolution()?;
     for call in 0..config.warmup_calls {
@@ -404,6 +409,7 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
         workload_name: arguments.workload_name.clone(),
         tree_count,
         feature_count,
+        sum_count,
         timer_resolution_ns,
         distinct_rows,
         sample_count: arguments.samples,
@@ -413,8 +419,8 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
 
 fn print_report(report: &Report) {
     println!(
-        "Workload {}: {} trees, {} features, {ROWS} rows; shared-feature order, 8 trees/chunk, 2 sums",
-        report.workload_name, report.tree_count, report.feature_count
+        "Workload {}: {} trees, {} features, {ROWS} rows; shared-feature order, 8 trees/chunk, {} sums",
+        report.workload_name, report.tree_count, report.feature_count, report.sum_count
     );
     println!(
         "timer resolution about {:.1} ns",

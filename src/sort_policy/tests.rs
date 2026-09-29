@@ -276,42 +276,12 @@ fn partition_trees_counts_visit_order() {
         tree(&[(2, 0.0), (3, 0.0)]),
         tree(&[(0, 1.0), (1, 1.0)]),
     ]);
-    let predicates = trees
-        .trees()
-        .iter()
-        .flat_map(|tree| tree.selections.iter().cloned())
-        .collect();
-    let plan = Plan {
-        model: &trees,
-        predicates,
-        actions: vec![
-            Action::EvaluateTree {
-                tree: TreeId(3),
-                predicates: 0..2,
-                sum: SumId(0),
-            },
-            Action::Constant {
-                tree: TreeId(1),
-                sum: SumId(1),
-            },
-            Action::EvaluateTree {
-                tree: TreeId(0),
-                predicates: 2..4,
-                sum: SumId(0),
-            },
-            Action::EvaluateTree {
-                tree: TreeId(2),
-                predicates: 4..6,
-                sum: SumId(1),
-            },
-        ],
-        sum_count: 2,
-        chunks: Vec::new(),
-    };
+    let plan = plan_with(&trees, 2, 2);
     assert_eq!(
-        continuation::partition_trees(&plan, NonZeroUsize::new(2).unwrap()),
-        [Chunk { actions: 0..2 }, Chunk { actions: 2..4 },]
+        plan.chunks(),
+        [Chunk { actions: 0..2 }, Chunk { actions: 2..4 }]
     );
+    replay(&plan, &[1.0, 2.0, 3.0, 4.0]);
 }
 
 #[test]

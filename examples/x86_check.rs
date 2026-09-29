@@ -426,6 +426,11 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn gate_executes_kernel_and_rejects_mismatches_and_invalid_assembly() {
+        let avx2_directory = TempDirectory::new();
+        let (model, rows) = workload(Workload::Distinct(100, 100));
+        let name =
+            write_outputs(&avx2_directory.0, &model, &rows, EmitOptions { avx2: true }).unwrap();
+        check_kernel(&avx2_directory.0, name).unwrap();
         let directory = TempDirectory::new();
         let (model, rows) = workload(Workload::Distinct(5, 8));
         let name = write_outputs(&directory.0, &model, &rows, EmitOptions::default()).unwrap();

@@ -267,7 +267,7 @@ fn repeated_features_nan_modes_and_scale_bias_match_reference() {
 }
 
 #[test]
-fn empty_and_constant_forests_need_no_row_loads() {
+fn empty_and_constant_forests_match_reference() {
     let context = Context::create();
     let empty = Trees::new(vec![], vec![], f64::NAN, -0.0).unwrap();
     assert_eq!(

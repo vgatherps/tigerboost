@@ -65,29 +65,35 @@ the tree count, with one sum for an empty forest). The sums are added at the end
 There are no planning options.
 
 `jit::compile(&context, &model)` plans internally and emits the kernel.
-`jit::compile_plan(&context, &plan)` compiles an inspected plan. Thresholds and leaf
-tables live in one private constant block that every function reaches through a
-pointer argument, so inside a function each threshold is one load and each leaf
+`jit::compile_plan(&context, &plan)` compiles an inspected plan. One private constant
+block holds each chunk's thresholds in target lane order, zero padding to a multiple
+of eight threshold entries, then that chunk's leaf blocks in tree visit order.
+Functions reach this block through a pointer argument, so each threshold is one load and each leaf
 lookup is one indexed load (on x86-64 the leaf load folds into the add). A tree of
 depth `d` is evaluated as `ceil(d/2)` two-lane vector comparisons: its feature
 values are loaded into lane pairs, compared against the tree's thresholds (stored
-consecutively), and the lane masks are packed with shift-left-insert into two
+consecutively), and the lane masks are packed with shift-left-insert on ARM64
+or addition of shifted masks on generic targets into two
 signed lane values whose sum addresses a leaf table that was permuted at compile
 time to match. Odd depths get a constant-false padding level. The permutation is
 defined by simulating that lane arithmetic for reachable bit patterns, with the
 padding bit always false, and checked to be a bijection onto the original leaf
-count when the model is compiled.
+count when the model is compiled. Within each complete pair, exactly one shared
+feature goes to lane 1 on ARM64 and lane 0 on x86. Both-shared and neither-shared
+pairs keep their order; padding is never swapped. Thresholds follow their features.
 
 Each chunk is a separate `noinline preserve_nonecc` function that transfers only
-the row pointer, the constants pointer (on ARM64 also a per-chunk threshold
-base so paired loads stay within `ldp` range), and the running sums to the next chunk
+the row pointer, the constants pointer (on ARM64 also a chunk base addressing both
+thresholds and leaves), and the running sums to the next chunk
 with a `musttail` call; a C `predict` wrapper calls the first one. The split
 exists to stop LLVM from hoisting loads across many trees and spilling; eight
-trees per chunk is the largest spill-free size measured on ARM64.
+trees per chunk is the largest spill-free size measured on ARM64. For an empty
+forest, the C wrapper returns the bias directly without a continuation.
 
 `jit::compile_with(&context, &model, EmitOptions { avx2: true })` selects an
 x86-64 emission that compares four lanes then two per tree with the threshold
-vector as a memory operand and reads the level bits back with `vmovmskpd`. It
+vector as a memory operand and reads the lane bits back with `vmovmskpd`. Its leaf
+blocks are permuted when pairs are swapped; without swaps they retain original order. It
 sets `x86-64-v3` on the emitted functions. `compile_with` returns an error if
 AVX2 is requested and the host lacks any required x86-64-v3 feature. `EmitOptions::from_host()` enables
 it when LLVM reports all of `+avx2`, `+bmi1`, `+bmi2`, `+fma`, `+lzcnt`, `+movbe`,
@@ -108,6 +114,7 @@ RUSTDOCFLAGS="-C link-arg=/opt/homebrew/lib/libzstd.dylib" cargo test --offline 
 cargo clippy --offline --all-targets -- -D warnings
 cargo run --offline --release --example x86_check -- special /tmp/tb-x86-special
 cargo run --offline --release --example x86_check -- special /tmp/tb-x86-special-avx2 --avx2
+cargo run --offline --release --example x86_check -- 100x100 /tmp/tb-x86-100-avx2 --avx2
 cargo run --offline --release --example x86_check -- depths /tmp/tb-x86-depths --avx2
 cargo run --offline --release --example x86_check -- depths2 /tmp/tb-x86-depths2
 ```
@@ -131,20 +138,15 @@ per call including about 5 ns of driver. Cold numbers are
 read-modify-write traffic. Both workloads are synthetic depth-6 forests with
 random feature reuse and globally distinct thresholds.
 
-| 100 trees, 100 features | hot median ns | cold p50 ns |
+| Shared-feature kernel revision / run | 100 trees, hot ns | 300 trees, hot ns |
 |---|---:|---:|
-| scheduled scalar kernel before this work | 121 | 791 |
-| previous model-order kernel | 87 | 792 (measured at 4 per chunk) |
-| current shared-feature kernel | 85 | — |
+| scalar-carry study based on `6cae781`, carry disabled | 85.3 | 228.2 |
+| before layout, `131c251`, back-to-back layout run | 89.6–91.5 | 229.6–234.0 |
+| layout and lane order, `91951d5`, same run | 89.3 | 232.4 |
 
-| 300 trees, 100 features | hot median ns |
-|---|---:|
-| scheduled scalar kernel before this work | ~345 |
-| previous model-order kernel | 237 |
-| current shared-feature kernel | 228 |
-
-The current kernel's recorded hot medians are 85.3 / 228.2 ns at 100 / 300
-trees. Measurements and rejected experiments are in
+The first row is historical; the layout rows were measured back to back on the M4.
+Static layout counts are in [the layout report](plans/perf-study-2026-09-28/VERDICT_layout_astra.md);
+the timing comparison, earlier cold measurements, and rejected experiments are in
 [RESULTS.md](plans/perf-study-2026-09-28/RESULTS.md).
 
 Commands:
@@ -165,5 +167,6 @@ with the required x86-64-v3 features, plus the driver floor. `cold_bench` accept
 
 Inspection requires a fresh output directory. It uses `emit_assembly` for the
 default ARM64/x86-64 assembly and `emit_assembly_with` for the x86 AVX2 twin,
-with plan dumps alongside each file. These are separate target emissions,
+with one `plan.txt` containing both targets' thresholds in emitted lane order,
+plus the shared chunks and actions. These are separate target emissions,
 not MCJIT's executable bytes.

@@ -3,7 +3,7 @@
 Status: one kernel, shared-feature tree order, eight trees per chunk, two sums. No planning
 options remain. Chunks use `musttail` continuations carrying only pointers and sums. The default
 emission compares two lanes; the x86 AVX2 twin compares four then two lanes. Recorded ARM64 hot
-medians are 85 / 228 ns at 100 / 300 trees. x86-64 kernels match the reference under Rosetta 2;
+medians at layout commit `91951d5` are 89.3 / 232.4 ns at 100 / 300 trees. x86-64 kernels match the reference under Rosetta 2;
 no native x86 timing is recorded. The [README](README.md) documents the API;
 [RESULTS.md](plans/perf-study-2026-09-28/RESULTS.md) records the measurements and experiments.
 
@@ -32,19 +32,23 @@ sharing the most features with the chunk; ties use model order. Constant trees c
 Odd depths get a constant-false `+inf` padding level. Leaves accumulate round-robin into two
 sums, clamped to the tree count (one sum for an empty forest). Eight whole trees form a chunk.
 The emitter performs the final reduction and scale/bias.
-Only the row pointer, constants pointer, per-chunk threshold base on ARM64, and sums cross
+Only the row pointer, constants pointer, chunk base on ARM64, and sums cross
 chunk boundaries; `preserve_nonecc` passes them in registers.
 
-The emitter builds one private constant block: thresholds one slot per predicate in first-use
-order, then each tree's leaf block. A tree's thresholds are consecutive, so each lane pair or
+The emitter builds one private constant block per model. Each chunk has thresholds in swapped
+lane order, zero padding to a multiple of eight threshold entries, then its leaf blocks in tree
+visit order. The ARM64 chunk base addresses both thresholds and leaves. A tree's thresholds are consecutive, so each lane pair or
 lane quad is one vector load. Lane masks are packed with shift-left-insert on ARM64 (generic
-shift/or elsewhere) into two signed lane values; the leaf block for that tree is permuted at
+shift/add elsewhere) into two signed lane values; the leaf block for that tree is permuted at
 compile time over reachable patterns with the padding bit false. Each block has the original
 leaf count, and the permutation is asserted to be a bijection.
-Under `EmitOptions { avx2 }` on x86-64, lanes map to level bits directly through `vmovmskpd`, the
-threshold vector folds into `vcmpgt_oqpd`, and the leaf block keeps its original order. Only the
+Exactly one shared feature in a complete pair goes to lane 1 on ARM64 and lane 0 on x86;
+both-shared and neither-shared pairs keep their order. Padding is never swapped.
+Under `EmitOptions { avx2 }` on x86-64, `vmovmskpd` reads lane bits, the
+threshold vector folds into `vcmpgt_oqpd`, and leaf blocks are permuted for swapped pairs.
+With no swaps, AVX2 leaves retain their original order. Only the
 last continuation clears the upper halves. Host execution requires all seven LLVM feature flags
-listed in the README.
+listed in the README. Empty forests return the exact bias from the C wrapper, with no continuation.
 
 ## What was tried and rejected
 
@@ -71,7 +75,6 @@ listed in the README.
 
 ## Open
 
-- ARM64 leaf-offset layout study.
 - Native x86-64 timing of the SSE2 and AVX2 kernels; Rosetta cannot provide it.
 - A representative user model: real depth range, NaN modes, feature counts, and whether inputs
   arrive hot or cold decide what the deployment number is.

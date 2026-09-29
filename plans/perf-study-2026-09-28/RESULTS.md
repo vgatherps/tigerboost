@@ -277,8 +277,26 @@ Each carried feature saves one row load and costs about one register move (the a
 incoming arguments into place). Neutral in model order, slower in shared order. Decision: the
 kernel is continuations + shared-feature order, 8 trees per chunk, 2 sums, with no other option.
 
+## Layout and lane order
+
+Commit `91951d5` places each chunk's thresholds, padding, and leaf blocks together. The ARM64
+chunk base addresses thresholds and leaves. A pair's sole shared feature goes to lane 1 on
+ARM64 and lane 0 on x86; thresholds move with their features and AVX2 leaves are permuted too.
+Counts from [the layout report](VERDICT_layout_astra.md) cover continuations, excluding the C wrapper:
+
+| Target | Instructions, 100 trees before → after | Instructions, 300 trees before → after |
+|---|---:|---:|
+| ARM64 | 2060 → 1974 | 6247 → 5876 |
+| SSE2 | 2295 → 2267 | 6925 → 6859 |
+| AVX2 | 1378 → 1334 | 4114 → 3978 |
+
+ARM64 leaf-offset materializations fell from 45 / 267 to zero at 100 / 300 trees;
+continuations retained zero stack operations. The maintainer's back-to-back M4 hot measurements
+were 89.3 / 232.4 ns for `91951d5`, against 89.6–91.5 / 229.6–234.0 ns for the previous kernel
+at `131c251`. These are the layout run's measurements, separate from the earlier 85.3 / 228.2 ns
+scalar-carry study based on `6cae781`. No native x86 timing was collected.
+
 ## Open
 
-- ARM64 leaf-offset layout study.
 - Native x86 timing of the SSE2 and AVX2 kernels.
 - A representative user model.
