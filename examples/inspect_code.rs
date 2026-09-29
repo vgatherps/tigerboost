@@ -61,3 +61,76 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tigerboost::sort_policy::Action;
+
+    #[test]
+    fn every_300_tree_chunk_keeps_thresholds_and_leaves_within_32_kib() {
+        let context = Context::create();
+        let (model, _) = support::workload(Workload::Distinct(300, 100));
+        let plan = plan(&model);
+        let assembly = emit_assembly(&context, &plan, "aarch64-apple-darwin").unwrap();
+        let constants: Vec<_> = assembly
+            .split_once("l_constants:\n")
+            .unwrap()
+            .1
+            .lines()
+            .map(str::trim)
+            .take_while(|line| line.starts_with(".quad"))
+            .map(|line| {
+                u64::from_str_radix(
+                    line.split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .strip_prefix("0x")
+                        .unwrap(),
+                    16,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut slot = 0usize;
+        assert_eq!(plan.chunks().len(), 38);
+        for chunk in plan.chunks() {
+            let first = slot;
+            let actions = &plan.actions()[chunk.actions.clone()];
+            for action in actions {
+                let Action::EvaluateTree { predicates, .. } = action else {
+                    unreachable!()
+                };
+                for pair in plan.predicates()[predicates.clone()].chunks_exact(2) {
+                    let mut expected = [pair[0].threshold.to_bits(), pair[1].threshold.to_bits()];
+                    let mut actual = [constants[slot], constants[slot + 1]];
+                    expected.sort_unstable();
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected);
+                    slot += 2;
+                }
+            }
+            let padded = first + (slot - first).next_multiple_of(8);
+            assert!(constants[slot..padded].iter().all(|&bits| bits == 0));
+            slot = padded;
+            for action in actions {
+                let Action::EvaluateTree { tree, .. } = action else {
+                    unreachable!()
+                };
+                let tree = &model.trees()[tree.0];
+                let mut expected: Vec<_> = tree.leafs.iter().map(|leaf| leaf.to_bits()).collect();
+                let mut actual = constants[slot..slot + tree.leafs.len()].to_vec();
+                expected.sort_unstable();
+                actual.sort_unstable();
+                assert_eq!(actual, expected);
+                slot += tree.leafs.len();
+            }
+            assert_eq!(
+                (slot - first) * size_of::<f64>(),
+                actions.len() * (6 + 64) * 8
+            );
+            assert!((slot - first) * size_of::<f64>() <= 32 * 1024);
+        }
+        assert_eq!(slot, constants.len());
+    }
+}

@@ -20,6 +20,68 @@ fn indexed_tree(selections: Vec<Discriminator>) -> SingleTree {
 }
 
 #[test]
+fn every_leaf_pattern_survives_shared_feature_lane_swaps() {
+    let context = Context::create();
+    for depth in 1..=10 {
+        for shared_lane in 0..2 {
+            let selections: Vec<_> = (0..depth)
+                .map(|level| split(level, (2 * level) as f64 - 5.0))
+                .collect();
+            let shared: Vec<_> = selections
+                .iter()
+                .skip(shared_lane)
+                .step_by(2)
+                .cloned()
+                .collect();
+            let mut companion = indexed_tree(shared);
+            for leaf in &mut companion.leafs {
+                *leaf *= (1usize << depth) as f64;
+            }
+            let model = Trees::new(
+                vec![indexed_tree(selections.clone()), companion],
+                vec![NanMode::AsIs; depth],
+                1.0,
+                0.0,
+            )
+            .unwrap();
+            let mut kernels = vec![compile(&context, &model).unwrap()];
+            if tigerboost::jit::EmitOptions::from_host().avx2 {
+                kernels.push(
+                    tigerboost::jit::compile_with(
+                        &context,
+                        &model,
+                        tigerboost::jit::EmitOptions { avx2: true },
+                    )
+                    .unwrap(),
+                );
+            }
+            for pattern in 0..1usize << depth {
+                let row: Vec<_> = selections
+                    .iter()
+                    .enumerate()
+                    .map(|(level, split)| split.threshold + f64::from(pattern & (1 << level) != 0))
+                    .collect();
+                let shared_pattern = (shared_lane..depth)
+                    .step_by(2)
+                    .enumerate()
+                    .fold(0, |bits, (lane, level)| {
+                        bits | (((pattern >> level) & 1) << lane)
+                    });
+                let expected = (pattern | (shared_pattern << depth)) as f64;
+                assert_eq!(model.predict(&row), Ok(expected));
+                for compiled in &kernels {
+                    assert_eq!(
+                        compiled.predict(&row),
+                        Ok(expected),
+                        "depth={depth} shared_lane={shared_lane} pattern={pattern}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn matches_reference_on_special_values() {
     let context = Context::create();
     let values = [
