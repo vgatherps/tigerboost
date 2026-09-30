@@ -329,8 +329,8 @@ byte-identical and grew ARM64 from 1999 to 2083 instructions at 100x100 and from
 `mov.16b` 61 -> 125: a lane insert has no immediate offset and overwrites its register, so it needs
 an address add and a copy of the reused value. M4 hot, three back-to-back rounds against master:
 100x100 82.8/85.6/86.2 vs 81.7/83.2/83.5 ns; 300x100 215.6/217.9/225.5 vs 219.3/217.8/222.6 ns.
-Lane 1 on ARM64 and lane 0 on x86 stays: each target puts the fresh load where its offset-addressed
-load form writes.
+Lane 1 on ARM64 stays: the fresh feature then lands in lane 0 through an offset-addressed `ldr`.
+The x86 lane choice was not revisited.
 
 ## Open
 
