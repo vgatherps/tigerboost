@@ -321,6 +321,17 @@ the total unchanged. Vector-register counts and stack operations are unchanged. 
 forests at depths 0, 1, and 2 lose the explicit `vzeroupper` and its spill/reload: continuation
 instructions fall from 8 → 5, 13 → 10, and 13 → 10, with stack operations 2 → 0 in each case.
 
+## Shared-feature lane on ARM64 (rejected, branch `exp/lane0`)
+
+Putting a pair's sole shared feature in lane 0 on ARM64, as x86 does, left x86 assembly
+byte-identical and grew ARM64 from 1999 to 2083 instructions at 100x100 and from 5902 to 6164 at
+300x100. `ldr` fell 364 -> 290 while `ld1.d` lane inserts rose 32 -> 152, `add` 245 -> 361 and
+`mov.16b` 61 -> 125: a lane insert has no immediate offset and overwrites its register, so it needs
+an address add and a copy of the reused value. M4 hot, three back-to-back rounds against master:
+100x100 82.8/85.6/86.2 vs 81.7/83.2/83.5 ns; 300x100 215.6/217.9/225.5 vs 219.3/217.8/222.6 ns.
+Lane 1 on ARM64 and lane 0 on x86 stays: each target puts the fresh load where its offset-addressed
+load form writes.
+
 ## Open
 
 - Native x86 timing of the SSE2 and AVX2 kernels.
