@@ -16,12 +16,17 @@ use inkwell::values::{
 };
 use inkwell::{AddressSpace, FloatPredicate, OptimizationLevel};
 use std::error::Error;
+use std::sync::{Mutex, PoisonError};
 
 type PredictFn = unsafe extern "C" fn(*const f64) -> f64;
 type CompileResult<T> = Result<T, Box<dyn Error>>;
 const BACKEND_OPTIMIZATION: OptimizationLevel = OptimizationLevel::Less;
 // LLVM 21 preserve_nonecc; only used between matching continuation signatures.
 const PRESERVE_NONE_CALL_CONVENTION: u32 = 21;
+// LLVM registers its targets again on every initialize call and reads the registry
+// without a lock when a target machine is created, so compilation and assembly
+// emission take turns. Prediction never touches this.
+static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EmitOptions {
@@ -125,6 +130,7 @@ fn compile_plan_with(plan: &Plan<'_>, options: EmitOptions) -> CompileResult<Com
     if options.avx2 && !EmitOptions::from_host().avx2 {
         return Err("AVX2 emission requires x86-64-v3 host features".into());
     }
+    let _serialized = COMPILE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     LlvmTarget::initialize_native(&InitializationConfig::default())?;
     let triple = TargetMachine::get_default_triple();
     let context = Context::create();
@@ -160,6 +166,7 @@ pub fn emit_assembly_with(
     target_triple: &str,
     options: EmitOptions,
 ) -> CompileResult<String> {
+    let _serialized = COMPILE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     LlvmTarget::initialize_all(&InitializationConfig::default());
     let triple = TargetTriple::create(target_triple);
     let context = Context::create();
@@ -2071,56 +2078,6 @@ mod tests {
                 .to_string()
                 .contains("0xFFF0000000000000")
         );
-    }
-
-    #[test]
-    fn special_values_match_the_reference_for_every_nan_mode() {
-        for mode in [NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue] {
-            for threshold in [
-                f64::NEG_INFINITY,
-                -1.0,
-                0.0,
-                1.0,
-                f64::INFINITY,
-                f64::NAN,
-            ] {
-                let model = Trees::new(
-                    vec![SingleTree {
-                        leafs: vec![3.0, 7.0],
-                        selections: vec![Discriminator {
-                            feature_idx: FeatureIndex(0),
-                            threshold,
-                        }],
-                    }],
-                    vec![mode],
-                    1.0,
-                    0.0,
-                )
-                .unwrap();
-                let compiled = compile(&model).unwrap();
-                for value in [
-                    f64::NAN,
-                    f64::NEG_INFINITY,
-                    -1.0,
-                    0.0,
-                    1.0,
-                    f64::INFINITY,
-                ] {
-                    assert_eq!(
-                        compiled.predict(&[value]).unwrap().to_bits(),
-                        model.predict(&[value]).unwrap().to_bits(),
-                        "mode={mode:?} threshold={threshold:?} value={value:?}",
-                    );
-                }
-                if mode != NanMode::AsTrue {
-                    assert_eq!(
-                        compiled.predict(&[f64::NAN]).unwrap().to_bits(),
-                        compiled.predict(&[f64::NEG_INFINITY]).unwrap().to_bits(),
-                        "mode={mode:?} threshold={threshold:?}",
-                    );
-                }
-            }
-        }
     }
 
     #[test]

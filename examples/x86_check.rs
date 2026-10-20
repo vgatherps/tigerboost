@@ -88,11 +88,12 @@ fn resolve_host() -> Result<Host, String> {
         })
     } else if cfg!(target_os = "linux") {
         require(&["x86_64-linux-gnu-gcc", "qemu-x86_64"])?;
+        // Static, so qemu-x86_64 needs no x86-64 sysroot for the dynamic loader.
         Ok(Host {
             triple: "x86_64-unknown-linux-gnu",
             compiler: "x86_64-linux-gnu-gcc",
             assemble_flags: &["-c"],
-            link_flags: &["-O1", "-no-pie"],
+            link_flags: &["-O1", "-no-pie", "-static"],
             runner: &["qemu-x86_64"],
         })
     } else {
@@ -302,7 +303,8 @@ mod tests {
         match toolchain(avx2) {
             Ok(host) => Some(host),
             Err(reason) => {
-                eprintln!("skipped: {reason}");
+                // Written to fd 2 directly: libtest captures eprintln! from passing tests.
+                let _ = writeln!(std::io::stderr(), "skipped: {reason}");
                 None
             }
         }

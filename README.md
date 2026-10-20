@@ -36,7 +36,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 independent tree-order reference. Compiled models own their LLVM context, code
 and copied constants, so the source `Trees` and `Plan` may be dropped.
 `CompiledModel` is `Send` and `Sync`: one model may be shared across threads
-calling `predict` at the same time, or moved to another thread.
+calling `predict` at the same time, or moved to another thread. Compilation and
+assembly emission take turns behind one process-wide lock, because LLVM's target
+registry is not safe to use from two threads at once; `predict` never waits on it.
 `predict` checks that the row covers every declared feature.
 Rows stay read-only during each call and may change between calls. Prediction
 writes neither caller memory nor model data.
@@ -115,7 +117,7 @@ Cargo.toml), and a C compiler. The x86 check also needs an x86-64 runner:
 |---|---|---|
 | macOS | Homebrew `llvm@21` | Rosetta 2 (`arch -x86_64`), `clang` |
 | Linux x86-64 | `llvm-config-21` or `llvm-config` 21.x | `cc` only |
-| Linux aarch64 | `llvm-config-21` or `llvm-config` 21.x | `gcc-x86-64-linux-gnu`, `qemu-user` |
+| Linux aarch64 | `llvm-config-21` or `llvm-config` 21.x | `gcc-x86-64-linux-gnu` (with its static cross libc), `qemu-user`; the check binary is linked `-static` so qemu needs no sysroot |
 
 ```sh
 make                                # build, test, check-x86
@@ -155,7 +157,8 @@ emits the kernel (or its AVX2 twin) for `x86_64-apple-darwin` on macOS or
 natively, or under `qemu-x86_64`) and compares every prediction bit for bit with
 the reference. The x86_check tests in `cargo test --all-targets` execute
 `special`, `100x100`, `depths`, and `depths2` kernels this way; without an x86-64
-runner they print `skipped: <reason>` and pass, while `make check-x86` fails. On
+runner they pass and write `skipped: <reason>` straight to stderr, past the test
+harness's capture, while `make check-x86` fails. On
 Linux x86-64 the AVX2 variants skip when the CPU lacks AVX2. Emulated timing says
 nothing about an x86 CPU; no x86 performance has been measured.
 
