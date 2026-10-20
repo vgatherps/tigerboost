@@ -1,3 +1,5 @@
 # Homebrew's LLVM depends on zstd in this directory.
+# rustdoc ignores rustflags and llvm-sys's /usr/local/lib search path wins, so doctests link zstd by path.
 [target.aarch64-apple-darwin]
 rustflags = ["-L", "/opt/homebrew/lib"]
+rustdocflags = ["-C", "link-arg=/opt/homebrew/lib/libzstd.dylib"]

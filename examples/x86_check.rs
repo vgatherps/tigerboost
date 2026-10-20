@@ -6,8 +6,10 @@ use std::{
     error::Error,
     fs::{self, File},
     io::{BufWriter, Write},
+    fmt,
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
 };
 use support::{ROWS, Workload, workload};
 #[cfg(test)]
@@ -20,6 +22,103 @@ use tigerboost::sort_policy::plan;
 
 const USAGE: &str =
     "usage: x86_check <special|depths|depths2|<trees>x<features>> <fresh-output-dir> [--avx2]";
+
+/// How this machine assembles, links, and runs x86-64 code.
+struct Host {
+    triple: &'static str,
+    compiler: &'static str,
+    assemble_flags: &'static [&'static str],
+    link_flags: &'static [&'static str],
+    runner: &'static [&'static str],
+}
+
+/// No x86-64 runner on this machine; distinct from a check that ran and failed.
+struct Unavailable(String);
+
+impl fmt::Display for Unavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "no x86-64 runner: {}", self.0)
+    }
+}
+
+impl fmt::Debug for Unavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl Error for Unavailable {}
+
+fn on_path(tool: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(tool).is_file()))
+}
+
+fn require(tools: &[&str]) -> Result<(), String> {
+    match tools.iter().find(|tool| !on_path(tool)) {
+        Some(tool) => Err(format!("{tool} is not on PATH")),
+        None => Ok(()),
+    }
+}
+
+fn resolve_host() -> Result<Host, String> {
+    if cfg!(target_os = "macos") {
+        require(&["clang", "arch"])?;
+        let rosetta = Command::new("arch")
+            .args(["-x86_64", "/usr/bin/true"])
+            .output();
+        if !rosetta.is_ok_and(|output| output.status.success()) {
+            return Err("`arch -x86_64 /usr/bin/true` failed; install Rosetta 2".into());
+        }
+        Ok(Host {
+            triple: "x86_64-apple-darwin",
+            compiler: "clang",
+            assemble_flags: &["-arch", "x86_64", "-c"],
+            link_flags: &["-arch", "x86_64", "-O1", "-Wl,-no_pie"],
+            runner: &["arch", "-x86_64"],
+        })
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        require(&["cc"])?;
+        Ok(Host {
+            triple: "x86_64-unknown-linux-gnu",
+            compiler: "cc",
+            assemble_flags: &["-c"],
+            link_flags: &["-O1", "-no-pie"],
+            runner: &[],
+        })
+    } else if cfg!(target_os = "linux") {
+        require(&["x86_64-linux-gnu-gcc", "qemu-x86_64"])?;
+        Ok(Host {
+            triple: "x86_64-unknown-linux-gnu",
+            compiler: "x86_64-linux-gnu-gcc",
+            assemble_flags: &["-c"],
+            link_flags: &["-O1", "-no-pie"],
+            runner: &["qemu-x86_64"],
+        })
+    } else {
+        Err(format!("unsupported OS {}", std::env::consts::OS))
+    }
+}
+
+/// Rosetta and qemu-x86_64 run AVX2 code; native Linux x86-64 runs it only if the CPU has it.
+fn runs_avx2() -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    true
+}
+
+fn toolchain(avx2: bool) -> Result<&'static Host, Unavailable> {
+    static HOST: OnceLock<Result<Host, String>> = OnceLock::new();
+    let host = HOST
+        .get_or_init(resolve_host)
+        .as_ref()
+        .map_err(|reason| Unavailable(reason.clone()))?;
+    if avx2 && !runs_avx2() {
+        return Err(Unavailable("this x86-64 CPU lacks AVX2".into()));
+    }
+    Ok(host)
+}
 
 fn reference_scores(model: &Trees, rows: &[Vec<f64>]) -> Result<Vec<f64>, Box<dyn Error>> {
     rows.iter()
@@ -54,6 +153,7 @@ fn write_f64s(path: &Path, values: impl IntoIterator<Item = f64>) -> Result<(), 
 
 fn write_outputs(
     output: &Path,
+    triple: &str,
     model: &Trees,
     rows: &[Vec<f64>],
     emit_options: EmitOptions,
@@ -70,7 +170,7 @@ fn write_outputs(
     } else {
         "kernel"
     };
-    let assembly = emit_assembly_with(&plan, "x86_64-apple-darwin", emit_options)?;
+    let assembly = emit_assembly_with(&plan, triple, emit_options)?;
     let path = output.join(format!("{name}.s"));
     File::create_new(&path)?.write_all(assembly.as_bytes())?;
     println!("{}", path.display());
@@ -91,30 +191,54 @@ fn write_outputs(
     Ok(name)
 }
 
-fn run(command: &mut Command) -> Result<(), Box<dyn Error>> {
-    let status = command.status()?;
-    if !status.success() {
-        return Err(format!("{command:?} exited with {status}").into());
+fn run(command: &mut Command) -> Result<String, Box<dyn Error>> {
+    let output = command.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        return Err(format!(
+            "{command:?} exited with {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
     }
-    Ok(())
+    Ok(stdout.into_owned())
 }
 
-fn check_kernel(output: &Path, name: &str) -> Result<(), Box<dyn Error>> {
+fn assemble_command(host: &Host, output: &Path, name: &str) -> Command {
+    let mut command = Command::new(host.compiler);
+    command
+        .args(host.assemble_flags)
+        .arg(output.join(format!("{name}.s")))
+        .arg("-o")
+        .arg(output.join(format!("{name}.o")));
+    command
+}
+
+fn check_kernel(host: &Host, output: &Path, name: &str) -> Result<(), Box<dyn Error>> {
     let result = (|| {
-        let object = output.join(format!("{name}.o"));
         let binary = output.join(format!("{name}.check"));
-        run(Command::new("clang")
-            .args(["-arch", "x86_64", "-c"])
-            .arg(output.join(format!("{name}.s")))
-            .arg("-o")
-            .arg(&object))?;
-        run(Command::new("clang")
-            .args(["-arch", "x86_64", "-O1", "-Wl,-no_pie"])
+        run(&mut assemble_command(host, output, name))?;
+        run(Command::new(host.compiler)
+            .args(host.link_flags)
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/x86_check.c"))
-            .arg(&object)
+            .arg(output.join(format!("{name}.o")))
             .arg("-o")
             .arg(&binary))?;
-        run(Command::new("arch").arg("-x86_64").arg(&binary).arg(output))
+        let mut command = match host.runner {
+            [] => Command::new(&binary),
+            [runner, flags @ ..] => {
+                let mut command = Command::new(runner);
+                command.args(flags).arg(&binary);
+                command
+            }
+        };
+        let stdout = run(command.arg(output))?;
+        let expected = format!("ok {ROWS} rows");
+        if !stdout.lines().any(|line| line == expected) {
+            return Err(format!("driver stdout lacks `{expected}`:\n{stdout}").into());
+        }
+        Ok(())
     })();
     println!("{} {name}", if result.is_ok() { "PASS" } else { "FAIL" });
     result
@@ -132,9 +256,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     if arguments.next().is_some() {
         return Err(USAGE.into());
     }
+    let host = toolchain(avx2)?;
     let (model, rows) = workload(choice);
-    let name = write_outputs(&output, &model, &rows, EmitOptions { avx2 })?;
-    check_kernel(&output, name)
+    let name = write_outputs(&output, host.triple, &model, &rows, EmitOptions { avx2 })?;
+    check_kernel(host, &output, name)
 }
 
 #[cfg(test)]
@@ -159,11 +284,72 @@ mod tests {
     impl Drop for TempDirectory {
         fn drop(&mut self) {
             if let Err(error) = fs::remove_dir_all(&self.0) {
-                if error.kind() != std::io::ErrorKind::NotFound {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return;
+                }
+                if std::thread::panicking() {
+                    eprintln!("failed to remove {}: {error}", self.0.display());
+                } else {
                     panic!("failed to remove {}: {error}", self.0.display());
                 }
             }
         }
+    }
+
+    const DARWIN: &str = "x86_64-apple-darwin";
+
+    fn execution_host(avx2: bool) -> Option<&'static Host> {
+        match toolchain(avx2) {
+            Ok(host) => Some(host),
+            Err(reason) => {
+                eprintln!("skipped: {reason}");
+                None
+            }
+        }
+    }
+
+    fn check_on_x86(model: &Trees, rows: &[Vec<f64>], avx2: bool) {
+        let Some(host) = execution_host(avx2) else {
+            return;
+        };
+        let directory = TempDirectory::new();
+        let name = write_outputs(&directory.0, host.triple, model, rows, EmitOptions { avx2 }).unwrap();
+        check_kernel(host, &directory.0, name).unwrap();
+    }
+
+    fn check_workload_on_x86(kind: Workload, avx2: bool) {
+        let (model, rows) = workload(kind);
+        check_on_x86(&model, &rows, avx2);
+    }
+
+    #[test]
+    fn special_executes_on_x86() {
+        check_workload_on_x86(Workload::Special, false);
+    }
+
+    #[test]
+    fn special_avx2_executes_on_x86() {
+        check_workload_on_x86(Workload::Special, true);
+    }
+
+    #[test]
+    fn distinct_100x100_executes_on_x86() {
+        check_workload_on_x86(Workload::Distinct(100, 100), false);
+    }
+
+    #[test]
+    fn distinct_100x100_avx2_executes_on_x86() {
+        check_workload_on_x86(Workload::Distinct(100, 100), true);
+    }
+
+    #[test]
+    fn depths_avx2_executes_on_x86() {
+        check_workload_on_x86(Workload::Depths, true);
+    }
+
+    #[test]
+    fn depths2_executes_on_x86() {
+        check_workload_on_x86(Workload::Depths2, false);
     }
 
     fn assert_leaf_fields_decode(model: &Trees, rows: &[Vec<f64>]) {
@@ -321,6 +507,12 @@ mod tests {
 
     #[test]
     fn exported_rows_detect_deep_leaf_mutants() {
+        const ROW: usize = 17;
+        let expected_bytes = |model: &Trees, rows: &[Vec<f64>]| {
+            let directory = TempDirectory::new();
+            write_outputs(&directory.0, DARWIN, model, rows, EmitOptions::default()).unwrap();
+            fs::read(directory.0.join("expected.bin")).unwrap()[ROW * 8..ROW * 8 + 8].to_vec()
+        };
         for (model, rows, depth) in [
             {
                 let (model, rows) = special_workload();
@@ -336,16 +528,15 @@ mod tests {
                 .iter()
                 .position(|tree| tree.selections.len() == depth)
                 .unwrap();
-            let leaf = model.leaf_indices(&rows[0]).unwrap()[tree];
+            let leaf = model.leaf_indices(&rows[ROW]).unwrap()[tree];
+            let score = model.predict(&rows[ROW]).unwrap();
+
             let mutant = mutated_leaf_model(&model, tree, leaf);
-            let expected = reference_scores(&model, &rows).unwrap();
-            let actual = reference_scores(&mutant, &rows).unwrap();
-            assert!(
-                expected
-                    .iter()
-                    .zip(actual)
-                    .any(|(expected, actual)| expected != &actual)
-            );
+            assert_ne!(mutant.predict(&rows[ROW]).unwrap().to_bits(), score.to_bits());
+            assert_ne!(expected_bytes(&model, &rows), expected_bytes(&mutant, &rows));
+
+            let other = mutated_leaf_model(&model, tree, (leaf + 1) % (1 << depth));
+            assert_eq!(other.predict(&rows[ROW]).unwrap().to_bits(), score.to_bits());
         }
     }
 
@@ -353,7 +544,7 @@ mod tests {
     fn outputs_have_the_documented_sizes_and_symbols() {
         let directory = TempDirectory::new();
         let (model, rows) = support::workload(Workload::Distinct(5, 8));
-        write_outputs(&directory.0, &model, &rows, EmitOptions::default()).unwrap();
+        write_outputs(&directory.0, DARWIN, &model, &rows, EmitOptions::default()).unwrap();
         assert_eq!(
             fs::metadata(directory.0.join("rows.bin")).unwrap().len(),
             256 * 8 * 8
@@ -374,7 +565,7 @@ mod tests {
             1
         );
         let assembly = fs::read(directory.0.join("kernel.s")).unwrap();
-        assert!(write_outputs(&directory.0, &model, &rows, EmitOptions::default()).is_err());
+        assert!(write_outputs(&directory.0, DARWIN, &model, &rows, EmitOptions::default()).is_err());
         assert_eq!(fs::read(directory.0.join("kernel.s")).unwrap(), assembly);
         assert!(!assembly.is_empty());
         assert!(!assembly.contains(&0));
@@ -389,14 +580,14 @@ mod tests {
     fn avx2_outputs_record_options_and_emit_vector_compares() {
         let directory = TempDirectory::new();
         let (model, rows) = support::workload(Workload::Distinct(5, 8));
-        write_outputs(&directory.0, &model, &rows, EmitOptions { avx2: true }).unwrap();
+        write_outputs(&directory.0, DARWIN, &model, &rows, EmitOptions { avx2: true }).unwrap();
         let manifest = fs::read_to_string(directory.0.join("manifest.txt")).unwrap();
         assert_eq!(manifest.lines().filter(|line| *line == "avx2 1").count(), 1);
         let assembly = fs::read_to_string(directory.0.join("kernel-avx2.s")).unwrap();
         let plan = plan(&model);
         let expected = emit_assembly_with(
             &plan,
-            "x86_64-apple-darwin",
+            DARWIN,
             EmitOptions { avx2: true },
         )
         .unwrap();
@@ -419,7 +610,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     fn encoded_mixed_forest_keeps_swapped_leaf_fields_on_both_paths() {
         use tigerboost::jit::ordered_predicates;
         use tigerboost::parsed_tree::{Discriminator, FeatureIndex, SingleTree};
@@ -506,14 +696,11 @@ mod tests {
             }
         }
         for avx2 in [false, true] {
-            let directory = TempDirectory::new();
-            let name = write_outputs(&directory.0, &model, &rows, EmitOptions { avx2 }).unwrap();
-            check_kernel(&directory.0, name).unwrap();
+            check_on_x86(&model, &rows, avx2);
         }
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     fn empty_forest_preserves_bias_bits_on_both_paths() {
         let rows = vec![vec![0.0; 2]; ROWS];
         for bits in [
@@ -538,36 +725,45 @@ mod tests {
                     .all(|value| value.to_bits() == bits)
             );
             for avx2 in [false, true] {
-                let directory = TempDirectory::new();
-                let name =
-                    write_outputs(&directory.0, &model, &rows, EmitOptions { avx2 }).unwrap();
-                check_kernel(&directory.0, name).unwrap();
+                check_on_x86(&model, &rows, avx2);
             }
         }
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     fn gate_executes_kernel_and_rejects_mismatches_and_invalid_assembly() {
-        let avx2_directory = TempDirectory::new();
-        let (model, rows) = workload(Workload::Distinct(100, 100));
-        let name =
-            write_outputs(&avx2_directory.0, &model, &rows, EmitOptions { avx2: true }).unwrap();
-        check_kernel(&avx2_directory.0, name).unwrap();
+        let Some(host) = execution_host(false) else {
+            return;
+        };
         let directory = TempDirectory::new();
         let (model, rows) = workload(Workload::Distinct(5, 8));
-        let name = write_outputs(&directory.0, &model, &rows, EmitOptions::default()).unwrap();
-        check_kernel(&directory.0, name).unwrap();
+        let name =
+            write_outputs(&directory.0, host.triple, &model, &rows, EmitOptions::default())
+                .unwrap();
+        check_kernel(host, &directory.0, name).unwrap();
+
         let expected = directory.0.join("expected.bin");
-        let mut bytes = fs::read(&expected).unwrap();
-        bytes[..8].copy_from_slice(&(-1.0f64).to_le_bytes());
-        fs::write(expected, bytes).unwrap();
-        assert!(check_kernel(&directory.0, name).is_err());
+        let original = fs::read(&expected).unwrap();
+        let mut corrupted = original.clone();
+        corrupted[..8].copy_from_slice(&(-1.0f64).to_le_bytes());
+        fs::write(&expected, corrupted).unwrap();
+        let mismatch = check_kernel(host, &directory.0, name)
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("row 0: got"), "{mismatch}");
+
+        fs::write(&expected, original).unwrap();
+        check_kernel(host, &directory.0, name).unwrap();
         fs::write(
             directory.0.join(format!("{name}.s")),
             "invalid instruction\n",
         )
         .unwrap();
-        assert!(check_kernel(&directory.0, name).is_err());
+        let assembly = check_kernel(host, &directory.0, name)
+            .unwrap_err()
+            .to_string();
+        let assembler = format!("{:?}", assemble_command(host, &directory.0, name));
+        assert!(assembly.contains(&assembler), "{assembly}");
+        assert!(!assembly.contains("row 0: got"), "{assembly}");
     }
 }

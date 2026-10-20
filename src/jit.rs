@@ -1401,6 +1401,21 @@ mod tests {
     }
 
     #[test]
+    fn from_host_agrees_with_cpu_feature_detection() {
+        #[cfg(target_arch = "x86_64")]
+        let expected = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("bmi1")
+            && std::arch::is_x86_feature_detected!("bmi2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("lzcnt")
+            && std::arch::is_x86_feature_detected!("movbe")
+            && std::arch::is_x86_feature_detected!("f16c");
+        #[cfg(not(target_arch = "x86_64"))]
+        let expected = false;
+        assert_eq!(EmitOptions::from_host().avx2, expected);
+    }
+
+    #[test]
     fn avx2_emits_folded_compares() {
         let context = Context::create();
         LlvmTarget::initialize_all(&InitializationConfig::default());

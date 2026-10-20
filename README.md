@@ -105,32 +105,56 @@ skip `vzeroupper`; the final continuation clears the upper halves before returni
 
 ## Build and checks
 
-Requires LLVM 21 and Inkwell 0.9.0 (pinned in Cargo.toml). With the existing
-Homebrew LLVM installation used here on ARM64:
+Requires Rust, GNU make, LLVM 21 with `llvm-config`, Inkwell 0.9.0 (pinned in
+Cargo.toml), and a C compiler. The x86 check also needs an x86-64 runner:
+
+| Host | LLVM | x86 check |
+|---|---|---|
+| macOS | Homebrew `llvm@21` | Rosetta 2 (`arch -x86_64`), `clang` |
+| Linux x86-64 | `llvm-config-21` or `llvm-config` 21.x | `cc` only |
+| Linux aarch64 | `llvm-config-21` or `llvm-config` 21.x | `gcc-x86-64-linux-gnu`, `qemu-user` |
+
+```sh
+make                                # build, test, check-x86
+make test                           # cargo test (with doctests), --all-targets, release, clippy
+make check-x86                      # x86_check on six workloads; fails without a runner
+make bench                          # scalar_bench 100x100 and 300x100, cold_bench 100x100
+make inspect OUT=/tmp/tb-code       # inspect_code 100x100 into a fresh directory
+make CARGO_FLAGS=--offline test     # extra cargo flags
+```
+
+The Makefile keeps `LLVM_SYS_211_PREFIX` from the environment or the make command
+line; otherwise `tools/llvm-prefix.sh` finds it (`brew --prefix llvm@21` on macOS,
+using the Homebrew for this CPU first; the `llvm-config-21`/`llvm-config` (21.x)
+prefix on Linux), else it stays unset for llvm-sys to search `PATH`.
+
+Without make:
 
 ```sh
 export LLVM_SYS_211_PREFIX=/opt/homebrew/opt/llvm@21
 cargo build --offline --release --examples
+cargo test --offline
 cargo test --offline --all-targets
 cargo test --offline --release --all-targets
-RUSTDOCFLAGS="-C link-arg=/opt/homebrew/lib/libzstd.dylib" cargo test --offline --doc
 cargo clippy --offline --all-targets -- -D warnings
-cargo run --offline --release --example x86_check -- special /tmp/tb-x86-special
-cargo run --offline --release --example x86_check -- special /tmp/tb-x86-special-avx2 --avx2
-cargo run --offline --release --example x86_check -- 100x100 /tmp/tb-x86-100-avx2 --avx2
-cargo run --offline --release --example x86_check -- depths /tmp/tb-x86-depths --avx2
-cargo run --offline --release --example x86_check -- depths2 /tmp/tb-x86-depths2
+cargo run --offline --release --example x86_check -- special /tmp/tb-x86-special --avx2
 ```
 
-The macOS ARM64 Cargo configuration links `/opt/homebrew/lib` for zstd;
-rustdoc does not inherit that setting.
+Plain `cargo test` runs the doctests but not the examples' tests; `--all-targets`
+runs those but not the doctests. On macOS ARM64, `.cargo/config.toml` adds
+`/opt/homebrew/lib` to the link path for Homebrew LLVM's zstd. rustdoc does not
+take those rustflags, and llvm-sys's `/usr/local/lib` (an x86_64 zstd here) would
+win, so the same file passes rustdoc the arm64 `libzstd.dylib` by path.
 
-`x86_check <workload> <fresh-output-dir> [--avx2]` refuses an existing directory
-and emits the kernel (or its AVX2 twin) for
-`x86_64-apple-darwin`, links it with a C driver, runs it under Rosetta 2
-(`arch -x86_64`) and compares every prediction bit for bit with the reference.
-Rosetta executes the code but its timing says nothing about an x86 CPU; no x86
-performance has been measured.
+`x86_check <workload> <fresh-output-dir> [--avx2]` refuses an existing directory,
+emits the kernel (or its AVX2 twin) for `x86_64-apple-darwin` on macOS or
+`x86_64-unknown-linux-gnu` on Linux, links it with a C driver, runs it (Rosetta 2,
+natively, or under `qemu-x86_64`) and compares every prediction bit for bit with
+the reference. The x86_check tests in `cargo test --all-targets` execute
+`special`, `100x100`, `depths`, and `depths2` kernels this way; without an x86-64
+runner they print `skipped: <reason>` and pass, while `make check-x86` fails. On
+Linux x86-64 the AVX2 variants skip when the CPU lacks AVX2. Emulated timing says
+nothing about an x86 CPU; no x86 performance has been measured.
 
 ## Measurements
 
@@ -152,10 +176,11 @@ Static layout counts are in [the layout report](plans/perf-study-2026-09-28/VERD
 the timing comparison, earlier cold measurements, and rejected experiments are in
 [RESULTS.md](plans/perf-study-2026-09-28/RESULTS.md).
 
-Commands:
+Commands (`make bench`, `make inspect` run the same examples):
 
 ```sh
 cargo run --offline --release --example scalar_bench -- 100x100
+cargo run --offline --release --example scalar_bench -- 300x100
 cargo run --offline --release --example cold_bench -- 100x100 --samples 5000
 cargo run --offline --release --example inspect_code -- /tmp/tigerboost-code 100x100
 ```
