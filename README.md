@@ -86,22 +86,25 @@ feature goes to lane 1 on ARM64 and lane 0 on x86. Both-shared and neither-share
 pairs keep their order; padding is never swapped. Thresholds follow their features.
 
 Each chunk is a separate `noinline preserve_nonecc` function that transfers only
-the row pointer, the constants pointer (on ARM64 also a chunk base addressing both
-thresholds and leaves), and the running sums to the next chunk
+the row pointer, the chunk base (a pointer into the constant block that each hand-off
+advances to the next chunk's thresholds), and the running sums to the next chunk
 with a `musttail` call; a C `predict` wrapper calls the first one. The split
 exists to stop LLVM from hoisting loads across many trees and spilling; eight
 trees per chunk is the largest spill-free size measured on ARM64. For an empty
 forest, the C wrapper returns the bias directly without a continuation.
 
 `jit::compile_with(&model, EmitOptions { avx2: true })` selects an
-x86-64 emission that compares four lanes then two per tree with the threshold
-vector as a memory operand and reads the lane bits back with `vmovmskpd`. Its leaf
+x86-64 emission that compares a tree's predicates in groups of four lanes, with a
+final two-lane group when the padded depth is not a multiple of four, with the
+threshold vector as a memory operand and reads the lane bits back with `vmovmskpd`. Its leaf
 blocks are permuted when pairs are swapped; without swaps they retain original order. It
 sets `x86-64-v3` on the emitted functions. `compile_with` returns an error if
 AVX2 is requested and the host lacks any required x86-64-v3 feature. `EmitOptions::from_host()` enables
 it when LLVM reports all of `+avx2`, `+bmi1`, `+bmi2`, `+fma`, `+lzcnt`, `+movbe`,
 and `+f16c`; `compile` uses the default two-lane emission. Internal continuations
-skip `vzeroupper`; the final continuation clears the upper halves before returning.
+skip `vzeroupper`; the final continuation clears the upper halves before returning
+when any chunk used a four-lane compare, and a forest with no four-lane compare emits
+no clear.
 
 ## Build and checks
 
@@ -158,12 +161,14 @@ nothing about an x86 CPU; no x86 performance has been measured.
 
 ## Measurements
 
-Apple M4 Pro, LLVM 21.1.8, generic target, serial runs. Hot numbers are
-`examples/scalar_bench.rs` medians of five rounds of 50,000 dependent calls, ns
-per call including about 5 ns of driver. Cold numbers are
-`examples/cold_bench.rs` per-call p50 over shuffled rows after 64 MiB of unrelated
-read-modify-write traffic. Both workloads are synthetic depth-6 forests with
-random feature reuse and globally distinct thresholds.
+Apple M4 Pro, LLVM 21.1.8, generic target, serial runs. The table has hot numbers:
+`examples/scalar_bench.rs` medians of five rounds of 50,000 dependent calls, ns per call
+including about 5 ns of driver. Cold numbers, recorded in
+[RESULTS.md](plans/perf-study-2026-09-28/RESULTS.md), are `examples/cold_bench.rs` per-call
+p50 over shuffled rows after 64 MiB of unrelated read-modify-write traffic; the row is copied
+into a scratch buffer just before the timed call, so the traffic evicts code and constants,
+not the row. Both workloads are synthetic depth-6 forests with random feature reuse and
+globally distinct thresholds.
 
 | Shared-feature kernel revision / run | 100 trees, hot ns | 300 trees, hot ns |
 |---|---:|---:|

@@ -2,7 +2,7 @@
 
 Status: one kernel, shared-feature tree order, eight trees per chunk, two sums. No planning
 options remain. Chunks use `musttail` continuations carrying only pointers and sums. The default
-emission compares two lanes; the x86 AVX2 twin compares four then two lanes. Recorded ARM64 hot
+emission compares two lanes; the x86 AVX2 twin compares groups of four lanes with a final pair when needed. Recorded ARM64 hot
 medians at layout commit `91951d5` are 89.3 / 232.4 ns at 100 / 300 trees. x86-64 kernels match the reference under Rosetta 2;
 no native x86 timing is recorded. The [README](README.md) documents the API;
 [RESULTS.md](plans/perf-study-2026-09-28/RESULTS.md) records the measurements and experiments.
@@ -25,7 +25,7 @@ row per call.
 
 Validated model → shared-feature tree order → eight-tree LLVM continuations.
 
-`compile(&context, &trees)` plans internally; `plan` remains public for inspection.
+`compile(&trees)` plans internally; `plan` remains public for inspection.
 The plan has one `EvaluateTree` action per tree with splits and one `Constant` action per
 constant tree. Each chunk starts with the highest feature-frequency score, then takes trees
 sharing the most features with the chunk; ties use model order. Constant trees come last.
@@ -38,8 +38,9 @@ The emitter builds one private constant block per model. Each chunk has threshol
 lane order, zero padding to a multiple of eight threshold entries, then its leaf blocks in tree
 visit order. The chunk base addresses both thresholds and leaves; each transfer advances it
 to the next chunk. A tree's thresholds are consecutive, so each lane pair or
-lane quad is one vector load. Lane masks are packed with shift-left-insert on ARM64, shift/add on
-SSE2, and movemask on AVX2 into two signed lane values; the leaf block for that tree is permuted at
+lane quad is one vector load. Lane masks are packed into two signed lane values with
+shift-left-insert on ARM64 and shift/add on SSE2, and into one non-negative index with
+movemask on AVX2; the leaf block for that tree is permuted at
 compile time over reachable patterns with the padding bit false. Each block has the original
 leaf count, and the permutation is asserted to be a bijection.
 Exactly one shared feature in a complete pair goes to lane 1 on ARM64 and lane 0 on x86;
@@ -64,8 +65,9 @@ listed in the README. Empty forests return the exact bias from the C wrapper, wi
   unsafe with the default memory manager.
 - Emission-order changes inside a chunk (leaf loads issued after all compares; reuse of a feature
   already loaded in the chunk): the emitted assembly is identical or within four instructions,
-  because `early-cse` and the machine scheduler already do both. The remaining row loads are
-  distinct features.
+  because `early-cse` and the machine scheduler already do both. `early-cse` removes repeated
+  loads of a feature within a chunk at the IR level; the backend may still reload a feature from
+  L1 instead of shuffling a register.
 - Chunks of 16 trees: a few percent faster than 8 but the first stack spills appear; 32 and 64
   spill heavily and lose the gain. Eight is the largest spill-free size.
 - Cross-boundary feature reuse through fences, volatile residency, scheduler changes, carried
