@@ -8,7 +8,6 @@ features, and probability transforms are not implemented.
 ## Use
 
 ```rust
-use inkwell::context::Context;
 use tigerboost::jit::compile;
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
 
@@ -25,8 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         2.0,  // scale
         -1.0, // bias
     )?;
-    let context = Context::create();
-    let predictor = compile(&context, &model)?;
+    let predictor = compile(&model)?;
     drop(model);
     assert_eq!(predictor.predict(&[1.0])?, 3.0);
     assert_eq!(predictor.predict(&[2.0])?, 9.0);
@@ -35,9 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `Trees::new` validates leaf counts and feature indices. `Trees::predict` is the
-independent tree-order reference. Compiled models own their code and copied
-constants, so the source `Trees` may be dropped; the LLVM `Context` must outlive
-the compiled model. `predict` checks that the row covers every declared feature.
+independent tree-order reference. Compiled models own their LLVM context, code
+and copied constants, so the source `Trees` and `Plan` may be dropped.
+`CompiledModel` is `Send` and `Sync`: one model may be shared across threads
+calling `predict` at the same time, or moved to another thread.
+`predict` checks that the row covers every declared feature.
 Rows stay read-only during each call and may change between calls. Prediction
 writes neither caller memory nor model data.
 
@@ -67,8 +67,8 @@ trees, with selected leaves accumulated round-robin into two sums (clamped to
 the tree count, with one sum for an empty forest). The sums are added at the end.
 There are no planning options.
 
-`jit::compile(&context, &model)` plans internally and emits the kernel.
-`jit::compile_plan(&context, &plan)` compiles an inspected plan. One private constant
+`jit::compile(&model)` plans internally and emits the kernel.
+`jit::compile_plan(&plan)` compiles an inspected plan. One private constant
 block holds each chunk's thresholds in target lane order, zero padding to a multiple
 of eight threshold entries, then that chunk's leaf blocks in tree visit order.
 Functions reach this block through a pointer argument, so each threshold is one load and each leaf
@@ -93,7 +93,7 @@ exists to stop LLVM from hoisting loads across many trees and spilling; eight
 trees per chunk is the largest spill-free size measured on ARM64. For an empty
 forest, the C wrapper returns the bias directly without a continuation.
 
-`jit::compile_with(&context, &model, EmitOptions { avx2: true })` selects an
+`jit::compile_with(&model, EmitOptions { avx2: true })` selects an
 x86-64 emission that compares four lanes then two per tree with the threshold
 vector as a memory operand and reads the lane bits back with `vmovmskpd`. Its leaf
 blocks are permuted when pairs are swapped; without swaps they retain original order. It

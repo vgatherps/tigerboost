@@ -1,4 +1,3 @@
-use inkwell::context::Context;
 use tigerboost::jit::{compile, compile_plan};
 use tigerboost::parsed_tree::{Discriminator, FeatureIndex, NanMode, SingleTree, Trees};
 use tigerboost::sort_policy::plan;
@@ -86,7 +85,6 @@ fn seeded_forests_preserve_every_trees_leaf_index() {
                     .collect()
             })
             .collect();
-        let context = Context::create();
         let expected: Vec<_> = rows.iter().map(|row| model.predict(row).unwrap()).collect();
         let indices: Vec<_> = rows
             .iter()
@@ -96,8 +94,8 @@ fn seeded_forests_preserve_every_trees_leaf_index() {
         assert_eq!(inspected.actions().len(), tree_count);
         assert_eq!(inspected.chunks().len(), tree_count.div_ceil(8));
         let kernels = [
-            compile_plan(&context, &inspected).unwrap(),
-            compile(&context, &model).unwrap(),
+            compile_plan(&inspected).unwrap(),
+            compile(&model).unwrap(),
         ];
         drop(inspected);
         drop(model);

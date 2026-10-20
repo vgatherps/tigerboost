@@ -80,13 +80,22 @@ impl Target {
     }
 }
 
-pub struct CompiledModel<'ctx> {
-    // Retains the engine, including executable code and private constant globals.
-    function: JitFunction<'ctx, PredictFn>,
+// Fields drop in declaration order: the function (engine, code, constants) goes before
+// the context it was built in.
+pub struct CompiledModel {
+    function: JitFunction<'static, PredictFn>,
+    _context: Context,
     feature_count: usize,
 }
 
-impl CompiledModel<'_> {
+// SAFETY: predict is the only method and only calls an immutable function pointer that
+// reads the row and the engine's private constants. The struct owns the sole Rc to its
+// engine and the only handle to its context, and Context is already Send. Nothing reads
+// or writes LLVM state through &self.
+unsafe impl Send for CompiledModel {}
+unsafe impl Sync for CompiledModel {}
+
+impl CompiledModel {
     pub fn predict(&self, row: &[f64]) -> Result<f64, RowLengthError> {
         if row.len() < self.feature_count {
             return Err(RowLengthError {
@@ -100,64 +109,61 @@ impl CompiledModel<'_> {
     }
 }
 
-pub fn compile<'ctx>(context: &'ctx Context, model: &Trees) -> CompileResult<CompiledModel<'ctx>> {
-    compile_with(context, model, EmitOptions::default())
+pub fn compile(model: &Trees) -> CompileResult<CompiledModel> {
+    compile_with(model, EmitOptions::default())
 }
 
-pub fn compile_with<'ctx>(
-    context: &'ctx Context,
-    model: &Trees,
-    options: EmitOptions,
-) -> CompileResult<CompiledModel<'ctx>> {
-    compile_plan_with(context, &plan(model), options)
+pub fn compile_with(model: &Trees, options: EmitOptions) -> CompileResult<CompiledModel> {
+    compile_plan_with(&plan(model), options)
 }
 
-pub fn compile_plan<'ctx>(
-    context: &'ctx Context,
-    plan: &Plan<'_>,
-) -> CompileResult<CompiledModel<'ctx>> {
-    compile_plan_with(context, plan, EmitOptions::default())
+pub fn compile_plan(plan: &Plan<'_>) -> CompileResult<CompiledModel> {
+    compile_plan_with(plan, EmitOptions::default())
 }
 
-fn compile_plan_with<'ctx>(
-    context: &'ctx Context,
-    plan: &Plan<'_>,
-    options: EmitOptions,
-) -> CompileResult<CompiledModel<'ctx>> {
+fn compile_plan_with(plan: &Plan<'_>, options: EmitOptions) -> CompileResult<CompiledModel> {
     if options.avx2 && !EmitOptions::from_host().avx2 {
         return Err("AVX2 emission requires x86-64-v3 host features".into());
     }
     LlvmTarget::initialize_native(&InitializationConfig::default())?;
     let triple = TargetMachine::get_default_triple();
-    let (module, _) = prepare_module(context, plan, &triple, options)?;
-    let engine = module.create_jit_execution_engine(BACKEND_OPTIMIZATION)?;
-    // SAFETY: emit_plan builds exactly C ABI double(const double*).
-    let function = unsafe { engine.get_function::<PredictFn>("predict")? };
+    let context = Context::create();
+    let function = {
+        let (module, _) = prepare_module(&context, plan, &triple, options)?;
+        let engine = module.create_jit_execution_engine(BACKEND_OPTIMIZATION)?;
+        // SAFETY: emit_plan builds exactly C ABI double(const double*).
+        let function = unsafe { engine.get_function::<PredictFn>("predict")? };
+        // SAFETY: function borrows context, which is moved into the same struct and
+        // outlives it by field order. The Rc inside is the only clone left once the
+        // module and engine locals drop at the end of this block.
+        unsafe {
+            std::mem::transmute::<JitFunction<'_, PredictFn>, JitFunction<'static, PredictFn>>(
+                function,
+            )
+        }
+    };
     Ok(CompiledModel {
         function,
+        _context: context,
         feature_count: plan.model().feature_modes().len(),
     })
 }
 
 /// Separate target emission for inspection, not disassembly of MCJIT's executable bytes.
-pub fn emit_assembly(
-    context: &Context,
-    plan: &Plan<'_>,
-    target_triple: &str,
-) -> CompileResult<String> {
-    emit_assembly_with(context, plan, target_triple, EmitOptions::default())
+pub fn emit_assembly(plan: &Plan<'_>, target_triple: &str) -> CompileResult<String> {
+    emit_assembly_with(plan, target_triple, EmitOptions::default())
 }
 
 /// Separate target emission with explicit target options.
 pub fn emit_assembly_with(
-    context: &Context,
     plan: &Plan<'_>,
     target_triple: &str,
     options: EmitOptions,
 ) -> CompileResult<String> {
     LlvmTarget::initialize_all(&InitializationConfig::default());
     let triple = TargetTriple::create(target_triple);
-    let (module, machine) = prepare_module(context, plan, &triple, options)?;
+    let context = Context::create();
+    let (module, machine) = prepare_module(&context, plan, &triple, options)?;
     let buffer = machine.write_to_memory_buffer(&module, FileType::Assembly)?;
     let bytes = buffer.as_slice();
     Ok(String::from_utf8(
@@ -951,7 +957,6 @@ mod tests {
 
     #[test]
     fn reachable_leaf_patterns_compile_for_depths_1_to_12() {
-        let context = Context::create();
         for depth in 1..=12 {
             let model = indexed_model(&[depth]);
             let tree = &model.trees()[0];
@@ -964,7 +969,7 @@ mod tests {
             slots.sort_unstable();
             assert_eq!(slots, (0..leaves.len() as i64).collect::<Vec<_>>());
             assert_eq!(leaves.len(), tree.leafs.len());
-            let compiled = compile(&context, &model).unwrap();
+            let compiled = compile(&model).unwrap();
             for pattern in 0..tree.leafs.len() as u32 {
                 let slot = (bias + raw_of(pattern, pairs, 0, target)) as usize;
                 let row: Vec<_> = (0..model.feature_modes().len())
@@ -1051,7 +1056,7 @@ mod tests {
                     bits
                 );
             }
-            let compiled = compile(&context, &model).unwrap();
+            let compiled = compile(&model).unwrap();
             assert_eq!(compiled.predict(&[1.0, 2.0]).unwrap().to_bits(), bits);
             assert_eq!(
                 compiled.predict(&[1.0]),
@@ -1248,7 +1253,7 @@ mod tests {
                     }
                 }
             }
-            let assembly = emit_assembly(&context, &plan, triple).unwrap();
+            let assembly = emit_assembly(&plan, triple).unwrap();
             if insert_masks {
                 assert!(assembly.contains("fcmgt.2d"));
                 assert!(assembly.contains("sli"));
@@ -1262,13 +1267,12 @@ mod tests {
 
     #[test]
     fn arm64_ignores_avx2_option() {
-        let context = Context::create();
         for model in [mixed_depth_model(), indexed_model(&[0, 1, 3, 5, 6, 8])] {
             for plan in [plan(&model), plan_with(&model, 1, 2)] {
                 let triple = "aarch64-apple-darwin";
                 assert_eq!(
-                    emit_assembly(&context, &plan, triple).unwrap(),
-                    emit_assembly_with(&context, &plan, triple, EmitOptions { avx2: true })
+                    emit_assembly(&plan, triple).unwrap(),
+                    emit_assembly_with(&plan, triple, EmitOptions { avx2: true })
                         .unwrap(),
                 );
             }
@@ -1304,8 +1308,8 @@ mod tests {
                     if avx2 && x86 { "x86-64-v3" } else { "generic" },
                 );
                 assert_eq!(
-                    emit_assembly_with(&context, &plan, alias, options).unwrap(),
-                    emit_assembly_with(&context, &plan, canonical, options).unwrap(),
+                    emit_assembly_with(&plan, alias, options).unwrap(),
+                    emit_assembly_with(&plan, canonical, options).unwrap(),
                 );
                 for (actual, expected) in ordered_predicates(&plan, alias)
                     .iter()
@@ -1449,7 +1453,7 @@ mod tests {
                 }
             }
             let assembly =
-                emit_assembly_with(&context, &plan, triple, EmitOptions { avx2: true }).unwrap();
+                emit_assembly_with(&plan, triple, EmitOptions { avx2: true }).unwrap();
             let instructions: Vec<_> = assembly
                 .lines()
                 .filter_map(|line| {
@@ -1558,9 +1562,8 @@ mod tests {
 
     #[test]
     fn compile_checks_host_avx2_support() {
-        let context = Context::create();
         let model = indexed_model(&[3]);
-        let result = compile_with(&context, &model, EmitOptions { avx2: true });
+        let result = compile_with(&model, EmitOptions { avx2: true });
         if EmitOptions::from_host().avx2 {
             assert_eq!(result.unwrap().predict(&[1.0; 8]), model.predict(&[1.0; 8]));
         } else {
@@ -1682,7 +1685,7 @@ mod tests {
                 context.f64_type().const_array(&expected),
             );
         }
-        let compiled = compile_plan(&context, &plan).unwrap();
+        let compiled = compile_plan(&plan).unwrap();
         for row in [[0.0, -1.0, 0.0], [2.0, 0.0, 2.0], [3.0, 0.0, 3.0]] {
             assert_eq!(compiled.predict(&row), model.predict(&row));
         }
@@ -1880,7 +1883,7 @@ mod tests {
                     );
                 }
             }
-            let assembly = emit_assembly(&context, &plan, triple).unwrap();
+            let assembly = emit_assembly(&plan, triple).unwrap();
             if triple.starts_with("x86_64") {
                 assert!(
                     assembly.lines().any(|line| { line.contains("cmpltpd") }),
@@ -1910,7 +1913,6 @@ mod tests {
 
     #[test]
     fn dropped_model_and_last_tree_leaf() {
-        let context = Context::create();
         let model = Trees::new(
             (0..70)
                 .map(|tree| SingleTree {
@@ -1935,7 +1937,7 @@ mod tests {
         let mut kernels = Vec::new();
         for chunk_trees in [4, 8] {
             let plan = plan_with(&model, chunk_trees, 2);
-            kernels.push(compile_plan(&context, &plan).unwrap());
+            kernels.push(compile_plan(&plan).unwrap());
             drop(plan);
         }
         drop(model);
@@ -1987,7 +1989,7 @@ mod tests {
                     context.f64_type().const_array(&values),
                 );
             }
-            let compiled = compile_plan(&context, &plan).unwrap();
+            let compiled = compile_plan(&plan).unwrap();
             assert_eq!(compiled.predict(&[]), Ok(if empty { 3.0 } else { 10.0 }));
             assert_eq!(compiled.predict(&[]), model.predict(&[]));
         }
@@ -1995,7 +1997,6 @@ mod tests {
 
     #[test]
     fn emits_predict_for_aarch64_and_x86_64() {
-        let context = Context::create();
         let model = Trees::new(
             vec![SingleTree {
                 leafs: vec![1.0, 2.0],
@@ -2010,7 +2011,7 @@ mod tests {
         )
         .unwrap();
         for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
-            let assembly = emit_assembly(&context, &plan(&model), triple).unwrap();
+            let assembly = emit_assembly(&plan(&model), triple).unwrap();
             assert!(assembly.contains("predict"), "{triple}: {assembly}");
             assert!(!assembly.contains('\0'));
             assert!(assembly.ends_with('\n'));
@@ -2059,7 +2060,6 @@ mod tests {
 
     #[test]
     fn special_values_match_the_reference_for_every_nan_mode() {
-        let context = Context::create();
         for mode in [NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue] {
             for threshold in [
                 f64::NEG_INFINITY,
@@ -2082,7 +2082,7 @@ mod tests {
                     0.0,
                 )
                 .unwrap();
-                let compiled = compile(&context, &model).unwrap();
+                let compiled = compile(&model).unwrap();
                 for value in [
                     f64::NAN,
                     f64::NEG_INFINITY,
@@ -2274,10 +2274,10 @@ mod tests {
                     .count(),
                 1
             );
-            let assembly = emit_assembly_with(&context, &plan, triple, options).unwrap();
+            let assembly = emit_assembly_with(&plan, triple, options).unwrap();
             assert!(assembly.contains("continuation"));
         }
-        let compiled = compile_plan(&context, &plan).unwrap();
+        let compiled = compile_plan(&plan).unwrap();
         for row in [[-1.0; 8], [0.0; 8], [1.0; 8], [f64::NAN; 8]] {
             assert_eq!(compiled.predict(&row), model.predict(&row));
         }

@@ -4,7 +4,6 @@ mod bench;
 mod support;
 
 use bench::{next_row, verify};
-use inkwell::context::Context;
 use std::{
     error::Error,
     fs::File,
@@ -255,7 +254,7 @@ fn timer_resolution() -> Result<f64, &'static str> {
         .ok_or("Instant produced no nonzero delta in 100000 reads")
 }
 
-fn timed_prediction(compiled: &CompiledModel<'_>, row: &[f64]) -> (u64, f64) {
+fn timed_prediction(compiled: &CompiledModel, row: &[f64]) -> (u64, f64) {
     let start = Instant::now();
     let prediction = compiled.predict(row).unwrap();
     let elapsed = start.elapsed().as_nanos() as u64;
@@ -271,14 +270,14 @@ fn timed_empty() -> u64 {
 
 #[allow(clippy::too_many_arguments)]
 fn measure_condition(
-    compiled: &CompiledModel<'_>,
+    compiled: &CompiledModel,
     rows: &[Vec<f64>],
     scores: &[f64],
     row_order: &[usize; ROWS],
     sequence: RowSequence,
     condition: Condition,
     pollution: &mut [PollutionBuffer; 4],
-    other: &CompiledModel<'_>,
+    other: &CompiledModel,
     other_rows: &[Vec<f64>],
     sample_count: usize,
 ) -> Vec<u64> {
@@ -317,13 +316,13 @@ fn measure_condition(
 
 #[allow(clippy::too_many_arguments)]
 fn measure_sequence(
-    compiled: &CompiledModel<'_>,
+    compiled: &CompiledModel,
     rows: &[Vec<f64>],
     scores: &[f64],
     row_order: &[usize; ROWS],
     sequence: RowSequence,
     pollution: &mut [PollutionBuffer; 4],
-    other: &CompiledModel<'_>,
+    other: &CompiledModel,
     other_rows: &[Vec<f64>],
     sample_count: usize,
 ) -> Vec<Measurement> {
@@ -364,10 +363,9 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
     let (model, rows) = workload(arguments.workload);
     let tree_count = model.trees().len();
     let feature_count = model.feature_modes().len();
-    let context = Context::create();
     let plan = plan(&model);
     let sum_count = plan.sum_count();
-    let compiled = compile_plan(&context, &plan)?;
+    let compiled = compile_plan(&plan)?;
     drop(plan);
     let (scores, distinct_rows) = verify(&model, &compiled, &rows, VERIFY_CALLS);
     let timer_resolution_ns = timer_resolution()?;
@@ -383,7 +381,7 @@ fn benchmark(arguments: &Arguments, config: BenchmarkConfig) -> Result<Report, B
         config.other_trees,
         config.other_features,
     ));
-    let other = compile(&context, &other_model)?;
+    let other = compile(&other_model)?;
     let mut pollution = std::array::from_fn(|index| {
         PollutionBuffer::new(config.data_bytes[index], 0x504f4c4c5554494f ^ index as u64)
     });
@@ -584,8 +582,7 @@ mod tests {
     #[test]
     fn verified_kernel_matches_reference_before_timing() {
         let (model, rows) = workload(Workload::Distinct(20, 30));
-        let context = Context::create();
-        let compiled = compile(&context, &model).unwrap();
+        let compiled = compile(&model).unwrap();
         let (scores, _) = verify(&model, &compiled, &rows, VERIFY_CALLS);
         assert_eq!(scores.len(), ROWS);
         for (row, score) in rows.iter().zip(scores) {

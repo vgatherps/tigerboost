@@ -1,7 +1,6 @@
 //! Writes separately emitted target assembly, not MCJIT byte disassembly.
 mod support;
 
-use inkwell::context::Context;
 use std::{
     error::Error,
     fs::{self, File},
@@ -28,7 +27,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     fs::create_dir(&output)?;
     let (model, _) = support::workload(choice);
-    let context = Context::create();
     let plan = plan(&model);
     for (triple, name, avx2) in [
         ("aarch64-apple-darwin", "kernel", false),
@@ -36,9 +34,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("x86_64-unknown-linux-gnu", "kernel-avx2", true),
     ] {
         let assembly = if avx2 {
-            emit_assembly_with(&context, &plan, triple, EmitOptions { avx2: true })?
+            emit_assembly_with(&plan, triple, EmitOptions { avx2: true })?
         } else {
-            emit_assembly(&context, &plan, triple)?
+            emit_assembly(&plan, triple)?
         };
         let path = output.join(format!("{triple}-{name}.s"));
         File::create_new(&path)?.write_all(assembly.as_bytes())?;

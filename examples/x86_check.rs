@@ -1,6 +1,5 @@
 mod support;
 
-use inkwell::context::Context;
 #[cfg(test)]
 use std::collections::HashSet;
 use std::{
@@ -33,8 +32,7 @@ fn check_natively(
     rows: &[Vec<f64>],
     expected: &[f64],
 ) -> Result<(), Box<dyn Error>> {
-    let context = Context::create();
-    let compiled = compile(&context, model)?;
+    let compiled = compile(model)?;
     for (row, (&expected, features)) in expected.iter().zip(rows).enumerate() {
         assert_eq!(
             compiled.predict(features)?.to_bits(),
@@ -63,7 +61,6 @@ fn write_outputs(
     assert_eq!(rows.len(), ROWS);
     let expected = reference_scores(model, rows)?;
     let feature_count = model.feature_modes().len();
-    let context = Context::create();
 
     fs::create_dir(output)?;
     check_natively(model, rows, &expected)?;
@@ -73,7 +70,7 @@ fn write_outputs(
     } else {
         "kernel"
     };
-    let assembly = emit_assembly_with(&context, &plan, "x86_64-apple-darwin", emit_options)?;
+    let assembly = emit_assembly_with(&plan, "x86_64-apple-darwin", emit_options)?;
     let path = output.join(format!("{name}.s"));
     File::create_new(&path)?.write_all(assembly.as_bytes())?;
     println!("{}", path.display());
@@ -395,11 +392,9 @@ mod tests {
         write_outputs(&directory.0, &model, &rows, EmitOptions { avx2: true }).unwrap();
         let manifest = fs::read_to_string(directory.0.join("manifest.txt")).unwrap();
         assert_eq!(manifest.lines().filter(|line| *line == "avx2 1").count(), 1);
-        let context = Context::create();
         let assembly = fs::read_to_string(directory.0.join("kernel-avx2.s")).unwrap();
         let plan = plan(&model);
         let expected = emit_assembly_with(
-            &context,
             &plan,
             "x86_64-apple-darwin",
             EmitOptions { avx2: true },

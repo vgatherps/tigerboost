@@ -12,7 +12,7 @@ pub fn next_row(index: usize, prediction: f64) -> usize {
 /// Returns the reference scores and the number of distinct rows the trace visits.
 pub fn verify(
     model: &Trees,
-    compiled: &CompiledModel<'_>,
+    compiled: &CompiledModel,
     rows: &[Vec<f64>],
     calls: usize,
 ) -> (Vec<f64>, usize) {

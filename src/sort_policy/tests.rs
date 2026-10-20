@@ -1,7 +1,6 @@
 use super::*;
 use crate::jit::compile_plan;
 use crate::parsed_tree::{FeatureIndex, NanMode, SingleTree};
-use inkwell::context::Context;
 
 #[test]
 fn default_uses_eight_trees_per_chunk_and_two_sums() {
@@ -394,12 +393,11 @@ fn partition_limits_and_sum_clamping_compile() {
         tree(&[(0, 0.0)]),
         tree(&[(1, 0.0), (2, 0.0)]),
     ]);
-    let context = Context::create();
     for chunk_trees in [1, 8] {
         let plan = plan_with(&trees, chunk_trees, 8);
         assert_eq!(plan.sum_count(), 3);
         assert_eq!(plan.chunks().len(), if chunk_trees == 1 { 3 } else { 1 });
-        let compiled = compile_plan(&context, &plan).unwrap();
+        let compiled = compile_plan(&plan).unwrap();
         for row in [[0.0; 4], [1.0; 4], [f64::NAN; 4]] {
             assert_eq!(compiled.predict(&row), trees.predict(&row));
         }
