@@ -709,17 +709,12 @@ fn load_feature<'ctx>(
     let loaded = builder.build_load(f64_type, address, "feature")?;
     loaded.as_instruction_value().unwrap().set_alignment(8)?;
     let mut value = loaded.into_float_value();
-    if mode != NanMode::AsIs {
+    if mode == NanMode::AsTrue {
         let is_nan = builder.build_float_compare(FloatPredicate::UNO, value, value, "is_nan")?;
-        let replacement = if mode == NanMode::AsFalse {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        };
         value = builder
             .build_select(
                 is_nan,
-                f64_type.const_float(replacement),
+                f64_type.const_float(f64::INFINITY),
                 value,
                 "nan_value",
             )?
@@ -2019,6 +2014,97 @@ mod tests {
             assert!(assembly.contains("predict"), "{triple}: {assembly}");
             assert!(!assembly.contains('\0'));
             assert!(assembly.ends_with('\n'));
+        }
+    }
+
+    #[test]
+    fn only_as_true_emits_a_nan_check_and_positive_infinity_select() {
+        let context = Context::create();
+        let model = Trees::new(
+            vec![SingleTree {
+                leafs: (0..8).map(|leaf| leaf as f64).collect(),
+                selections: (0..3)
+                    .map(|feature| Discriminator {
+                        feature_idx: FeatureIndex(feature),
+                        threshold: feature as f64,
+                    })
+                    .collect(),
+            }],
+            vec![NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let module = emit_test_plan(
+            &context,
+            &plan(&model),
+            &TargetMachine::get_default_triple(),
+            EmitOptions::default(),
+        )
+        .unwrap();
+        module.verify().unwrap();
+        let continuation = module.get_function("continuation0").unwrap();
+        let ir = continuation.print_to_string().to_string();
+        assert_eq!(ir.matches("fcmp uno double").count(), 1, "{ir}");
+        assert_eq!(ir.matches("select i1").count(), 1, "{ir}");
+        let select = ir.lines().find(|line| line.contains("select i1")).unwrap();
+        assert!(select.contains("double 0x7FF0000000000000"), "{select}");
+        assert!(
+            !module
+                .print_to_string()
+                .to_string()
+                .contains("0xFFF0000000000000")
+        );
+    }
+
+    #[test]
+    fn special_values_match_the_reference_for_every_nan_mode() {
+        let context = Context::create();
+        for mode in [NanMode::AsIs, NanMode::AsFalse, NanMode::AsTrue] {
+            for threshold in [
+                f64::NEG_INFINITY,
+                -1.0,
+                0.0,
+                1.0,
+                f64::INFINITY,
+                f64::NAN,
+            ] {
+                let model = Trees::new(
+                    vec![SingleTree {
+                        leafs: vec![3.0, 7.0],
+                        selections: vec![Discriminator {
+                            feature_idx: FeatureIndex(0),
+                            threshold,
+                        }],
+                    }],
+                    vec![mode],
+                    1.0,
+                    0.0,
+                )
+                .unwrap();
+                let compiled = compile(&context, &model).unwrap();
+                for value in [
+                    f64::NAN,
+                    f64::NEG_INFINITY,
+                    -1.0,
+                    0.0,
+                    1.0,
+                    f64::INFINITY,
+                ] {
+                    assert_eq!(
+                        compiled.predict(&[value]).unwrap().to_bits(),
+                        model.predict(&[value]).unwrap().to_bits(),
+                        "mode={mode:?} threshold={threshold:?} value={value:?}",
+                    );
+                }
+                if mode != NanMode::AsTrue {
+                    assert_eq!(
+                        compiled.predict(&[f64::NAN]).unwrap().to_bits(),
+                        compiled.predict(&[f64::NEG_INFINITY]).unwrap().to_bits(),
+                        "mode={mode:?} threshold={threshold:?}",
+                    );
+                }
+            }
         }
     }
 

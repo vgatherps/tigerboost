@@ -47,6 +47,9 @@ leaves NaN unchanged (ordered comparisons are false), `AsFalse` replaces it with
 negative infinity, and `AsTrue` replaces it with positive infinity. `AsTrue` is
 not an unconditional true bit: positive infinity is not greater than itself.
 A NaN threshold also compares false.
+`AsIs` and `AsFalse` compile to the same code because an ordered `>` is false
+for NaN and negative infinity alike; only `AsTrue` adds a NaN check per feature
+load.
 
 The score is the sum of selected leaves, scaled and then biased. Depth-zero
 trees are constants; an empty forest returns bias without applying scale.
