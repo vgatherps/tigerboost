@@ -33,15 +33,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `Trees::new` validates leaf counts and feature indices. `Trees::predict` is the
-independent tree-order reference. Compiled models own their LLVM context, code
-and copied constants, so the source `Trees` and `Plan` may be dropped.
-`CompiledModel` is `Send` and `Sync`: one model may be shared across threads
-calling `predict` at the same time, or moved to another thread. Compilation and
-assembly emission take turns behind one process-wide lock, because LLVM's target
-registry is not safe to use from two threads at once; `predict` never waits on it.
-`predict` checks that the row covers every declared feature.
-Rows stay read-only during each call and may change between calls. Prediction
-writes neither caller memory nor model data.
+independent tree-order reference. `predict` checks that the row covers every
+declared feature. Rows stay read-only during each call and may change between
+calls; prediction writes neither caller memory nor model data.
+
+A compiled model owns its LLVM context, code and copied constants, so the source
+`Trees` and `Plan` may be dropped. `CompiledModel` is `Send` and `Sync`: one model
+can serve several threads calling `predict` at once, or move to another thread.
+Compiling and emitting assembly take turns behind one process-wide lock, because
+LLVM's target registry is not safe to use from two threads at once; `predict`
+never waits on it.
 
 At original tree level `k`, a strict `feature > threshold` decision sets bit `k`
 of the leaf index. Each feature's `NanMode` applies before comparison: `AsIs`
@@ -71,8 +72,8 @@ There are no planning options.
 
 `jit::compile(&model)` plans internally and emits the kernel.
 `jit::compile_plan(&plan)` compiles an inspected plan. One private constant
-block holds each chunk's thresholds in target lane order, zero padding to a multiple
-of eight threshold entries, then that chunk's leaf blocks in tree visit order.
+block holds, per chunk, the thresholds in target lane order, zero-padded to a
+multiple of eight entries, then that chunk's leaf blocks in tree visit order.
 Functions reach this block through a pointer argument, so each threshold is one load and each leaf
 lookup is one indexed load (on x86-64 the leaf load folds into the add). A tree of
 depth `d` is evaluated as `ceil(d/2)` two-lane vector comparisons: its feature
@@ -95,10 +96,10 @@ exists to stop LLVM from hoisting loads across many trees and spilling; eight
 trees per chunk is the largest spill-free size measured on ARM64. For an empty
 forest, the C wrapper returns the bias directly without a continuation.
 
-`jit::compile_with(&model, EmitOptions { avx2: true })` selects an
-x86-64 emission that compares a tree's predicates in groups of four lanes, with a
-final two-lane group when the padded depth is not a multiple of four, with the
-threshold vector as a memory operand and reads the lane bits back with `vmovmskpd`. Its leaf
+`jit::compile_with(&model, EmitOptions { avx2: true })` selects an x86-64
+emission that compares a tree's predicates four lanes at a time (a final
+two-lane group covers a padded depth that is not a multiple of four), takes the
+threshold vector as a memory operand, and reads the lane bits back with `vmovmskpd`. Its leaf
 blocks are permuted when pairs are swapped; without swaps they retain original order. It
 sets `x86-64-v3` on the emitted functions. `compile_with` returns an error if
 AVX2 is requested and the host lacks any required x86-64-v3 feature. `EmitOptions::from_host()` enables
@@ -110,14 +111,15 @@ no clear.
 
 ## Build and checks
 
-Requires Rust, GNU make, LLVM 21 with `llvm-config`, Inkwell 0.9.0 (pinned in
-Cargo.toml), and a C compiler. The x86 check also needs an x86-64 runner:
+Requires Rust, GNU make, LLVM 21 (found through `llvm-config` or
+`LLVM_SYS_211_PREFIX`), and a C compiler. The x86 check also needs a way to run
+x86-64 code:
 
 | Host | LLVM | x86 check |
 |---|---|---|
 | macOS | Homebrew `llvm@21` | Rosetta 2 (`arch -x86_64`), `clang` |
 | Linux x86-64 | `llvm-config-21` or `llvm-config` 21.x | `cc` only |
-| Linux aarch64 | `llvm-config-21` or `llvm-config` 21.x | `gcc-x86-64-linux-gnu` (with its static cross libc), `qemu-user`; the check binary is linked `-static` so qemu needs no sysroot |
+| Linux aarch64 | `llvm-config-21` or `llvm-config` 21.x | `gcc-x86-64-linux-gnu` and `qemu-user`; the check binary is linked `-static`, so qemu needs no sysroot |
 
 ```sh
 make                                # build, test, check-x86
@@ -128,12 +130,13 @@ make inspect OUT=/tmp/tb-code       # inspect_code 100x100 into a fresh director
 make CARGO_FLAGS=--offline test     # extra cargo flags
 ```
 
-The Makefile keeps `LLVM_SYS_211_PREFIX` from the environment or the make command
-line; otherwise `tools/llvm-prefix.sh` finds it (`brew --prefix llvm@21` on macOS,
-using the Homebrew for this CPU first; the `llvm-config-21`/`llvm-config` (21.x)
-prefix on Linux), else it stays unset for llvm-sys to search `PATH`.
+`LLVM_SYS_211_PREFIX` from the environment or the make command line wins.
+Otherwise `tools/llvm-prefix.sh` asks `brew --prefix llvm@21` on macOS (the
+Homebrew for this CPU first) or `llvm-config-21`/`llvm-config` on Linux, and
+leaves the variable unset when neither answers, so llvm-sys searches `PATH`
+itself.
 
-Without make:
+Without make (one of the six x86 workloads shown):
 
 ```sh
 export LLVM_SYS_211_PREFIX=/opt/homebrew/opt/llvm@21
@@ -146,21 +149,22 @@ cargo run --offline --release --example x86_check -- special /tmp/tb-x86-special
 ```
 
 Plain `cargo test` runs the doctests but not the examples' tests; `--all-targets`
-runs those but not the doctests. On macOS ARM64, `.cargo/config.toml` adds
-`/opt/homebrew/lib` to the link path for Homebrew LLVM's zstd. rustdoc does not
-take those rustflags, and llvm-sys's `/usr/local/lib` (an x86_64 zstd here) would
-win, so the same file passes rustdoc the arm64 `libzstd.dylib` by path.
+runs those but not the doctests, so `make test` runs both. On macOS ARM64,
+`.cargo/config.toml` adds `/opt/homebrew/lib` to the link path for Homebrew
+LLVM's zstd. rustdoc does not take rustflags, and an Intel Homebrew zstd in
+`/usr/local/lib` would come first on llvm-sys's search path, so the same file
+passes rustdoc the arm64 `libzstd.dylib` by path.
 
 `x86_check <workload> <fresh-output-dir> [--avx2]` refuses an existing directory,
 emits the kernel (or its AVX2 twin) for `x86_64-apple-darwin` on macOS or
 `x86_64-unknown-linux-gnu` on Linux, links it with a C driver, runs it (Rosetta 2,
 natively, or under `qemu-x86_64`) and compares every prediction bit for bit with
 the reference. The x86_check tests in `cargo test --all-targets` execute
-`special`, `100x100`, `depths`, and `depths2` kernels this way; without an x86-64
-runner they pass and write `skipped: <reason>` straight to stderr, past the test
-harness's capture, while `make check-x86` fails. On
-Linux x86-64 the AVX2 variants skip when the CPU lacks AVX2. Emulated timing says
-nothing about an x86 CPU; no x86 performance has been measured.
+`special`, `100x100`, `depths`, and `depths2` kernels this way. Without an
+x86-64 runner they pass and write `skipped: <reason>` straight to stderr, past
+the test harness's capture, while `make check-x86` fails. On Linux x86-64 the
+AVX2 variants skip when the CPU lacks AVX2. Emulated timing says nothing about
+an x86 CPU; no x86 performance has been measured.
 
 ## Measurements
 
@@ -170,8 +174,8 @@ including about 5 ns of driver. Cold numbers, recorded in
 [RESULTS.md](plans/perf-study-2026-09-28/RESULTS.md), are `examples/cold_bench.rs` per-call
 p50 over shuffled rows after 64 MiB of unrelated read-modify-write traffic; the row is copied
 into a scratch buffer just before the timed call, so the traffic evicts code and constants,
-not the row. Both workloads are synthetic depth-6 forests with random feature reuse and
-globally distinct thresholds.
+not the row. Both workloads are synthetic depth-6 forests with random feature reuse,
+globally distinct thresholds, and every feature `AsIs`.
 
 | Shared-feature kernel revision / run | 100 trees, hot ns | 300 trees, hot ns |
 |---|---:|---:|
